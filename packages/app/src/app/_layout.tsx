@@ -60,6 +60,7 @@ import {
   resolveDesktopSidebarVisibility,
 } from "@/components/desktop-sidebar-layout";
 import { isNative, isWeb } from "@/constants/platform";
+import { isEmbedMode } from "@/figmenta/embed";
 import { HorizontalScrollProvider } from "@/contexts/horizontal-scroll-context";
 import { SessionProvider } from "@/contexts/session-context";
 import { SidebarCalloutProvider } from "@/contexts/sidebar-callout-context";
@@ -647,10 +648,12 @@ function SidebarChrome({
   const isCompactLayout = useIsCompactFormFactor();
   const isMobileActive = useIsMobilePanelActive("agent-list");
   const isDesktopOpen = usePanelStore((state) => state.desktop.agentListOpen);
-  const active = visible && (isCompactLayout ? isMobileActive : isDesktopOpen);
+  // Figmenta embed mode: Orchestra draws the session list itself (docs/FIGMENTA.md).
+  const embedded = isEmbedMode();
+  const active = !embedded && visible && (isCompactLayout ? isMobileActive : isDesktopOpen);
   return (
     <SidebarModelProvider active={active}>
-      {mounted ? <LeftSidebar active={active} /> : null}
+      {mounted && !embedded ? <LeftSidebar active={active} /> : null}
       <WorkspaceShortcutTargetsSubscriber enabled={keyboardShortcutsEnabled} />
     </SidebarModelProvider>
   );
