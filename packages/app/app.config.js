@@ -179,6 +179,8 @@ export default {
       ...(isProfileBuild ? [withAndroidProfileable] : []),
     ],
     experiments: {
+      // Figmenta: serve the web export under a sub-path (e.g. /agents-ui) when set.
+      ...(process.env.PASEO_WEB_BASE_URL ? { baseUrl: process.env.PASEO_WEB_BASE_URL } : {}),
       typedRoutes: true,
       reactCompiler: true,
       autolinkingModuleResolution: true,
