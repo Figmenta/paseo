@@ -1,4 +1,5 @@
 import { ComposerDockBackground } from "@/composer/dock";
+import { isEmbedMode } from "@/figmenta/embed";
 import { useMemo, type ReactNode } from "react";
 import type { LayoutChangeEvent } from "react-native";
 import { View, type StyleProp, type ViewStyle } from "react-native";
@@ -34,6 +35,9 @@ export function ScreenHeader({
   borderless,
   onRowLayout,
 }: ScreenHeaderProps) {
+  // Figmenta embed mode: Orchestra draws the session header itself. Every screen
+  // header in the app goes through this component (docs/FIGMENTA.md).
+  const embedded = isEmbedMode();
   const { theme } = useUnistyles();
   const insets = useSafeAreaInsets();
   const isMobile = useIsCompactFormFactor();
@@ -48,6 +52,8 @@ export function ScreenHeader({
   const rowStyle = useMemo(() => [styles.row, borderless && styles.borderless], [borderless]);
   const leftCombinedStyle = useMemo(() => [styles.left, leftStyle], [leftStyle]);
   const rightCombinedStyle = useMemo(() => [styles.right, rightStyle], [rightStyle]);
+
+  if (embedded) return null;
 
   return (
     <ComposerDockBackground style={styles.header} testID="composer-dock-header">
