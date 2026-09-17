@@ -11,7 +11,7 @@ Branch `figmenta` = upstream release tag + a minimal set of patches. Rules:
 Patches:
 - `packages/app/app.config.js`: optional `experiments.baseUrl` from `PASEO_WEB_BASE_URL`, so the web
   export can be served by Orchestra under `/agents-ui`.
-- Embed mode (see below): `packages/app/src/figmenta/embed.ts` (new file) plus two one-line guards.
+- Embed mode (see below): `packages/app/src/figmenta/embed.ts` (new file) plus three one-line guards.
 
 Build the web client for Orchestra:
 `PASEO_WEB_BASE_URL=/agents-ui npm run build --workspace=@getpaseo/app` → `packages/app/dist`.
@@ -31,7 +31,7 @@ flag into `sessionStorage`, because the deep-link route resolves to a workspace 
 and rewrites the URL: without the latch the flag would survive exactly one render.
 On iOS and Android it is always false.
 
-Two call sites, two hunks to reapply after a rebase:
+Three call sites, three hunks to reapply after a rebase:
 
 1. `packages/app/src/app/_layout.tsx`, in `SidebarChrome` — do not mount `LeftSidebar`,
    and keep the sidebar model inactive:
@@ -57,11 +57,30 @@ Two call sites, two hunks to reapply after a rebase:
    if (embedded) return null;        // after every hook, before the JSX
 ```
 
-Reapplying after `git rebase vX.Y.Z figmenta`: `embed.ts` comes across untouched. If either
-hunk fails, find the same two anchors (`LeftSidebar` inside `SidebarChrome`; the `return (`
-of `ScreenHeader`) and reapply by hand — both guards are two lines and neither depends on
-upstream internals beyond the component's own name.
+3. `packages/app/src/components/split-container.tsx`, in the pane view — do not draw the
+   pane's tab strip. Inside the iframe the sessions are the rows of Orchestra's own
+   sidebar, so Paseo's horizontal tab bar (with its `+` and `...`) is a second, wrong
+   copy of the same list:
 
-Verifying without Orchestra: open `http://127.0.0.1:8081/?embed=1` on the dev server; the
-left sidebar and the header disappear, and they stay gone while navigating inside the app.
+```tsx
+   {isEmbedMode() ? null : (
+     <WindowChromeSafeArea placement="inline" style={styles.paneTabs}>
+       ...
+     </WindowChromeSafeArea>
+   )}
+```
+
+   Only the strip goes: the pane content below it is untouched. No height needs zeroing —
+   `styles.paneTabs` carries `position` and `minWidth` only, never a height, so the content
+   pane takes the room on its own.
+
+Reapplying after `git rebase vX.Y.Z figmenta`: `embed.ts` comes across untouched. If a hunk
+fails, find the same three anchors (`LeftSidebar` inside `SidebarChrome`; the `return (` of
+`ScreenHeader`; the `WindowChromeSafeArea` wrapping `WorkspaceDesktopTabsRow`) and reapply by
+hand — each guard is two lines and none depends on upstream internals beyond the component's
+own name.
+
+Verifying without Orchestra: open `http://127.0.0.1:8081/?embed=1` on the dev server; the left
+sidebar, the header and the pane tab strip disappear, and they stay gone while navigating
+inside the app.
 Removing the flag needs a new tab (the latch lives in `sessionStorage`).
