@@ -2,8 +2,10 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   installEmbedBridge,
+  lastAgentRoute,
   readEmbedTheme,
   reduceComposerInsert,
+  rememberAgentRoute,
   resetEmbedModeCache,
   shouldBlockEmbedRoute,
   subscribeToEmbedComposerInsert,
@@ -132,5 +134,47 @@ describe("maestro.composer.insert routing", () => {
 
     expect(first).toEqual([]);
     expect(second).toEqual([]);
+  });
+});
+
+describe("rememberAgentRoute / lastAgentRoute", () => {
+  beforeEach(() => {
+    window.sessionStorage.clear();
+  });
+
+  it("remembers an agent route and hands it back", () => {
+    rememberAgentRoute("/h/srv1/agent/ag1");
+    expect(lastAgentRoute()).toBe("/h/srv1/agent/ag1");
+  });
+
+  it("drops the query string and the hash", () => {
+    rememberAgentRoute("/h/srv1/agent/ag1?embed=1#top");
+    expect(lastAgentRoute()).toBe("/h/srv1/agent/ag1");
+  });
+
+  it("ignores everything that is not an agent route", () => {
+    for (const pathname of [
+      "/",
+      "/settings",
+      "/settings/models",
+      "/h/srv1/settings",
+      "/h/srv1/agent",
+      "/h/srv1/agent/ag1/files",
+      "",
+    ]) {
+      rememberAgentRoute(pathname);
+      expect(lastAgentRoute()).toBeNull();
+    }
+  });
+
+  it("keeps the last agent route seen", () => {
+    rememberAgentRoute("/h/srv1/agent/ag1");
+    rememberAgentRoute("/h/srv2/agent/ag2");
+    rememberAgentRoute("/settings");
+    expect(lastAgentRoute()).toBe("/h/srv2/agent/ag2");
+  });
+
+  it("returns null when nothing was remembered", () => {
+    expect(lastAgentRoute()).toBeNull();
   });
 });
