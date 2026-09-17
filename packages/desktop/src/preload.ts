@@ -9,15 +9,18 @@ import { contextBridge } from "electron";
 // The preload still runs inside Electron's sandbox and is tsc-compiled (not bundled), so it
 // MUST NOT import anything but "electron" (preload-sandbox.test.ts guards this).
 const APP_VERSION_ARGUMENT_PREFIX = "--orchestra-app-version=";
+const TITLE_BAR_INSET_ARGUMENT_PREFIX = "--orchestra-title-bar-inset=";
 
-function readAppVersion(): string {
-  const value = process.argv.find((argument) =>
-    argument.startsWith(APP_VERSION_ARGUMENT_PREFIX),
-  );
-  return value ? value.slice(APP_VERSION_ARGUMENT_PREFIX.length) : "";
+function readArgument(prefix: string): string {
+  const value = process.argv.find((argument) => argument.startsWith(prefix));
+  return value ? value.slice(prefix.length) : "";
 }
 
 contextBridge.exposeInMainWorld("orchestraDesktop", {
-  version: readAppVersion(),
+  version: readArgument(APP_VERSION_ARGUMENT_PREFIX),
   platform: process.platform,
+  // The window keeps Paseo's own title bar, so the macOS traffic lights float over the
+  // top-left of the page. Orchestra reads this to indent its header by that many pixels;
+  // 0 where there is nothing to avoid.
+  titleBarInset: Number.parseInt(readArgument(TITLE_BAR_INSET_ARGUMENT_PREFIX), 10) || 0,
 });

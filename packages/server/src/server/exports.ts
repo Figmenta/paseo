@@ -2,6 +2,9 @@
 export { createPaseoDaemon, type PaseoDaemon, type PaseoDaemonConfig } from "./bootstrap.js";
 export { loadConfig, type CliConfigOverrides } from "./config.js";
 export { resolvePaseoHome } from "./paseo-home.js";
+// Figmenta fork: the Orchestra shell seeds ~/.paseo/config.json before the daemon starts
+// and must not leave a half-written file behind.
+export { writeFileAtomic } from "./atomic-file.js";
 export { getOrCreateServerId } from "./server-id.js";
 export { createRootLogger, type LogLevel, type LogFormat } from "./logger.js";
 export {
