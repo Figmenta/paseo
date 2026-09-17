@@ -10,6 +10,8 @@ const profile = (handle = "federico"): MaestroProfile => ({
   models: ["claude-opus-5"],
   modes: ["auto", "plan"],
   tools: ["orchestra"],
+  persona: null,
+  base_skill: null,
   custom_instructions: "",
   skills: [],
   mcp: { url: "https://orchestra.figmenta.site/mcp/maestro", token: "orcm_1" },

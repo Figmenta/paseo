@@ -59,7 +59,12 @@ export default function contribute(server: PluginServerContext) {
         env["CLAUDE_CODE_OAUTH_TOKEN"] = profile.seat_token;
       }
       try {
-        const result = await syncSkills(skillsDir(), profile.skills);
+        // The base skill is the persona's own command: it lives next to the
+        // others, so a rename goes through the same removal path.
+        const result = await syncSkills(skillsDir(), [
+          ...profile.skills,
+          ...(profile.base_skill === null ? [] : [profile.base_skill]),
+        ]);
         if (result.written.length > 0 || result.removed.length > 0 || result.skipped.length > 0) {
           log("skills synced", result);
         }

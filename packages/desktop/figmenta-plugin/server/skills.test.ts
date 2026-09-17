@@ -18,16 +18,22 @@ async function exists(path: string): Promise<boolean> {
 }
 
 describe("renderSkillFile", () => {
-  it("writes frontmatter with the slug as name and a one-line description", () => {
+  it("writes the name verbatim in the frontmatter, with a one-line description", () => {
     const file = renderSkillFile({
       slug: "maestro-planner",
       name: "Planner",
       summary: "Plans your\nweek",
       body_md: "Do the thing.",
     });
-    expect(file).toContain("name: maestro-planner");
+    expect(file).toContain("name: Planner");
     expect(file).toContain('description: "Plans your week"');
     expect(file.trimEnd().endsWith("Do the thing.")).toBe(true);
+  });
+
+  it("falls back to the slug when the skill carries no name", () => {
+    expect(renderSkillFile({ slug: "maestro-editor", body_md: "Edit." })).toContain(
+      "name: maestro-editor",
+    );
   });
 });
 
@@ -59,8 +65,35 @@ describe("syncSkills", () => {
     const result = await syncSkills(dir, [{ slug: "maestro-planner", body_md: "Plan." }]);
 
     expect(result.skipped).toEqual(["maestro-planner"]);
-    expect(await readFile(join(dir, "maestro-planner", "SKILL.md"), "utf8")).toBe("hand written too");
+    expect(await readFile(join(dir, "maestro-planner", "SKILL.md"), "utf8")).toBe(
+      "hand written too",
+    );
     expect(await readFile(join(dir, "mine", "SKILL.md"), "utf8")).toBe("hand written");
+  });
+
+  it("writes the base skill under its lowercase slug, keeping the persona name cased", async () => {
+    const dir = await tempSkillsDir();
+    const result = await syncSkills(dir, [
+      { slug: "pluto", name: "Pluto", body_md: "When invoked, give the user a short briefing." },
+    ]);
+    expect(result.written).toEqual(["pluto"]);
+    const file = await readFile(join(dir, "pluto", "SKILL.md"), "utf8");
+    expect(file.split("\n").slice(0, 4)).toEqual([
+      "---",
+      "name: Pluto",
+      'description: "Pluto"',
+      "---",
+    ]);
+    expect(file).toContain("When invoked, give the user a short briefing.");
+    expect(await exists(join(dir, "pluto", MARKER))).toBe(true);
+  });
+
+  it("a persona rename removes the old base-skill directory", async () => {
+    const dir = await tempSkillsDir();
+    await syncSkills(dir, [{ slug: "maestro", name: "Maestro", body_md: "Brief." }]);
+    const result = await syncSkills(dir, [{ slug: "pluto", name: "Pluto", body_md: "Brief." }]);
+    expect(result.removed).toEqual(["maestro"]);
+    expect(await exists(join(dir, "maestro"))).toBe(false);
   });
 
   it("refuses an invalid slug", async () => {

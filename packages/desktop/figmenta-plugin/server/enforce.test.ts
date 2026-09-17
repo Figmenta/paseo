@@ -3,6 +3,7 @@ import {
   composeSystemPrompt,
   enforceConfig,
   MAESTRO_BASE,
+  maestroBase,
   splitProvider,
   type EnforceableConfig,
   type EnforceableProfile,
@@ -32,10 +33,7 @@ describe("splitProvider", () => {
 
 describe("enforceConfig", () => {
   it("keeps an allowed model and mode", () => {
-    const result = enforceConfig(
-      { ...base, model: "claude-sonnet-5", modeId: "plan" },
-      profile,
-    );
+    const result = enforceConfig({ ...base, model: "claude-sonnet-5", modeId: "plan" }, profile);
     expect(result.model).toBe("claude-sonnet-5");
     expect(result.modeId).toBe("plan");
   });
@@ -84,9 +82,7 @@ describe("enforceConfig", () => {
 
   it("appends the preamble and the custom instructions to an existing prompt", () => {
     const result = enforceConfig({ ...base, systemPrompt: "Be terse." }, profile);
-    expect(result.systemPrompt).toBe(
-      `Be terse.\n\n${MAESTRO_BASE}\n\nCall me by my first name.`,
-    );
+    expect(result.systemPrompt).toBe(`Be terse.\n\n${MAESTRO_BASE}\n\nCall me by my first name.`);
   });
 
   it("is idempotent: enforcing twice does not duplicate the preamble", () => {
@@ -96,8 +92,51 @@ describe("enforceConfig", () => {
   });
 });
 
+describe("maestroBase", () => {
+  it("names the persona and advertises its slash command", () => {
+    const text = maestroBase({ name: "Pluto", slug: "pluto" });
+    expect(text.split("\n")[0]).toBe(
+      "You are Pluto, the user's Maestro inside Orchestra, the Figmenta workspace.",
+    );
+    expect(text).toContain(
+      "The user can type /pluto to get a briefing on their tasks, mail and Discord.",
+    );
+    expect(text).toContain("Use mail_recent / mail_read and discord_recent");
+  });
+
+  it("falls back to Maestro and drops the slash line without a persona", () => {
+    expect(maestroBase(null).split("\n")[0]).toBe(
+      "You are Maestro, the user's Maestro inside Orchestra, the Figmenta workspace.",
+    );
+    expect(maestroBase(null)).not.toContain("The user can type /");
+    expect(MAESTRO_BASE).toBe(maestroBase(null));
+  });
+});
+
 describe("composeSystemPrompt", () => {
   it("drops empty parts", () => {
     expect(composeSystemPrompt(undefined, "")).toBe(MAESTRO_BASE);
+  });
+
+  it("a persona rename leaves exactly one preamble, the new one", () => {
+    const first = composeSystemPrompt("Be terse.", "Call me by my first name.", {
+      name: "Maestro",
+      slug: "maestro",
+    });
+    const renamed = composeSystemPrompt(first, "Call me by my first name.", {
+      name: "Pluto",
+      slug: "pluto",
+    });
+    const preambles = renamed
+      .split(/\n{2,}/)
+      .filter(
+        (block) => block.startsWith("You are ") && block.includes("Maestro inside Orchestra"),
+      );
+    expect(preambles).toHaveLength(1);
+    expect(preambles[0]).toBe(maestroBase({ name: "Pluto", slug: "pluto" }));
+    expect(renamed).not.toContain("You are Maestro,");
+    expect(renamed).not.toContain("/maestro to get a briefing");
+    expect(renamed.startsWith("Be terse.")).toBe(true);
+    expect(renamed.endsWith("Call me by my first name.")).toBe(true);
   });
 });

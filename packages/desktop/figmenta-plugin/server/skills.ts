@@ -40,7 +40,12 @@ export function skillDescription(skill: SkillSpec): string {
 
 export function renderSkillFile(skill: SkillSpec): string {
   const description = skillDescription(skill).replace(/"/g, "'");
-  const front = ["---", `name: ${skill.slug}`, `description: "${description}"`, "---", ""];
+  // Verbatim on purpose. Measured on Claude Code (2026-09-17): a directory
+  // `zzprobe` whose frontmatter says `name: Zzprobe` answers to both /zzprobe
+  // and /Zzprobe, so lowercasing the persona's name would only make the skill
+  // read wrong. The directory is the slug; the name is how the persona writes it.
+  const name = (skill.name ?? "").trim() || skill.slug;
+  const front = ["---", `name: ${name}`, `description: "${description}"`, "---", ""];
   return `${front.join("\n")}\n${(skill.body_md ?? "").trim()}\n`;
 }
 
