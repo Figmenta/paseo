@@ -4,7 +4,13 @@ import { PortalProvider } from "@gorhom/portal";
 import { QueryClientProvider } from "@tanstack/react-query";
 import * as Linking from "expo-linking";
 import * as Notifications from "expo-notifications";
-import { Stack, useNavigationContainerRef, usePathname, useRouter } from "expo-router";
+import {
+  Stack,
+  useNavigationContainerRef,
+  usePathname,
+  useRootNavigationState,
+  useRouter,
+} from "expo-router";
 import {
   createContext,
   type ReactNode,
@@ -60,7 +66,13 @@ import {
   resolveDesktopSidebarVisibility,
 } from "@/components/desktop-sidebar-layout";
 import { isNative, isWeb } from "@/constants/platform";
-import { installEmbedBridge, isEmbedMode, shouldBlockEmbedRoute } from "@/figmenta/embed";
+import {
+  installEmbedBridge,
+  isEmbedMode,
+  lastAgentRoute,
+  rememberAgentRoute,
+  shouldBlockEmbedRoute,
+} from "@/figmenta/embed";
 import { HorizontalScrollProvider } from "@/contexts/horizontal-scroll-context";
 import { SessionProvider } from "@/contexts/session-context";
 import { SidebarCalloutProvider } from "@/contexts/sidebar-callout-context";
@@ -652,12 +664,25 @@ function SidebarChrome({
   const embedded = isEmbedMode();
   const embedPathname = usePathname();
   const embedRouter = useRouter();
+  const embedNavigationKey = useRootNavigationState()?.key;
   useEffect(() => {
     if (embedded) installEmbedBridge();
   }, [embedded]);
   useEffect(() => {
-    if (embedded && shouldBlockEmbedRoute(embedPathname)) embedRouter.replace("/");
-  }, [embedded, embedPathname, embedRouter]);
+    if (embedded) rememberAgentRoute(embedPathname);
+  }, [embedded, embedPathname]);
+  // The guard may only navigate once the Root Layout is mounted: an iframe that
+  // lands straight on /settings would otherwise replace before the navigator
+  // exists ("Attempted to navigate before mounting the Root Layout component").
+  useEffect(() => {
+    if (!embedded || !embedNavigationKey) return;
+    if (!shouldBlockEmbedRoute(embedPathname)) return;
+    if (embedRouter.canGoBack()) {
+      embedRouter.back();
+      return;
+    }
+    embedRouter.replace(lastAgentRoute() ?? "/");
+  }, [embedded, embedNavigationKey, embedPathname, embedRouter]);
   const active = !embedded && visible && (isCompactLayout ? isMobileActive : isDesktopOpen);
   return (
     <SidebarModelProvider active={active}>

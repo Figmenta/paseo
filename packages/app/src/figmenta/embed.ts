@@ -154,6 +154,45 @@ export function shouldBlockEmbedRoute(pathname: string): boolean {
   return false;
 }
 
+const LAST_AGENT_ROUTE_KEY = "figmentaLastAgentRoute";
+
+/** True only for `/h/<serverId>/agent/<agentId>`, the conversation surface. */
+function isAgentRoute(pathname: string): boolean {
+  const path = (pathname || "").split("?")[0].split("#")[0];
+  const segments = path.split("/").filter(Boolean);
+  return (
+    segments.length === 4 &&
+    segments[0] === "h" &&
+    segments[2] === "agent" &&
+    segments[1].length > 0 &&
+    segments[3].length > 0
+  );
+}
+
+/**
+ * Remember the conversation the frame was last on, so a blocked route has
+ * somewhere to bounce back to. Anything that is not an agent route is ignored.
+ */
+export function rememberAgentRoute(pathname: string): void {
+  if (!isAgentRoute(pathname)) return;
+  const path = (pathname || "").split("?")[0].split("#")[0];
+  try {
+    window.sessionStorage?.setItem(LAST_AGENT_ROUTE_KEY, path);
+  } catch {
+    // Storage denied to a framed document: the bounce falls back to "/".
+  }
+}
+
+/** The last agent route seen in this document, or null when there was none. */
+export function lastAgentRoute(): string | null {
+  try {
+    const stored = window.sessionStorage?.getItem(LAST_AGENT_ROUTE_KEY);
+    return stored && isAgentRoute(stored) ? stored : null;
+  } catch {
+    return null;
+  }
+}
+
 /** §4 payload: an insert names its agent, it never means "whoever is active". */
 export interface EmbedComposerInsert {
   text: string;

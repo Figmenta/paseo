@@ -717,12 +717,15 @@ function ModelRow({
   const handlePointerEnter = useCallback(() => setIsHovered(true), []);
   const handlePointerLeave = useCallback(() => setIsHovered(false), []);
 
+  // Figmenta embed: profile creation lives in Paseo settings (docs/FIGMENTA.md).
+  const embedded = isEmbedMode();
+
   const profileAction = useMemo(() => {
     if (row.modelId.length === 0) {
       return null;
     }
     if (profiledRows.length === 0) {
-      if (!onCreateProfile) {
+      if (embedded || !onCreateProfile) {
         return null;
       }
       return (
@@ -765,6 +768,7 @@ function ModelRow({
       </ModelRowProfileAction>
     );
   }, [
+    embedded,
     handleCreateProfile,
     handleEditProfile,
     handleEditProfiles,
