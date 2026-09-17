@@ -45,6 +45,11 @@ interface AgentInputDraftComposerOptions {
 
 interface UseAgentInputDraftInput {
   draftKey: DraftKeyInput;
+  /**
+   * Figmenta embed bridge v2: the agent this composer belongs to, so a
+   * `maestro.composer.insert` lands in its draft and in no other.
+   */
+  agentId?: string;
   composer?: AgentInputDraftComposerOptions;
 }
 
@@ -162,16 +167,20 @@ export function useAgentInputDraft(input: UseAgentInputDraftInput): AgentInputDr
   );
 
   // Figmenta embed bridge v2: Orchestra appends text to the composer of the
-  // active session (docs/FIGMENTA.md). It goes through `replaceText` so the
+  // agent it names (docs/FIGMENTA.md). It goes through `replaceText` so the
   // input re-renders via `textReplacement`; the create-agent composer, which
-  // is the only caller passing `composer` options, stays out of it.
+  // is the only caller passing `composer` options, stays out of it, and so
+  // does any composer that does not know which agent it belongs to.
+  const embedAgentId = input.agentId;
   useEffect(() => {
     if (!isEmbedMode() || composerOptions !== null) return;
-    return subscribeToEmbedComposerInsert((insertedText) => {
+    if (!embedAgentId) return;
+    return subscribeToEmbedComposerInsert(({ text: insertedText, agentId }) => {
+      if (agentId !== embedAgentId) return;
       const current = useDraftStore.getState().getDraftInput(draftKey)?.text ?? "";
       replaceText(reduceComposerInsert(current, insertedText));
     });
-  }, [composerOptions, draftKey, replaceText]);
+  }, [composerOptions, draftKey, embedAgentId, replaceText]);
 
   const setAttachments = useCallback(
     (updater: AttachmentUpdater) => {

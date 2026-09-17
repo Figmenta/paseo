@@ -1284,6 +1284,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
       serverId,
       agentId,
     }),
+    agentId,
   });
   // Stabilize the agentInputDraft object identity so that memo(AgentComposerSection) can bail out
   // when only toast state changes (which does not affect any draft field).

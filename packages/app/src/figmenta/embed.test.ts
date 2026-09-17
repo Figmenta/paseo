@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  installEmbedBridge,
   readEmbedTheme,
   reduceComposerInsert,
   resetEmbedModeCache,
   shouldBlockEmbedRoute,
+  subscribeToEmbedComposerInsert,
 } from "./embed";
 
 function setLocation(search: string): void {
@@ -78,5 +80,57 @@ describe("shouldBlockEmbedRoute", () => {
   it("ignores query and hash", () => {
     expect(shouldBlockEmbedRoute("/settings?tab=hosts")).toBe(true);
     expect(shouldBlockEmbedRoute("/h/x/agent/y?embed=1")).toBe(false);
+  });
+});
+
+describe("maestro.composer.insert routing", () => {
+  const unsubscribes: Array<() => void> = [];
+
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    setLocation("?embed=1");
+    resetEmbedModeCache();
+    installEmbedBridge();
+    while (unsubscribes.length) unsubscribes.pop()?.();
+  });
+
+  /** Mirrors the guard in `useAgentInputDraft`: a composer keeps its own agent only. */
+  function composerFor(agentId: string, applied: string[]): void {
+    unsubscribes.push(
+      subscribeToEmbedComposerInsert((insert) => {
+        if (insert.agentId !== agentId) return;
+        applied.push(insert.text);
+      }),
+    );
+  }
+
+  function post(data: unknown): void {
+    window.dispatchEvent(new MessageEvent("message", { data, origin: window.location.origin }));
+  }
+
+  it("applies the insert in the composer of that agent only", () => {
+    const first: string[] = [];
+    const second: string[] = [];
+    composerFor("a1", first);
+    composerFor("a2", second);
+
+    post({ type: "maestro.composer.insert", text: "/maestro", agentId: "a1" });
+
+    expect(first).toEqual(["/maestro"]);
+    expect(second).toEqual([]);
+  });
+
+  it("drops a message without a usable agentId", () => {
+    const first: string[] = [];
+    const second: string[] = [];
+    composerFor("a1", first);
+    composerFor("a2", second);
+
+    post({ type: "maestro.composer.insert", text: "/maestro" });
+    post({ type: "maestro.composer.insert", text: "/maestro", agentId: "" });
+    post({ type: "maestro.composer.insert", text: "/maestro", agentId: 7 });
+
+    expect(first).toEqual([]);
+    expect(second).toEqual([]);
   });
 });
