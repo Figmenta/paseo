@@ -20,12 +20,6 @@ import {
   writeAttachmentBytes,
 } from "../features/attachments.js";
 import {
-  checkForAppUpdate,
-  downloadAndInstallUpdate,
-  type AppUpdateCheckIntent,
-  type AppReleaseChannel,
-} from "../features/auto-updater.js";
-import {
   getBundledCliShimPath,
   getCliInstallStatus,
   installCli,
@@ -90,24 +84,6 @@ interface DesktopDaemonLogs {
   contents: string;
 }
 
-function parseReleaseChannel(
-  args: Record<string, unknown> | undefined,
-): AppReleaseChannel | undefined {
-  if (args?.releaseChannel === "beta") {
-    return "beta";
-  }
-  if (args?.releaseChannel === "stable") {
-    return "stable";
-  }
-  return undefined;
-}
-
-function parseAppUpdateCheckIntent(
-  args: Record<string, unknown> | undefined,
-): AppUpdateCheckIntent {
-  return args?.intent === "manual" ? "manual" : "automatic";
-}
-
 function parseDesktopDaemonStopReason(
   args: Record<string, unknown> | undefined,
 ): DesktopDaemonStopReason {
@@ -128,6 +104,14 @@ function getPaseoHome(): string {
 
 function logFilePath(): string {
   return path.join(getPaseoHome(), DAEMON_LOG_FILENAME);
+}
+
+// Figmenta fork: `desktopManaged: true` in the pid lock only means "a desktop app
+// spawned this daemon" — it does not say WHICH one. Orchestra and an installed Paseo
+// Desktop share ~/.paseo, so quitting consults `ownedLaunch` (the instance THIS process
+// acquired through startDaemonInstance) instead: only that daemon may be stopped on quit.
+export function wasDaemonSpawnedByThisApp(): boolean {
+  return ownedLaunch !== null;
 }
 
 export function isDesktopManagedDaemonRunningSync(): boolean {
@@ -269,7 +253,7 @@ function assertBuiltInDaemonManagementEnabled(settings: DesktopSettings): void {
   }
 }
 
-async function startDaemon(): Promise<DesktopDaemonStatus> {
+export async function startDaemon(): Promise<DesktopDaemonStatus> {
   assertBuiltInDaemonManagementEnabled(await getDesktopSettingsStore().get());
 
   const current = await resolveDesktopDaemonStatus();
@@ -381,12 +365,6 @@ async function getLocalDaemonVersion(): Promise<{ version: string | null; error:
   };
 }
 
-async function resolveRequestedReleaseChannel(
-  args: Record<string, unknown> | undefined,
-): Promise<AppReleaseChannel> {
-  return parseReleaseChannel(args) ?? (await getDesktopSettingsStore().get()).releaseChannel;
-}
-
 // ---------------------------------------------------------------------------
 // IPC registration
 // ---------------------------------------------------------------------------
@@ -437,22 +415,29 @@ export function createDaemonCommandHandlers(): Record<string, DesktopCommandHand
           : "";
       if (sessionId) closeLocalTransportSession(sessionId);
     },
-    check_app_update: async (args) => {
+    // Figmenta fork: Orchestra has no release feed (`publish: null`), so both update
+    // commands answer "already current" and log instead of hitting GitHub.
+    check_app_update: () => {
       const currentVersion = resolveDesktopAppVersion();
-      return checkForAppUpdate({
+      log.info("[orchestra] auto-update disabled: check_app_update is a no-op", {
         currentVersion,
-        releaseChannel: await resolveRequestedReleaseChannel(args),
-        intent: parseAppUpdateCheckIntent(args),
+      });
+      return Promise.resolve({
+        currentVersion,
+        hasUpdate: false,
+        readyToInstall: false,
       });
     },
-    install_app_update: async (args) => {
+    install_app_update: () => {
       const currentVersion = resolveDesktopAppVersion();
-      return downloadAndInstallUpdate(
-        { currentVersion, releaseChannel: await resolveRequestedReleaseChannel(args) },
-        async () => {
-          await stopDesktopDaemon("app_update");
-        },
-      );
+      log.info("[orchestra] auto-update disabled: install_app_update is a no-op", {
+        currentVersion,
+      });
+      return Promise.resolve({
+        installed: false,
+        version: currentVersion,
+        message: "Auto-update is disabled in Orchestra Desktop.",
+      });
     },
     get_local_daemon_version: () => getLocalDaemonVersion(),
     install_cli: () => installCli(),
