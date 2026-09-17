@@ -2,6 +2,7 @@ import { Text, View } from "react-native";
 import { ArrowLeftToLine, RotateCw, Settings } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
+import { isEmbedMode } from "@/figmenta/embed";
 import { Button } from "@/components/ui/button";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -242,9 +243,12 @@ function WorkspaceUnreachable({
           <Button size="sm" variant="default" leftIcon={RotateCw} onPress={onRetry}>
             {t("common.actions.retry")}
           </Button>
-          <Button size="sm" variant="outline" leftIcon={Settings} onPress={onManageHost}>
-            {t("workspace.route.manageHost")}
-          </Button>
+          {/* Figmenta embed: hosts are managed in Orchestra (docs/FIGMENTA.md). */}
+          {isEmbedMode() ? null : (
+            <Button size="sm" variant="outline" leftIcon={Settings} onPress={onManageHost}>
+              {t("workspace.route.manageHost")}
+            </Button>
+          )}
         </View>
       ) : null}
     </View>

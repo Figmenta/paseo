@@ -26,6 +26,11 @@ import { AfterPaintPublication } from "@/composer/after-paint-publication";
 import { useShallow } from "zustand/shallow";
 import type { ComposerTextSource } from "@/composer/text-source";
 import { isWeb } from "@/constants/platform";
+import {
+  isEmbedMode,
+  reduceComposerInsert,
+  subscribeToEmbedComposerInsert,
+} from "@/figmenta/embed";
 
 type AttachmentUpdater =
   | UserComposerAttachment[]
@@ -176,6 +181,18 @@ export function useAgentInputDraft(input: UseAgentInputDraftInput): AgentInputDr
     },
     [draftKey, publishTextReplacement, textPublication],
   );
+
+  // Figmenta embed bridge v2: Orchestra appends text to the composer of the
+  // active session (docs/FIGMENTA.md). It goes through `replaceText` so the
+  // input re-renders via `textReplacement`; the create-agent composer, which
+  // is the only caller passing `composer` options, stays out of it.
+  useEffect(() => {
+    if (!isEmbedMode() || composerOptions !== null) return;
+    return subscribeToEmbedComposerInsert((insertedText) => {
+      const current = useDraftStore.getState().getDraftInput(draftKey)?.text ?? "";
+      replaceText(reduceComposerInsert(current, insertedText));
+    });
+  }, [composerOptions, draftKey, replaceText]);
 
   const setAttachments = useCallback(
     (updater: AttachmentUpdater) => {
