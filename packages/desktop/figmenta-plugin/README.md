@@ -4,13 +4,13 @@ Adds one item to the Paseo sidebar, **Sessions**, that lists every agent session
 the selected host — across all workspaces — in a single scrollable surface. Clicking a
 row opens that session.
 
-Paseo's sidebar lists *workspaces*; the sessions themselves live one level down, in the
+Paseo's sidebar lists _workspaces_; the sessions themselves live one level down, in the
 horizontal tabs inside a workspace. This plugin puts that second level at the top, so
 the whole fleet is visible without opening a workspace first.
 
 It also carries **Maestro**: the daemon-side half of Orchestra's chat. That half holds the
 connection to Orchestra, applies the user's profile to every session Paseo creates, keeps
-the Maestro skills on disk, and records denied permissions. See *Maestro* below.
+the Maestro skills on disk, and records denied permissions. See _Maestro_ below.
 
 Built for **Paseo 0.8** (`requirements.paseo: ">=0.8.0"`).
 
@@ -34,7 +34,7 @@ ordered by last activity, newest first.
 
 Grouped rather than one flat feed because the sidebar next to this surface is a
 workspace list: the workspace is the coordinate you already navigate by, so keeping it
-as the header preserves that map while making the *session* the thing you click.
+as the header preserves that map while making the _session_ the thing you click.
 Activity order keeps whatever is live at the top of the scroll.
 
 Archived sessions are excluded (`filter.includeArchived: false`, plus a client-side
@@ -52,13 +52,13 @@ workspace already known for that session, so a row never loses its group.
 
 ### What it does
 
-| Hook / RPC                      | Effect                                                                                                                     |
-| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `maestro.setconnection`         | Checks `baseUrl` against the allow-list, then `GET {baseUrl}/api/maestro/plugin/profile` (falling back to `/maestro/plugin/profile`) with `Authorization: Bearer <connect token>`; on success stores it and returns the user |
-| `maestro.status`                | `{connected, stale, user, baseUrl, version}`                                                                                |
-| `before("agent.create")`        | Model and mode forced into the profile's allow-lists; `mcpServers.maestro` added; the Maestro preamble and the user's custom instructions appended to `systemPrompt` |
-| `before("agent.session_open")`  | `MAESTRO_USER=<handle>` in the env (`CLAUDE_CODE_OAUTH_TOKEN` too, but only when Orchestra actually sends a seat token, which it does not yet); Maestro skills synced to `~/.claude/skills/` |
-| `on("agent.permission_resolved")` | A `deny` is appended to `~/.paseo/figmenta-maestro-denials.jsonl`                                                          |
+| Hook / RPC                        | Effect                                                                                                                                                                                                                       |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `maestro.setconnection`           | Checks `baseUrl` against the allow-list, then `GET {baseUrl}/api/maestro/plugin/profile` (falling back to `/maestro/plugin/profile`) with `Authorization: Bearer <connect token>`; on success stores it and returns the user |
+| `maestro.status`                  | `{connected, stale, user, baseUrl, version}`                                                                                                                                                                                 |
+| `before("agent.create")`          | Model and mode forced into the profile's allow-lists; `mcpServers.maestro` added; the Maestro preamble and the user's custom instructions appended to `systemPrompt`                                                         |
+| `before("agent.session_open")`    | `MAESTRO_USER=<handle>` in the env (`CLAUDE_CODE_OAUTH_TOKEN` too, but only when Orchestra actually sends a seat token, which it does not yet); Maestro skills synced to `~/.claude/skills/`                                 |
+| `on("agent.permission_resolved")` | A `deny` is appended to `~/.paseo/figmenta-maestro-denials.jsonl`                                                                                                                                                            |
 
 Every hook is **fail-open**. If Orchestra is unreachable, the profile is unparseable, or the
 skill sync throws, the session is created exactly as the user asked and the reason goes to the
@@ -104,10 +104,20 @@ is lost. The plugin therefore sets `systemPrompt` and writes no `CLAUDE.local.md
 is idempotent — enforcing the same profile on a resumed session does not stack a second copy of
 the preamble.
 
+The preamble names the **persona** Orchestra sends (`profile.persona`): «You are Pluto, the
+user's Maestro inside Orchestra…», plus a line telling the user that `/<persona_slug>` gives a
+briefing. A preamble already present is rebuilt in place rather than deduped, so renaming the
+persona replaces the old one instead of leaving the user with two Maestros.
+
 ### Skills on disk
 
 One directory per skill under `~/.claude/skills/<slug>/`, holding `SKILL.md` (frontmatter
-`name: <slug>` + `description`, then the body from Orchestra) and a `.maestro-managed` marker.
+`name: <skill name, verbatim>` + `description`, then the body from Orchestra) and a
+`.maestro-managed` marker. The persona's **base skill** (`profile.base_skill`, body written by
+Orchestra) is synced alongside the others: its directory is the lowercase slug, while `name:`
+keeps the persona's own casing — measured on Claude Code, `name: Zzprobe` answers to both
+`/zzprobe` and `/Zzprobe`. A rename produces a new slug, so the old directory is no longer in
+the profile and the removal path below deletes it.
 A directory **without** the marker is the user's own and is never written to and never deleted —
 it is reported as skipped. A directory **with** the marker that is no longer in the profile is
 removed. Slugs must match `^[a-z0-9-]{2,40}$`; anything else is refused before it becomes a path.
@@ -139,8 +149,11 @@ on `Platform.OS === "web"`; on iOS and Android the bridge is a no-op.
    {
      "pluginsEnabled": true,
      "plugins": {
-       "figmenta-sessions": { "type": "directory", "path": "/absolute/path/to/paseo-orchestra-plugin" }
-     }
+       "figmenta-sessions": {
+         "type": "directory",
+         "path": "/absolute/path/to/paseo-orchestra-plugin",
+       },
+     },
    }
    ```
 

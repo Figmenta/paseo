@@ -17,6 +17,14 @@ export const MaestroSkillSchema = z.object({
 });
 export type MaestroSkill = z.infer<typeof MaestroSkillSchema>;
 
+/** Who the Maestro is for this user: a name, the slug of its base skill, a picture. */
+export const MaestroPersonaSchema = z.object({
+  name: z.string(),
+  slug: z.string(),
+  avatar: z.string().default(""),
+});
+export type MaestroPersona = z.infer<typeof MaestroPersonaSchema>;
+
 export const MaestroProfileSchema = z.object({
   user: MaestroUserSchema,
   status: z.string().default("active"),
@@ -27,6 +35,8 @@ export const MaestroProfileSchema = z.object({
   tools: z.array(z.string()).default([]),
   custom_instructions: z.string().default(""),
   skills: z.array(MaestroSkillSchema).default([]),
+  persona: MaestroPersonaSchema.nullable().default(null),
+  base_skill: MaestroSkillSchema.nullable().default(null),
   mcp: z.object({ url: z.string(), token: z.string() }).nullable().default(null),
   seat_token: z.string().nullable().default(null),
 });
@@ -73,7 +83,10 @@ export class ProfileFetchError extends Error {
   }
 }
 
-export type FetchLike = (url: string, init: Record<string, unknown>) => Promise<{
+export type FetchLike = (
+  url: string,
+  init: Record<string, unknown>,
+) => Promise<{
   ok: boolean;
   status: number;
   text(): Promise<string>;

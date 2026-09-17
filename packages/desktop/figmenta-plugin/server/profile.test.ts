@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { fetchProfile, ProfileFetchError, PROFILE_PATHS, profileUrl } from "./profile";
+import {
+  fetchProfile,
+  MaestroProfileSchema,
+  ProfileFetchError,
+  PROFILE_PATHS,
+  profileUrl,
+} from "./profile";
 
 const payload = {
   user: { id: "u1", handle: "federico", name: "Federico" },
@@ -76,5 +82,24 @@ describe("fetchProfile", () => {
 describe("profileUrl", () => {
   it("strips trailing slashes", () => {
     expect(profileUrl("http://x/")).toBe("http://x/api/maestro/plugin/profile");
+  });
+});
+
+describe("MaestroProfileSchema", () => {
+  it("parses a v1 payload that carries neither persona nor base_skill", () => {
+    const parsed = MaestroProfileSchema.parse(payload);
+    expect(parsed.persona).toBeNull();
+    expect(parsed.base_skill).toBeNull();
+  });
+
+  it("parses a persona and a base skill, defaulting the avatar", () => {
+    const parsed = MaestroProfileSchema.parse({
+      ...payload,
+      persona: { name: "Pluto", slug: "pluto" },
+      base_skill: { slug: "pluto", name: "Pluto", body_md: "Brief." },
+    });
+    expect(parsed.persona).toEqual({ name: "Pluto", slug: "pluto", avatar: "" });
+    expect(parsed.base_skill?.slug).toBe("pluto");
+    expect(parsed.base_skill?.name).toBe("Pluto");
   });
 });
