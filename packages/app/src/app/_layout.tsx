@@ -60,7 +60,7 @@ import {
   resolveDesktopSidebarVisibility,
 } from "@/components/desktop-sidebar-layout";
 import { isNative, isWeb } from "@/constants/platform";
-import { isEmbedMode } from "@/figmenta/embed";
+import { installEmbedBridge, isEmbedMode, shouldBlockEmbedRoute } from "@/figmenta/embed";
 import { HorizontalScrollProvider } from "@/contexts/horizontal-scroll-context";
 import { SessionProvider } from "@/contexts/session-context";
 import { SidebarCalloutProvider } from "@/contexts/sidebar-callout-context";
@@ -650,6 +650,14 @@ function SidebarChrome({
   const isDesktopOpen = usePanelStore((state) => state.desktop.agentListOpen);
   // Figmenta embed mode: Orchestra draws the session list itself (docs/FIGMENTA.md).
   const embedded = isEmbedMode();
+  const embedPathname = usePathname();
+  const embedRouter = useRouter();
+  useEffect(() => {
+    if (embedded) installEmbedBridge();
+  }, [embedded]);
+  useEffect(() => {
+    if (embedded && shouldBlockEmbedRoute(embedPathname)) embedRouter.replace("/");
+  }, [embedded, embedPathname, embedRouter]);
   const active = !embedded && visible && (isCompactLayout ? isMobileActive : isDesktopOpen);
   return (
     <SidebarModelProvider active={active}>

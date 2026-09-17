@@ -9,13 +9,13 @@ Branch `figmenta` = upstream release tag + a minimal set of patches. Rules:
 4. Anything that can be a plugin goes to `Figmenta/paseo-orchestra-plugin`, not here.
 
 Patches:
+
 - `packages/app/app.config.js`: optional `experiments.baseUrl` from `PASEO_WEB_BASE_URL`, so the web
   export can be served by Orchestra under `/agents-ui`.
 - Embed mode (see below): `packages/app/src/figmenta/embed.ts` (new file) plus three one-line guards.
 
 Build the web client for Orchestra:
 `PASEO_WEB_BASE_URL=/agents-ui npm run build --workspace=@getpaseo/app` → `packages/app/dist`.
-
 
 ## Embed mode
 
@@ -63,16 +63,18 @@ Three call sites, three hunks to reapply after a rebase:
    copy of the same list:
 
 ```tsx
-   {isEmbedMode() ? null : (
-     <WindowChromeSafeArea placement="inline" style={styles.paneTabs}>
-       ...
-     </WindowChromeSafeArea>
-   )}
+{
+  isEmbedMode() ? null : (
+    <WindowChromeSafeArea placement="inline" style={styles.paneTabs}>
+      ...
+    </WindowChromeSafeArea>
+  );
+}
 ```
 
-   Only the strip goes: the pane content below it is untouched. No height needs zeroing —
-   `styles.paneTabs` carries `position` and `minWidth` only, never a height, so the content
-   pane takes the room on its own.
+Only the strip goes: the pane content below it is untouched. No height needs zeroing —
+`styles.paneTabs` carries `position` and `minWidth` only, never a height, so the content
+pane takes the room on its own.
 
 Reapplying after `git rebase vX.Y.Z figmenta`: `embed.ts` comes across untouched. If a hunk
 fails, find the same three anchors (`LeftSidebar` inside `SidebarChrome`; the `return (` of
@@ -84,6 +86,39 @@ Verifying without Orchestra: open `http://127.0.0.1:8081/?embed=1` on the dev se
 sidebar, the header and the pane tab strip disappear, and they stay gone while navigating
 inside the app.
 Removing the flag needs a new tab (the latch lives in `sessionStorage`).
+
+## Embed bridge v2
+
+Orchestra drives the embedded client over `postMessage`, same origin, no answer back.
+Two messages in, plus a `theme=` query on the first URL. Schema frozen in
+`DMS/OS/Orchestra/PASEO/2026-09-17-maestro-v2-build-contracts.md` §4.
+
+```ts
+{ type: "maestro.composer.insert", text: string }   // append, never submit
+{ type: "maestro.theme", theme: "dark" | "light" }  // hot switch
+// first URL: /agents-ui/h/{serverId}/agent/{agentId}?embed=1&theme=dark|light
+```
+
+The hunks, so a rebase can be re-stitched:
+
+| File                                                                 | Function / site                                   | What it does                                                                                                                                                                                             |
+| -------------------------------------------------------------------- | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/app/src/figmenta/embed.ts`                                 | `readEmbedTheme`                                  | reads `?theme=`, latches it in `sessionStorage.figmentaTheme` (the router drops the query)                                                                                                               |
+|                                                                      | `applyEmbedTheme`                                 | `UnistylesRuntime.setAdaptiveThemes(false)` + `setTheme(THEME_TO_UNISTYLES[theme])`                                                                                                                      |
+|                                                                      | `reduceComposerInsert`                            | `(draft.length ? draft.trimEnd() + " " : "") + text` — the §4 append rule, pure                                                                                                                          |
+|                                                                      | `shouldBlockEmbedRoute`                           | true on `/settings*` and `/h/{id}/settings*`, false on `/h/{id}/agent/{id}`                                                                                                                              |
+|                                                                      | `installEmbedBridge`                              | idempotent (`window.__figmentaEmbedBridgeInstalled`), origin-checked `message` listener, applies the latched theme on install                                                                            |
+|                                                                      | `subscribeToEmbedComposerInsert`                  | the seam the composer hook uses; the bridge lives outside React and does not know the draft key                                                                                                          |
+| `packages/app/src/appearance/provider.tsx`                           | `applyTheme`                                      | returns early when `isEmbedMode() && readEmbedTheme()`, so the persisted Paseo preference cannot overwrite the imposed theme                                                                             |
+| `packages/app/src/composer/draft/input-draft.ts`                     | `useAgentInputDraft`                              | subscribes to the bridge and calls `replaceText(reduceComposerInsert(current, text))`, so the input re-renders through `textReplacement`. Skipped when `composer` options are passed (create-agent flow) |
+| `packages/app/src/app/_layout.tsx`                                   | `SidebarChrome`                                   | `installEmbedBridge()` on mount + route guard `shouldBlockEmbedRoute(pathname) → router.replace("/")`                                                                                                    |
+| `packages/app/src/components/model-browser.tsx`                      | `ProviderSettingsAction`, `CreateAgentProfileRow` | `return null` in embed                                                                                                                                                                                   |
+| `packages/app/src/screens/workspace/workspace-route-state-views.tsx` | «Manage host» button                              | not rendered in embed                                                                                                                                                                                    |
+| `packages/app/src/navigation/agent-route-resolution-view.tsx`        | «Manage host» button                              | not rendered in embed                                                                                                                                                                                    |
+
+Tests: `packages/app/src/figmenta/embed.test.ts` (jsdom) covers the pure functions.
+Run from `packages/app`, not the repo root — the root vitest config has no alias for
+`react-native-unistyles`: `npx vitest run --project unit src/figmenta`.
 
 ## Orchestra Desktop
 
@@ -156,7 +191,7 @@ only `orchestraDesktop = { version, platform }` and no IPC at all. The version a
 
 - `startDaemon` is exported.
 - **Daemon provenance.** `desktopManaged: true` in `~/.paseo/paseo.pid` means "a desktop app
-  spawned this daemon", not "*this* app did". Orchestra and an installed Paseo Desktop share
+  spawned this daemon", not "_this_ app did". Orchestra and an installed Paseo Desktop share
   `~/.paseo`, so the upstream check would let Orchestra kill Federico's daemon on quit. A
   module-level `daemonSpawnedByThisApp`, set only when our own spawn returns, gates the
   stop-on-quit path in `main.ts`. `startDaemon()` returns an already-running daemon untouched,

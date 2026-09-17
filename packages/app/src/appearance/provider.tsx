@@ -6,6 +6,7 @@ import {
   usePluginThemeCatalog,
   type PluginThemeOption,
 } from "@/plugins/themes";
+import { isEmbedMode, readEmbedTheme } from "@/figmenta/embed";
 import { PLUGIN_THEME_NAMES, PLUGIN_THEME_PREFERENCE, THEME_TO_UNISTYLES } from "@/styles/theme";
 import { applyAppearance } from "./apply";
 
@@ -23,6 +24,9 @@ interface ApplyThemeInput {
 const ContributedThemesContext = createContext<ContributedThemes | null>(null);
 
 function applyTheme({ preference, contributedTheme }: ApplyThemeInput): void {
+  // Figmenta embed: when Orchestra imposed a theme it owns the theme, and the
+  // persisted Paseo preference must not fight it (docs/FIGMENTA.md).
+  if (isEmbedMode() && readEmbedTheme()) return;
   if (contributedTheme) {
     const themeName = PLUGIN_THEME_NAMES[contributedTheme.theme.colorScheme];
     UnistylesRuntime.updateTheme(themeName, () => contributedTheme.theme);
