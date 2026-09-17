@@ -33,7 +33,6 @@ import { closeAllTransportSessions } from "./daemon/local-transport.js";
 import {
   applyDesktopWindowChromeMode,
   registerWindowManager,
-  getMainWindowChromeOptions,
   getWindowBackgroundColor,
   resolveSystemWindowTheme,
   resolveWindowBounds,
@@ -668,6 +667,21 @@ function getWorkAreasPrimaryFirst(): Electron.Rectangle[] {
   return [primary, ...others].map((display) => display.workArea);
 }
 
+// Figmenta fork: Paseo drew its own title bar — `titleBarStyle: "hidden"` plus an
+// overlay and a traffic-light offset — because its own client left a gap for the macOS
+// window buttons. The Orchestra site leaves no such gap, so the buttons sat on top of
+// its logo. The window takes the native title bar instead; nothing is injected into the
+// page to make room.
+function getOrchestraWindowChromeOptions(): Pick<
+  Electron.BrowserWindowConstructorOptions,
+  "titleBarStyle" | "frame" | "autoHideMenuBar"
+> {
+  if (process.platform === "darwin") {
+    return { titleBarStyle: "default" };
+  }
+  return { frame: true, autoHideMenuBar: true };
+}
+
 async function createWindow(
   options: {
     initialRoute?: string | null;
@@ -699,9 +713,7 @@ async function createWindow(
     show: false,
     backgroundColor: getWindowBackgroundColor(systemTheme),
     ...(iconPath ? { icon: iconPath } : {}),
-    ...getMainWindowChromeOptions({
-      mode: DESKTOP_WINDOW_CHROME_MODE,
-    }),
+    ...getOrchestraWindowChromeOptions(),
     webPreferences: {
       preload: getPreloadPath(),
       // Figmenta fork: the preload has no IPC, so the app version travels as an argv flag.
@@ -804,6 +816,12 @@ async function createWindow(
 // boundary. Orchestra (and the `*.figmenta.site` login hop) stays in-window;
 // everything else leaves for the system browser.
 function installOrchestraWindowGuards(win: BrowserWindow): void {
+  // The native title bar shows the window title, and the remote page would overwrite it
+  // with its own <title> on every route change. Keep it "Orchestra".
+  win.on("page-title-updated", (event) => {
+    event.preventDefault();
+  });
+
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (isOrchestraOrigin(url)) {
       return { action: "allow" };
@@ -1169,6 +1187,14 @@ const quitLifecycle = createQuitLifecycle({
 electronAutoUpdater.on("before-quit-for-update", () => {
   log.info("[auto-updater] before-quit-for-update", { currentVersion: app.getVersion() });
   quitLifecycle.handleBeforeQuitForUpdate();
+});
+// Figmenta fork: `orchestra_session` is a persistent cookie (Max-Age 7 days), so
+// Chromium keeps it across launches on its own. Chromium's cookie store writes are
+// asynchronous though, so a login seconds before quit could still be in flight: flush it.
+app.on("before-quit", () => {
+  void session.defaultSession.cookies.flushStore().catch((error: unknown) => {
+    log.error("[orchestra] failed to flush the cookie store on quit", error);
+  });
 });
 app.on("before-quit", quitLifecycle.handleBeforeQuit);
 registerExternalQuitSignals({ signals: process, quit: () => app.quit() });

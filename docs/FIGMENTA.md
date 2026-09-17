@@ -115,6 +115,17 @@ tested by `orchestra.test.ts` (no Electron needed):
 - `installOrchestraWindowGuards(win)` — `setWindowOpenHandler` keeps same-origin popups in a
   window and sends everything else to `shell.openExternal`; `will-navigate` refuses any
   top-level navigation outside `isAllowedNavigation` and hands it to the system browser.
+- `getOrchestraWindowChromeOptions()` — the window takes the **native** title bar
+  (`titleBarStyle: "default"` on macOS, `frame: true` elsewhere). Paseo drew its own bar
+  (`hidden` + overlay + a traffic-light offset) because its client left a gap for the macOS
+  buttons; the Orchestra site leaves none, so the buttons sat on top of its logo. The guards
+  also `preventDefault()` `page-title-updated`, so the native bar keeps reading "Orchestra"
+  instead of the page's `<title>`. No CSS is injected into the site.
+- Cookie durability: `orchestra_session` is a **persistent** cookie (`Max-Age` 7 days,
+  `maestro/web/src/lib/session.ts:9,:126-129`), so Chromium keeps it across launches with no
+  help from us. Its store writes are asynchronous, so `before-quit` calls
+  `session.defaultSession.cookies.flushStore()` — a login seconds before quit could still be
+  in flight. No cookie is rewritten or re-dated by the shell.
 - `installOrchestraSessionPolicies()` — `setPermissionRequestHandler` delegates to
   `permissionPolicy`; `webRequest.onBeforeSendHeaders` stamps `X-Orchestra-Desktop: <version>`
   on requests to the Orchestra origin only.
