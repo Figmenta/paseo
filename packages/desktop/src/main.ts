@@ -8,7 +8,7 @@ import { inheritLoginShellEnv } from "./login-shell-env.js";
 
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import {
   app,
@@ -26,7 +26,8 @@ import {
   shell,
   webContents,
 } from "electron";
-import { registerDaemonManager } from "./daemon/daemon-manager.js";
+import { registerDaemonManager, startDaemon } from "./daemon/daemon-manager.js";
+import { resolvePaseoHome } from "@getpaseo/server";
 import { parsePassthroughCliArgsFromArgv, runPassthroughCli } from "./daemon/cli/passthrough.js";
 import { closeAllTransportSessions } from "./daemon/local-transport.js";
 import {
@@ -90,6 +91,7 @@ import { clampWindowStateToWorkAreas, createWindowStateStore } from "./settings/
 import {
   isDesktopManagedDaemonRunningSync,
   stopDesktopDaemonViaCli,
+  wasDaemonSpawnedByThisApp,
 } from "./daemon/daemon-manager.js";
 import {
   createQuitLifecycle,
@@ -97,9 +99,16 @@ import {
   stopDesktopManagedDaemonOnQuitIfNeeded,
 } from "./daemon/quit-lifecycle.js";
 import { runDesktopStartup } from "./desktop-startup.js";
+import {
+  isAllowedNavigation,
+  isOrchestraOrigin,
+  ORCHESTRA_PLUGIN_ID,
+  ORCHESTRA_URL,
+  permissionPolicy,
+  seedPaseoConfigText,
+} from "./figmenta/orchestra.js";
 import { registerBrowserAutomationIpc } from "./features/browser-automation/ipc.js";
 import { BrowserKeyboard } from "./features/browser-keyboard/index.js";
-import { installAppUpdateOnQuit } from "./features/auto-updater.js";
 import {
   buildAgentDeepLinkRoute,
   parseAgentDeepLink,
@@ -107,11 +116,10 @@ import {
 } from "@getpaseo/protocol/agent-deep-link";
 import { AgentNavigationInbox, parseAgentDeepLinkFromArgv } from "./agent-navigation.js";
 
-const DEV_SERVER_URL = process.env.EXPO_DEV_URL ?? "http://localhost:8081";
 const APP_SCHEME = "paseo";
 const PASEO_DEBUG = process.env.PASEO_DEBUG === "1";
 const DISABLE_SINGLE_INSTANCE_LOCK = process.env.PASEO_DISABLE_SINGLE_INSTANCE_LOCK === "1";
-const APP_NAME = process.env.PASEO_TEST_APP_NAME?.trim() || "Paseo";
+const APP_NAME = process.env.PASEO_TEST_APP_NAME?.trim() || "Orchestra";
 const DESKTOP_WINDOW_CHROME_MODE = resolveDesktopWindowChromeMode({
   platform: process.platform,
   override: process.env.PASEO_DESKTOP_WINDOW_CONTROLS,
@@ -696,7 +704,11 @@ async function createWindow(
     }),
     webPreferences: {
       preload: getPreloadPath(),
-      additionalArguments: [windowChromeModeArgument(DESKTOP_WINDOW_CHROME_MODE)],
+      // Figmenta fork: the preload has no IPC, so the app version travels as an argv flag.
+      additionalArguments: [
+        windowChromeModeArgument(DESKTOP_WINDOW_CHROME_MODE),
+        `--orchestra-app-version=${app.getVersion()}`,
+      ],
       contextIsolation: true,
       nodeIntegration: false,
       webviewTag: true,
@@ -774,18 +786,43 @@ async function createWindow(
     mainWindow.show();
   });
 
+  installOrchestraWindowGuards(mainWindow);
+
   if (!app.isPackaged) {
     const { loadReactDevTools } = await import("./features/react-devtools.js");
     await loadReactDevTools();
-    const initialUrl = options.initialRoute
-      ? new URL(options.initialRoute, `${DEV_SERVER_URL}/`).toString()
-      : DEV_SERVER_URL;
-    await mainWindow.loadURL(initialUrl);
-    return mainWindow;
   }
 
-  await mainWindow.loadURL(`${APP_SCHEME}://app${options.initialRoute ?? "/"}`);
+  // Figmenta fork: the main window IS the remote Orchestra web app. The bundled
+  // Expo export and the `paseo://app` handler stay registered for deep links only,
+  // so `options.initialRoute` (a Paseo route) is meaningless here and is ignored.
+  await mainWindow.loadURL(ORCHESTRA_URL);
   return mainWindow;
+}
+
+// Figmenta fork: a window pointed at a remote origin needs its own navigation
+// boundary. Orchestra (and the `*.figmenta.site` login hop) stays in-window;
+// everything else leaves for the system browser.
+function installOrchestraWindowGuards(win: BrowserWindow): void {
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (isOrchestraOrigin(url)) {
+      return { action: "allow" };
+    }
+    if (url.startsWith("https:") || url.startsWith("http:")) {
+      void shell.openExternal(url);
+    }
+    return { action: "deny" };
+  });
+
+  win.webContents.on("will-navigate", (event, url) => {
+    if (isAllowedNavigation(url)) {
+      return;
+    }
+    event.preventDefault();
+    if (url.startsWith("https:") || url.startsWith("http:")) {
+      void shell.openExternal(url);
+    }
+  });
 }
 
 function ownedDesktopWindow(win: BrowserWindow): OwnedDesktopWindow<AgentDeepLinkTarget> {
@@ -897,6 +934,79 @@ function setupSingleInstanceLock(): boolean {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Figmenta fork: Orchestra runtime setup
+// ---------------------------------------------------------------------------
+
+// Where the `figmenta-sessions` plugin lives: shipped under Resources/plugins in a
+// packaged build, read straight from the monorepo copy in development.
+function resolveOrchestraPluginPath(): string {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, "plugins", ORCHESTRA_PLUGIN_ID)
+    : path.resolve(__dirname, "../figmenta-plugin");
+}
+
+// The Orchestra shell is the only thing that configures this daemon, so it seeds
+// ~/.paseo/config.json itself: plugins on, our plugin registered (never replacing an
+// entry the user already has), and the Orchestra origin allowed through daemon CORS.
+function seedOrchestraDaemonConfig(): void {
+  const home = resolvePaseoHome(process.env);
+  const configPath = path.join(home, "config.json");
+  let current = "";
+  try {
+    current = readFileSync(configPath, "utf-8");
+  } catch {
+    current = "";
+  }
+  const seeded = seedPaseoConfigText(current, { pluginPath: resolveOrchestraPluginPath() });
+  if (seeded === current) {
+    return;
+  }
+  mkdirSync(home, { recursive: true });
+  writeFileSync(configPath, seeded, "utf-8");
+  log.info("[orchestra] seeded daemon config", { configPath });
+}
+
+// In Paseo the renderer asks for the daemon over IPC. The Orchestra page is remote and
+// has no such bridge, so the main process starts it. startDaemon() returns an already
+// running daemon untouched: a daemon Federico started by hand keeps its own lifecycle.
+async function startOrchestraDaemon(): Promise<void> {
+  try {
+    const status = await startDaemon();
+    log.info("[orchestra] daemon ready", {
+      status: status.status,
+      listen: status.listen,
+      spawnedByThisApp: wasDaemonSpawnedByThisApp(),
+    });
+  } catch (error) {
+    log.error("[orchestra] failed to start the local daemon", error);
+  }
+}
+
+function installOrchestraSessionPolicies(): void {
+  const defaultSession = session.defaultSession;
+
+  defaultSession.setPermissionRequestHandler((contents, permission, callback, details) => {
+    const requestingUrl = details?.requestingUrl || contents?.getURL() || "";
+    const granted = permissionPolicy(requestingUrl, permission);
+    if (!granted) {
+      log.info("[orchestra] permission denied", { permission, requestingUrl });
+    }
+    callback(granted);
+  });
+
+  // Lets the Orchestra backend tell a desktop shell apart from a browser tab.
+  defaultSession.webRequest.onBeforeSendHeaders((details, callback) => {
+    if (!isOrchestraOrigin(details.url)) {
+      callback({ requestHeaders: details.requestHeaders });
+      return;
+    }
+    callback({
+      requestHeaders: { ...details.requestHeaders, "X-Orchestra-Desktop": app.getVersion() },
+    });
+  });
+}
+
 async function runCliPassthroughIfRequested(): Promise<boolean> {
   const cliArgs = parsePassthroughCliArgsFromArgv(process.argv);
   if (!cliArgs) {
@@ -979,6 +1089,10 @@ async function bootstrap(): Promise<void> {
     });
   });
 
+  installOrchestraSessionPolicies();
+  seedOrchestraDaemonConfig();
+  await startOrchestraDaemon();
+
   // The first window of the session restores and persists saved geometry.
   const initialAgentNavigation = pendingAgentNavigation;
   pendingAgentNavigation = null;
@@ -1029,17 +1143,18 @@ const quitLifecycle = createQuitLifecycle({
   stopDesktopManagedDaemonIfNeeded: () =>
     stopDesktopManagedDaemonOnQuitIfNeeded({
       settingsStore: getDesktopSettingsStore(),
-      isDesktopManagedDaemonRunning: isDesktopManagedDaemonRunningSync,
+      // Figmenta fork: the pid lock only says "some desktop manages this daemon".
+      // Quitting Orchestra must not kill the daemon of an installed Paseo Desktop.
+      isDesktopManagedDaemonRunning: () =>
+        wasDaemonSpawnedByThisApp() && isDesktopManagedDaemonRunningSync(),
       stopDaemon: () => stopDesktopDaemonViaCli("quit"),
       showShutdownFeedback: showDaemonShutdownDialog,
     }),
-  installAppUpdateOnQuit: async (signal) => {
-    const settings = await getDesktopSettingsStore().get();
-    return installAppUpdateOnQuit({
-      currentVersion: app.getVersion(),
-      releaseChannel: settings.releaseChannel,
-      signal,
-    });
+  // Figmenta fork: Orchestra ships without an update feed (publish: null), so there is
+  // never a downloaded update to validate on quit. Kept as a logged no-op.
+  installAppUpdateOnQuit: async () => {
+    log.info("[orchestra] auto-update disabled: nothing to install on quit");
+    return false;
   },
   createUpdateDeadlineSignal: () => AbortSignal.timeout(UPDATE_QUIT_DEADLINE_MS),
   onStopError: (error) => {

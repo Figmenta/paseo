@@ -1,9 +1,9 @@
 npmRebuild: false
-appId: sh.paseo.desktop
-productName: Paseo
-executableName: Paseo
+appId: it.figmenta.orchestra
+productName: Orchestra
+executableName: Orchestra
 protocols:
-  - name: Paseo agent link
+  - name: Orchestra agent link
     schemes:
       - paseo
 afterPack: ./scripts/after-pack.js
@@ -31,17 +31,27 @@ extraResources:
     to: app-dist
   - from: assets/editor-targets
     to: editor-target-icons
-publish:
-  provider: github
-  owner: getpaseo
-  repo: paseo
+  # Figmenta fork: the figmenta-sessions plugin ships inside the app and is seeded into
+  # ~/.paseo/config.json at boot. The source lives in the monorepo (packages/desktop/
+  # figmenta-plugin) so the build never reaches outside the checkout. The daemon esbuilds
+  # the plugin from this directory and externalizes only react/react-native/@getpaseo/plugin,
+  # so `zod` — its one bundled runtime dependency — must be resolvable from here.
+  - from: figmenta-plugin
+    to: plugins/figmenta-sessions
+  - from: ../../node_modules/zod
+    to: plugins/figmenta-sessions/node_modules/zod
+# Figmenta fork: Orchestra is distributed by hand, not through a GitHub release feed.
+# The in-app update commands are no-ops (daemon-manager.ts) to match.
+publish: null
 mac:
-  artifactName: "Paseo-${version}-${arch}.${ext}"
+  artifactName: "Orchestra-${version}-${arch}.${ext}"
   minimumSystemVersion: "13.0.0"
   category: public.app-category.developer-tools
   icon: assets/icon.icns
-  hardenedRuntime: true
-  notarize: true
+  # Figmenta fork: internal distribution, no Developer ID signing or notarization.
+  hardenedRuntime: false
+  notarize: false
+  identity: null
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.inherit.plist
   extraResources:
@@ -55,9 +65,9 @@ mac:
 linux:
   category: Development
   icon: assets
-  artifactName: "Paseo-${version}-${arch}.${ext}"
+  artifactName: "Orchestra-${version}-${arch}.${ext}"
   maintainer: "Mohamed Boudra <hello@moboudra.com>"
-  vendor: "Paseo"
+  vendor: "Figmenta"
   extraResources:
     - from: bin/paseo
       to: bin/paseo
@@ -72,9 +82,9 @@ appImage:
   # versioned path. A rename orphans the old binary, breaks desktop shortcuts, and
   # dangles the ~/.local/bin/paseo CLI symlink, which points at $APPIMAGE. The
   # version stays discoverable via the release tag and the in-app version.
-  artifactName: "Paseo-${arch}.${ext}"
+  artifactName: "Orchestra-${arch}.${ext}"
 win:
-  artifactName: "Paseo-Setup-${version}-${arch}.${ext}"
+  artifactName: "Orchestra-Setup-${version}-${arch}.${ext}"
   icon: assets/icon.ico
   extraResources:
     - from: bin/paseo.cmd
