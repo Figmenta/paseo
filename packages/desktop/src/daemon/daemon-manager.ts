@@ -31,6 +31,7 @@ import {
 import type { DesktopSettings } from "../settings/desktop-settings.js";
 import { getDesktopSettingsStore } from "../settings/desktop-settings-electron.js";
 import { isRunningUnderARM64Translation } from "../system/arm64-translation.js";
+import { shouldRestartDaemonForVersion } from "../figmenta/orchestra.js";
 import { getDesktopAppLogs } from "../diagnostics/app-logs.js";
 import { getDesktopUpdaterDiagnostics } from "../diagnostics/updater.js";
 import {
@@ -287,11 +288,16 @@ function normalizeVersion(version: string | null): string | null {
   return trimmed.replace(/^v/i, "");
 }
 
+// Figmenta fork: a version mismatch restarts only a daemon THIS app spawned. Upstream
+// restarted any `desktopManaged` one, which in Orchestra means a daemon belonging to an
+// installed Paseo Desktop sharing ~/.paseo. A foreign daemon is reused as it is.
 function shouldRestartForVersion(current: DesktopDaemonStatus): boolean {
-  if (!current.desktopManaged) return false;
-  const appVersion = normalizeVersion(resolveDesktopAppVersion());
-  const daemonVersion = normalizeVersion(current.version);
-  return Boolean(appVersion && daemonVersion && appVersion !== daemonVersion);
+  return shouldRestartDaemonForVersion({
+    spawnedByThisApp: daemonSpawnedByThisApp,
+    desktopManaged: current.desktopManaged,
+    appVersion: resolveDesktopAppVersion(),
+    daemonVersion: current.version,
+  });
 }
 
 function assertBuiltInDaemonManagementEnabled(settings: DesktopSettings): void {
@@ -354,6 +360,14 @@ export async function startDaemon(): Promise<DesktopDaemonStatus> {
       });
       await stopDesktopDaemon("version_mismatch");
     } else {
+      if (!daemonSpawnedByThisApp) {
+        logDesktopDaemonLifecycle("reusing a daemon this app did not spawn", {
+          pid: current.pid,
+          listen: current.listen,
+          daemonVersion: current.version,
+          appVersion: resolveDesktopAppVersion(),
+        });
+      }
       return current;
     }
   }
@@ -565,6 +579,12 @@ export function createDaemonCommandHandlers(): Record<string, DesktopCommandHand
     read_legacy_skill_selection: () => readLegacySkillSelection(),
     delete_legacy_skill_selection: () => deleteLegacySkillSelection(),
   };
+}
+
+// Figmenta fork: probe for the Orchestra shell — did the daemon actually load the plugin
+// we seeded? Goes through the same CLI the desktop already uses for daemon status.
+export async function listDaemonPlugins(): Promise<unknown> {
+  return runExternalCliJsonCommand(["plugin", "ls", "--json"]);
 }
 
 export function registerDaemonManager(): void {

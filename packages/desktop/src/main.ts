@@ -8,7 +8,7 @@ import { inheritLoginShellEnv } from "./login-shell-env.js";
 
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import {
   app,
@@ -17,6 +17,7 @@ import {
   ClipboardItem,
   clipboard,
   Menu,
+  dialog,
   ipcMain,
   nativeImage,
   net,
@@ -26,15 +27,14 @@ import {
   shell,
   webContents,
 } from "electron";
-import { registerDaemonManager, startDaemon } from "./daemon/daemon-manager.js";
-import { resolvePaseoHome } from "@getpaseo/server";
+import { listDaemonPlugins, registerDaemonManager, startDaemon } from "./daemon/daemon-manager.js";
+import { resolvePaseoHome, writeFileAtomic } from "@getpaseo/server";
 import { parsePassthroughCliArgsFromArgv, runPassthroughCli } from "./daemon/cli/passthrough.js";
 import { closeAllTransportSessions } from "./daemon/local-transport.js";
 import {
   applyDesktopWindowChromeMode,
+  getMainWindowChromeOptions,
   registerWindowManager,
-  getWindowBackgroundColor,
-  resolveSystemWindowTheme,
   resolveWindowBounds,
   setupWindowResizeEvents,
   setupWindowStatePersistence,
@@ -99,12 +99,16 @@ import {
 } from "./daemon/quit-lifecycle.js";
 import { runDesktopStartup } from "./desktop-startup.js";
 import {
+  corsAllowsOrchestra,
   isAllowedNavigation,
   isOrchestraOrigin,
+  ORCHESTRA_BACKGROUND_COLOR,
   ORCHESTRA_PLUGIN_ID,
   ORCHESTRA_URL,
   permissionPolicy,
+  pluginIsRunning,
   seedPaseoConfigText,
+  titleBarInset,
 } from "./figmenta/orchestra.js";
 import { registerBrowserAutomationIpc } from "./features/browser-automation/ipc.js";
 import { BrowserKeyboard } from "./features/browser-keyboard/index.js";
@@ -667,19 +671,22 @@ function getWorkAreasPrimaryFirst(): Electron.Rectangle[] {
   return [primary, ...others].map((display) => display.workArea);
 }
 
-// Figmenta fork: Paseo drew its own title bar — `titleBarStyle: "hidden"` plus an
-// overlay and a traffic-light offset — because its own client left a gap for the macOS
-// window buttons. The Orchestra site leaves no such gap, so the buttons sat on top of
-// its logo. The window takes the native title bar instead; nothing is injected into the
-// page to make room.
-function getOrchestraWindowChromeOptions(): Pick<
-  Electron.BrowserWindowConstructorOptions,
-  "titleBarStyle" | "frame" | "autoHideMenuBar"
-> {
-  if (process.platform === "darwin") {
-    return { titleBarStyle: "default" };
-  }
-  return { frame: true, autoHideMenuBar: true };
+// Figmenta fork: the shared webPreferences for every window that shows the remote
+// Orchestra page — the main window and any same-origin popup it opens. `webviewTag` is
+// off: nothing in Orchestra uses <webview>, and leaving it on gives a remote document a
+// tag that can host another renderer.
+function orchestraWebPreferences(): Electron.WebPreferences {
+  return {
+    preload: getPreloadPath(),
+    additionalArguments: [
+      windowChromeModeArgument(DESKTOP_WINDOW_CHROME_MODE),
+      `--orchestra-app-version=${app.getVersion()}`,
+      `--orchestra-title-bar-inset=${titleBarInset()}`,
+    ],
+    contextIsolation: true,
+    nodeIntegration: false,
+    webviewTag: false,
+  };
 }
 
 async function createWindow(
@@ -691,7 +698,6 @@ async function createWindow(
   } = {},
 ): Promise<BrowserWindow> {
   const iconPath = await getEffectiveAppIconPath();
-  const systemTheme = resolveSystemWindowTheme();
 
   // Only the first window of a session restores and persists saved geometry.
   // Additional windows (⌘N, second-instance, "Open in new window") open at the
@@ -711,20 +717,13 @@ async function createWindow(
     title,
     ...resolveWindowBounds(restoredWindowState),
     show: false,
-    backgroundColor: getWindowBackgroundColor(systemTheme),
+    // Figmenta fork: paint the site's own background, not a white flash.
+    backgroundColor: ORCHESTRA_BACKGROUND_COLOR,
     ...(iconPath ? { icon: iconPath } : {}),
-    ...getOrchestraWindowChromeOptions(),
-    webPreferences: {
-      preload: getPreloadPath(),
-      // Figmenta fork: the preload has no IPC, so the app version travels as an argv flag.
-      additionalArguments: [
-        windowChromeModeArgument(DESKTOP_WINDOW_CHROME_MODE),
-        `--orchestra-app-version=${app.getVersion()}`,
-      ],
-      contextIsolation: true,
-      nodeIntegration: false,
-      webviewTag: true,
-    },
+    ...getMainWindowChromeOptions({
+      mode: DESKTOP_WINDOW_CHROME_MODE,
+    }),
+    webPreferences: orchestraWebPreferences(),
   });
   applyDesktopWindowChromeMode({ win: mainWindow, mode: DESKTOP_WINDOW_CHROME_MODE });
 
@@ -815,31 +814,54 @@ async function createWindow(
 // Figmenta fork: a window pointed at a remote origin needs its own navigation
 // boundary. Orchestra (and the `*.figmenta.site` login hop) stays in-window;
 // everything else leaves for the system browser.
-function installOrchestraWindowGuards(win: BrowserWindow): void {
-  // The native title bar shows the window title, and the remote page would overwrite it
-  // with its own <title> on every route change. Keep it "Orchestra".
-  win.on("page-title-updated", (event) => {
-    event.preventDefault();
-  });
+function externalizeOrchestraNavigation(event: { preventDefault(): void }, url: string): void {
+  if (isAllowedNavigation(url)) {
+    return;
+  }
+  event.preventDefault();
+  if (url.startsWith("https:") || url.startsWith("http:")) {
+    log.info("[orchestra] navigation sent to the system browser", { url });
+    void shell.openExternal(url);
+    return;
+  }
+  log.warn("[orchestra] navigation blocked", { url });
+}
 
+function installOrchestraWindowGuards(win: BrowserWindow): void {
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (isOrchestraOrigin(url)) {
-      return { action: "allow" };
+      // A popup inherits nothing by default: hand it the same locked-down preferences,
+      // or it would open with a preload-less, webview-capable renderer.
+      return {
+        action: "allow",
+        overrideBrowserWindowOptions: {
+          backgroundColor: ORCHESTRA_BACKGROUND_COLOR,
+          webPreferences: orchestraWebPreferences(),
+        },
+      };
     }
     if (url.startsWith("https:") || url.startsWith("http:")) {
+      log.info("[orchestra] popup sent to the system browser", { url });
       void shell.openExternal(url);
     }
     return { action: "deny" };
   });
 
+  // And the popup itself gets the same boundary, recursively.
+  win.webContents.on("did-create-window", (child) => {
+    installOrchestraWindowGuards(child);
+  });
+
+  // Three events, one boundary: a redirect and a subframe navigation leave the origin
+  // just as effectively as a click on a link.
   win.webContents.on("will-navigate", (event, url) => {
-    if (isAllowedNavigation(url)) {
-      return;
-    }
-    event.preventDefault();
-    if (url.startsWith("https:") || url.startsWith("http:")) {
-      void shell.openExternal(url);
-    }
+    externalizeOrchestraNavigation(event, url);
+  });
+  win.webContents.on("will-redirect", (event, url) => {
+    externalizeOrchestraNavigation(event, url);
+  });
+  win.webContents.on("will-frame-navigate", (event) => {
+    externalizeOrchestraNavigation(event, event.url);
   });
 }
 
@@ -967,7 +989,7 @@ function resolveOrchestraPluginPath(): string {
 // The Orchestra shell is the only thing that configures this daemon, so it seeds
 // ~/.paseo/config.json itself: plugins on, our plugin registered (never replacing an
 // entry the user already has), and the Orchestra origin allowed through daemon CORS.
-function seedOrchestraDaemonConfig(): void {
+async function seedOrchestraDaemonConfig(): Promise<void> {
   const home = resolvePaseoHome(process.env);
   const configPath = path.join(home, "config.json");
   let current = "";
@@ -976,12 +998,31 @@ function seedOrchestraDaemonConfig(): void {
   } catch {
     current = "";
   }
-  const seeded = seedPaseoConfigText(current, { pluginPath: resolveOrchestraPluginPath() });
-  if (seeded === current) {
+
+  const result = seedPaseoConfigText(current, { pluginPath: resolveOrchestraPluginPath() });
+  if (result.status === "corrupt") {
+    // A config we cannot parse is not ours to replace: it may be hand-edited and this
+    // may be its only copy. Keep a dated copy as evidence, report, and leave it alone —
+    // the daemon will refuse it too, and the log says why.
+    const backupPath = `${configPath}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+    try {
+      copyFileSync(configPath, backupPath);
+    } catch (error) {
+      log.error("[orchestra] could not preserve the unreadable config", error);
+    }
+    log.error("[orchestra] config.json does not parse: not seeded, left untouched", {
+      configPath,
+      backupPath,
+      reason: result.reason,
+    });
     return;
   }
-  mkdirSync(home, { recursive: true });
-  writeFileSync(configPath, seeded, "utf-8");
+
+  if (result.text === current) {
+    return;
+  }
+  // Atomic: a half-written config.json is a daemon that will not start.
+  await writeFileAtomic(configPath, result.text);
   log.info("[orchestra] seeded daemon config", { configPath });
 }
 
@@ -989,16 +1030,87 @@ function seedOrchestraDaemonConfig(): void {
 // has no such bridge, so the main process starts it. startDaemon() returns an already
 // running daemon untouched: a daemon Federico started by hand keeps its own lifecycle.
 async function startOrchestraDaemon(): Promise<void> {
+  let listen: string | null = null;
   try {
     const status = await startDaemon();
+    listen = status.listen;
     log.info("[orchestra] daemon ready", {
       status: status.status,
-      listen: status.listen,
+      listen,
       spawnedByThisApp: wasDaemonSpawnedByThisApp(),
     });
   } catch (error) {
     log.error("[orchestra] failed to start the local daemon", error);
+    return;
   }
+  await verifyOrchestraDaemonSeed(listen);
+}
+
+// Seeding the config is a no-op on a daemon that was ALREADY running: it read its config
+// at boot. So we ask the live daemon, instead of assuming: does it allow our origin, and
+// did it load our plugin? If not, the only cure is a restart, and a daemon we did not
+// spawn is not ours to restart — we say so instead.
+async function verifyOrchestraDaemonSeed(listen: string | null): Promise<void> {
+  const target = listen?.trim() || "127.0.0.1:6767";
+  let corsOk = false;
+  try {
+    const response = await net.fetch(`http://${target}/api/health`, {
+      headers: { Origin: ORCHESTRA_URL },
+    });
+    corsOk = corsAllowsOrchestra(response.headers.get("access-control-allow-origin"));
+  } catch (error) {
+    log.error("[orchestra] could not reach the daemon health endpoint", { target, error });
+  }
+
+  let pluginOk = false;
+  try {
+    pluginOk = pluginIsRunning(await listDaemonPlugins());
+  } catch (error) {
+    log.error("[orchestra] could not list the daemon plugins", error);
+  }
+
+  if (corsOk && pluginOk) {
+    log.info("[orchestra] daemon seed verified", { target });
+    return;
+  }
+
+  log.error("[orchestra] the daemon is not running with the Orchestra seed", {
+    target,
+    corsAllowsOrchestra: corsOk,
+    pluginRunning: pluginOk,
+    spawnedByThisApp: wasDaemonSpawnedByThisApp(),
+  });
+  showDaemonSeedWarning();
+}
+
+function showDaemonSeedWarning(): void {
+  const ours = wasDaemonSpawnedByThisApp();
+  void dialog
+    .showMessageBox({
+      type: "warning",
+      title: APP_NAME,
+      message: "Engine needs a restart to load the Orchestra plugin",
+      detail: ours
+        ? "The engine is running with an older configuration. Restarting it takes a few seconds."
+        : "The engine running on this machine was started outside Orchestra, so Orchestra will not restart it. Quit it (or the app that owns it) and reopen Orchestra.",
+      buttons: ours ? ["Restart engine", "Later"] : ["OK"],
+      defaultId: 0,
+      cancelId: ours ? 1 : 0,
+      noLink: true,
+    })
+    .then(async (result) => {
+      if (!ours || result.response !== 0) return;
+      try {
+        await stopDesktopDaemonViaCli("quit");
+        await startDaemon();
+        log.info("[orchestra] engine restarted on request");
+      } catch (error) {
+        log.error("[orchestra] engine restart failed", error);
+      }
+    })
+    .catch((error: unknown) => {
+      log.error("[orchestra] failed to show the engine warning", error);
+    });
 }
 
 function installOrchestraSessionPolicies(): void {
@@ -1012,6 +1124,15 @@ function installOrchestraSessionPolicies(): void {
     }
     callback(granted);
   });
+
+  // The synchronous check follows the same policy: a request handler alone leaves the
+  // check path on Electron's defaults, which grant several permissions without asking.
+  defaultSession.setPermissionCheckHandler((_contents, permission, requestingOrigin) =>
+    permissionPolicy(requestingOrigin ?? "", permission),
+  );
+
+  // No device (HID/serial/USB) is ever handed to the page.
+  defaultSession.setDevicePermissionHandler(() => false);
 
   // Lets the Orchestra backend tell a desktop shell apart from a browser tab.
   defaultSession.webRequest.onBeforeSendHeaders((details, callback) => {
@@ -1108,7 +1229,7 @@ async function bootstrap(): Promise<void> {
   });
 
   installOrchestraSessionPolicies();
-  seedOrchestraDaemonConfig();
+  await seedOrchestraDaemonConfig();
   await startOrchestraDaemon();
 
   // The first window of the session restores and persists saved geometry.

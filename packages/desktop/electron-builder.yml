@@ -38,6 +38,10 @@ extraResources:
   # so `zod` — its one bundled runtime dependency — must be resolvable from here.
   - from: figmenta-plugin
     to: plugins/figmenta-sessions
+    filter:
+      - "!node_modules"
+      - "!**/*.test.ts"
+      - "!**/*.test.tsx"
   - from: ../../node_modules/zod
     to: plugins/figmenta-sessions/node_modules/zod
 # Figmenta fork: Orchestra is distributed by hand, not through a GitHub release feed.

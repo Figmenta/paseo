@@ -7,9 +7,47 @@
 export const DEFAULT_ORCHESTRA_URL = "https://orchestra.figmenta.site";
 export const ORCHESTRA_PLUGIN_ID = "figmenta-sessions";
 
-/** Hosts we still accept a top-level navigation to: Orchestra itself plus any
- * `*.figmenta.site` sibling, because the login flow can bounce through one. */
-const FIGMENTA_SUFFIX = ".figmenta.site";
+/** `--bg` from the Orchestra stylesheet: the window paints the site's own background
+ * while it loads, instead of a white flash. */
+export const ORCHESTRA_BACKGROUND_COLOR = "#08090B";
+
+/**
+ * Height in px of the strip the macOS traffic lights occupy, handed to the page through
+ * `window.orchestraDesktop.titleBarInset` so Orchestra can leave room for them. The
+ * window keeps Paseo's own chrome (`titleBarStyle: "hidden"` with the traffic lights at
+ * y=14), so the buttons overlap the top-left of the document unless the site indents.
+ */
+export function titleBarInset(platform: NodeJS.Platform = process.platform): number {
+  return platform === "darwin" ? 28 : 0;
+}
+
+/** Does this `Access-Control-Allow-Origin` value let the Orchestra page call the daemon? */
+export function corsAllowsOrchestra(
+  headerValue: string | null | undefined,
+  orchestraUrl: string = ORCHESTRA_URL,
+): boolean {
+  const value = headerValue?.trim();
+  if (!value) return false;
+  if (value === "*") return true;
+  return value.split(/[,\s]+/).includes(orchestraOrigin(orchestraUrl));
+}
+
+/** Is our plugin actually running, per `paseo plugin ls --json`? */
+export function pluginIsRunning(payload: unknown, pluginId: string = ORCHESTRA_PLUGIN_ID): boolean {
+  const list = Array.isArray(payload)
+    ? payload
+    : payload !== null && typeof payload === "object" && Array.isArray((payload as { data?: unknown }).data)
+      ? ((payload as { data: unknown[] }).data)
+      : null;
+  if (!list) return false;
+  return list.some(
+    (entry) =>
+      entry !== null &&
+      typeof entry === "object" &&
+      (entry as { id?: unknown }).id === pluginId &&
+      (entry as { status?: unknown }).status === "running",
+  );
+}
 
 export function resolveOrchestraUrl(
   env: Record<string, string | undefined> = process.env,
@@ -43,19 +81,14 @@ export function isOrchestraOrigin(url: string, orchestraUrl: string = ORCHESTRA_
   return origin !== null && origin === orchestraOrigin(orchestraUrl);
 }
 
-/** Top-level navigation allowlist: Orchestra, plus https `*.figmenta.site` for the
- * OIDC hop. Everything else (including http and other hosts) is refused in-window
- * and handed to the system browser. */
+/**
+ * Top-level navigation allowlist: the Orchestra origin and nothing else. The OIDC
+ * login lives on that same host, so no sibling is needed — and a `*.figmenta.site`
+ * wildcard would let any future subdomain drive this window. Everything else is
+ * refused in-window and handed to the system browser.
+ */
 export function isAllowedNavigation(url: string, orchestraUrl: string = ORCHESTRA_URL): boolean {
-  if (isOrchestraOrigin(url, orchestraUrl)) return true;
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return false;
-  }
-  if (parsed.protocol !== "https:") return false;
-  return parsed.hostname === "figmenta.site" || parsed.hostname.endsWith(FIGMENTA_SUFFIX);
+  return isOrchestraOrigin(url, orchestraUrl);
 }
 
 const ALLOWED_PERMISSIONS = new Set([
@@ -71,6 +104,24 @@ const ALLOWED_PERMISSIONS = new Set([
 export function permissionPolicy(origin: string, permission: string): boolean {
   if (!isOrchestraOrigin(origin)) return false;
   return ALLOWED_PERMISSIONS.has(permission);
+}
+
+/**
+ * Whether a running daemon should be restarted because its version does not match the
+ * app's. Upstream restarted any `desktopManaged` daemon; Orchestra shares ~/.paseo with
+ * an installed Paseo Desktop, so a daemon we did not spawn is reused as-is — killing
+ * someone else's daemon to align a version number is not ours to do.
+ */
+export function shouldRestartDaemonForVersion(input: {
+  spawnedByThisApp: boolean;
+  desktopManaged: boolean;
+  appVersion: string | null;
+  daemonVersion: string | null;
+}): boolean {
+  if (!input.spawnedByThisApp || !input.desktopManaged) return false;
+  const app = input.appVersion?.trim().replace(/^v/i, "") || null;
+  const daemon = input.daemonVersion?.trim().replace(/^v/i, "") || null;
+  return Boolean(app && daemon && app !== daemon);
 }
 
 // ---------------------------------------------------------------------------
@@ -125,18 +176,29 @@ export function seedPaseoConfig(config: unknown, options: SeedOptions): JsonObje
   return next;
 }
 
-/** Text-in / text-out wrapper. An unreadable or empty file is treated as `{}`:
- * the daemon rewrites the file anyway, and refusing to start over a stray byte
- * would be worse than reseeding. */
-export function seedPaseoConfigText(text: string, options: SeedOptions): string {
-  let parsed: unknown = {};
+export type SeedTextResult =
+  | { status: "ok"; text: string }
+  | { status: "corrupt"; reason: string };
+
+/**
+ * Text-in / text-out wrapper. A missing or empty file seeds from `{}`. A file that does
+ * not parse is NOT rewritten: it may hold a hand-edited config whose only copy is that
+ * file, and silently replacing it with our three keys would destroy it. The caller
+ * preserves it and reports.
+ */
+export function seedPaseoConfigText(text: string, options: SeedOptions): SeedTextResult {
   const trimmed = text.trim();
-  if (trimmed.length > 0) {
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      parsed = {};
-    }
+  if (trimmed.length === 0) {
+    return { status: "ok", text: `${JSON.stringify(seedPaseoConfig({}, options), null, 2)}\n` };
   }
-  return `${JSON.stringify(seedPaseoConfig(parsed, options), null, 2)}\n`;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (error) {
+    return { status: "corrupt", reason: error instanceof Error ? error.message : String(error) };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { status: "corrupt", reason: "config.json is not a JSON object" };
+  }
+  return { status: "ok", text: `${JSON.stringify(seedPaseoConfig(parsed, options), null, 2)}\n` };
 }

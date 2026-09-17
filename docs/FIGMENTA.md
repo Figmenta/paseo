@@ -115,17 +115,29 @@ tested by `orchestra.test.ts` (no Electron needed):
 - `installOrchestraWindowGuards(win)` — `setWindowOpenHandler` keeps same-origin popups in a
   window and sends everything else to `shell.openExternal`; `will-navigate` refuses any
   top-level navigation outside `isAllowedNavigation` and hands it to the system browser.
-- `getOrchestraWindowChromeOptions()` — the window takes the **native** title bar
-  (`titleBarStyle: "default"` on macOS, `frame: true` elsewhere). Paseo drew its own bar
-  (`hidden` + overlay + a traffic-light offset) because its client left a gap for the macOS
-  buttons; the Orchestra site leaves none, so the buttons sat on top of its logo. The guards
-  also `preventDefault()` `page-title-updated`, so the native bar keeps reading "Orchestra"
-  instead of the page's `<title>`. No CSS is injected into the site.
-- Cookie durability: `orchestra_session` is a **persistent** cookie (`Max-Age` 7 days,
-  `maestro/web/src/lib/session.ts:9,:126-129`), so Chromium keeps it across launches with no
-  help from us. Its store writes are asynchronous, so `before-quit` calls
-  `session.defaultSession.cookies.flushStore()` — a login seconds before quit could still be
-  in flight. No cookie is rewritten or re-dated by the shell.
+- Window chrome stays Paseo's (`getMainWindowChromeOptions`, `titleBarStyle: "hidden"`
+  with the traffic lights at y=14) and the background is the site's own `--bg` (`#08090B`),
+  so there is no white flash. The macOS buttons float over the page, so the preload hands
+  Orchestra `titleBarInset` (28 on macOS, 0 elsewhere) and the site indents its own header:
+  the shell injects no CSS and overrides no page title.
+- `orchestraWebPreferences()` is shared by the main window and every same-origin popup
+  (`setWindowOpenHandler` → `overrideBrowserWindowOptions`, plus `did-create-window` so the
+  popup inherits the same guards). `webviewTag: false`.
+- The navigation boundary covers `will-navigate`, `will-redirect` **and**
+  `will-frame-navigate`; refused URLs go to `shell.openExternal` and are logged.
+- Permissions: `setPermissionRequestHandler` **and** `setPermissionCheckHandler` share
+  `permissionPolicy`; `setDevicePermissionHandler` denies every device.
+- Seeding is atomic (`writeFileAtomic`, re-exported from `@getpaseo/server`). A
+  `config.json` that does not parse is **never** rewritten: it is copied to
+  `config.json.corrupt-<ts>` and reported.
+- Seeding a daemon that was already running is a no-op — it read its config at boot. So
+  `verifyOrchestraDaemonSeed()` asks the live daemon: `GET /api/health` with an `Origin`
+  header (checking `Access-Control-Allow-Origin`) and `paseo plugin ls --json` (checking
+  `figmenta-sessions` is `running`). If the seed is not in force it logs and shows a
+  non-blocking dialog; the "Restart engine" button appears only for a daemon this app
+  spawned, otherwise the text says who has to act.
+- A version mismatch restarts the daemon only if this app spawned it
+  (`shouldRestartDaemonForVersion`); a foreign daemon is reused and the reuse is logged.
 - `installOrchestraSessionPolicies()` — `setPermissionRequestHandler` delegates to
   `permissionPolicy`; `webRequest.onBeforeSendHeaders` stamps `X-Orchestra-Desktop: <version>`
   on requests to the Orchestra origin only.

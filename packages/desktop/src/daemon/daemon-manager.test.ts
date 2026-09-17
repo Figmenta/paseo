@@ -347,69 +347,38 @@ describe("daemon-manager commands", () => {
     expect(mocks.spawnProcess).not.toHaveBeenCalled();
   });
 
-  it("restarts a stale reachable desktop daemon when the version differs", async () => {
-    mocks.runExternalCliJsonCommand
-      .mockResolvedValueOnce({
-        localDaemon: "stale_pid",
-        connectedDaemon: "reachable",
-        serverId: "server-1",
-        pid: 7675,
-        listen: "127.0.0.1:6767",
-        hostname: "dev-host",
-        daemonVersion: "1.2.2",
-        desktopManaged: true,
-      })
-      .mockResolvedValueOnce({
-        localDaemon: "stale_pid",
-        connectedDaemon: "reachable",
-        serverId: "server-1",
-        pid: 7675,
-        listen: "127.0.0.1:6767",
-        daemonVersion: "1.2.2",
-        desktopManaged: true,
-      })
-      .mockResolvedValueOnce({ action: "stopped" })
-      .mockResolvedValueOnce({
-        localDaemon: "stopped",
-        connectedDaemon: "unreachable",
-        serverId: "",
-      })
-      .mockResolvedValueOnce({
-        localDaemon: "running",
-        connectedDaemon: "reachable",
-        serverId: "server-2",
-        pid: 8888,
-        listen: "127.0.0.1:6767",
-        hostname: "dev-host",
-        daemonVersion: "1.2.3",
-        desktopManaged: true,
-      });
+  // Figmenta fork: upstream restarted any `desktopManaged` daemon whose version differed.
+  // Orchestra shares ~/.paseo with an installed Paseo Desktop, so a daemon this process
+  // did not spawn is reused as it is — the version-gated restart applies only to our own,
+  // and the predicate itself is covered in src/figmenta/orchestra.test.ts.
+  it("reuses a version-mismatched daemon this app did not spawn", async () => {
+    mocks.runExternalCliJsonCommand.mockResolvedValueOnce({
+      localDaemon: "running",
+      connectedDaemon: "reachable",
+      serverId: "server-1",
+      pid: 7675,
+      listen: "127.0.0.1:6767",
+      hostname: "dev-host",
+      daemonVersion: "1.2.2",
+      desktopManaged: true,
+    });
     mocks.spawnProcess.mockReturnValue(createMockChildProcess());
     const handlers = createDaemonCommandHandlers();
 
     await expect(handlers.start_desktop_daemon()).resolves.toEqual({
-      serverId: "server-2",
+      serverId: "server-1",
       status: "running",
       listen: "127.0.0.1:6767",
       hostname: "dev-host",
-      pid: 8888,
+      pid: 7675,
       home: mocks.paseoHome,
-      version: "1.2.3",
+      version: "1.2.2",
       desktopManaged: true,
       error: null,
     });
 
-    expect(mocks.runExternalCliJsonCommand).toHaveBeenNthCalledWith(3, [
-      "daemon",
-      "stop",
-      "--json",
-      "--timeout",
-      "5",
-      "--force",
-      "--kill-timeout",
-      "5",
-    ]);
-    expect(mocks.spawnProcess).toHaveBeenCalled();
+    expect(mocks.runExternalCliJsonCommand).toHaveBeenCalledTimes(1);
+    expect(mocks.spawnProcess).not.toHaveBeenCalled();
   });
 
   it("starts the managed daemon detached from desktop stdio and reports daemon log failures", async () => {
