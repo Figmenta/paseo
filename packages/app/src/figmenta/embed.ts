@@ -68,7 +68,7 @@ export function resetEmbedModeCache(): void {
 //
 // Orchestra owns the chrome AND the theme. Two messages come in over
 // postMessage, same-origin only, and nothing goes back out:
-//   { type: "maestro.composer.insert", text }  append to the active composer
+//   { type: "maestro.composer.insert", text, agentId }  append, that agent only
 //   { type: "maestro.theme", theme }           hot dark/light switch
 // The theme also arrives as `?theme=dark|light` on the first URL, latched like
 // `?embed=1` because the router rewrites the query away.
@@ -154,13 +154,20 @@ export function shouldBlockEmbedRoute(pathname: string): boolean {
   return false;
 }
 
-type ComposerInsertListener = (text: string) => void;
+/** §4 payload: an insert names its agent, it never means "whoever is active". */
+export interface EmbedComposerInsert {
+  text: string;
+  agentId: string;
+}
+
+type ComposerInsertListener = (insert: EmbedComposerInsert) => void;
 
 const composerInsertListeners = new Set<ComposerInsertListener>();
 
 /**
  * The composer hook subscribes here: the bridge lives outside React, and the
  * draft key of the active session is only known inside `useAgentInputDraft`.
+ * Every mounted composer is called: each one keeps only its own `agentId`.
  */
 export function subscribeToEmbedComposerInsert(listener: ComposerInsertListener): () => void {
   composerInsertListeners.add(listener);
@@ -169,10 +176,10 @@ export function subscribeToEmbedComposerInsert(listener: ComposerInsertListener)
   };
 }
 
-function emitComposerInsert(text: string): void {
+function emitComposerInsert(insert: EmbedComposerInsert): void {
   for (const listener of Array.from(composerInsertListeners)) {
     try {
-      listener(text);
+      listener(insert);
     } catch (error) {
       console.warn("[Figmenta] composer insert listener failed", error);
     }
@@ -181,13 +188,21 @@ function emitComposerInsert(text: string): void {
 
 function handleEmbedMessage(event: MessageEvent): void {
   if (event.origin !== window.location.origin) return;
-  const data = event.data as { type?: unknown; text?: unknown; theme?: unknown } | null;
+  const data = event.data as {
+    type?: unknown;
+    text?: unknown;
+    theme?: unknown;
+    agentId?: unknown;
+  } | null;
   if (typeof data?.type !== "string") return;
 
   switch (data.type) {
     case "maestro.composer.insert": {
       if (typeof data.text !== "string" || data.text.length === 0) return;
-      emitComposerInsert(data.text);
+      // No agent named, no delivery: an insert without a target would land in
+      // every mounted composer at once.
+      if (typeof data.agentId !== "string" || data.agentId.length === 0) return;
+      emitComposerInsert({ text: data.text, agentId: data.agentId });
       return;
     }
     case "maestro.theme": {
