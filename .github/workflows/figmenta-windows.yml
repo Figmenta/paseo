@@ -1,0 +1,61 @@
+# Figmenta fork: Windows installer of Orchestra Desktop, distributed by hand from
+# downloads.figmenta.site. Same build as desktop-release.yml (publish-windows job), but:
+# x64 NSIS only, no GitHub Release (the fork is public: the installer stays a workflow
+# artifact, 7 days), triggered by pushing a tag `figmenta-win-*` on the figmenta branch.
+name: Figmenta Windows installer
+
+on:
+  push:
+    tags:
+      - "figmenta-win-*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: package-lock.json
+
+      - name: Install JS dependencies
+        run: node scripts/npm-retry.mjs ci
+
+      - name: Build desktop (Windows x64, NSIS)
+        shell: bash
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          PASEO_DESKTOP_SMOKE: "1"
+          PASEO_DESKTOP_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/desktop-smoke
+        run: |
+          set -euo pipefail
+          npm run build:desktop -- --publish never --win nsis --x64
+
+      - name: Upload smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-smoke-windows-x64
+          path: ${{ runner.temp }}/desktop-smoke
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: orchestra-windows-x64
+          path: |
+            packages/desktop/release/*.exe
+            packages/desktop/release/*.exe.blockmap
+          if-no-files-found: error
+          retention-days: 7
