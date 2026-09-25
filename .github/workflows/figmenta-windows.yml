@@ -33,22 +33,15 @@ jobs:
 
       - name: Build desktop (Windows x64, NSIS)
         shell: bash
+        # No PASEO_DESKTOP_SMOKE: the upstream smoke waits for the paseo://app/ renderer,
+        # while the fork's window loads https://orchestra.figmenta.site, so it can never
+        # pass here (same as the local macOS build). The CLI shim cold daemon start it
+        # also runs passed on run 36118006318.
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-          PASEO_DESKTOP_SMOKE: "1"
-          PASEO_DESKTOP_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/desktop-smoke
         run: |
           set -euo pipefail
           npm run build:desktop -- --publish never --win nsis --x64
-
-      - name: Upload smoke diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: desktop-smoke-windows-x64
-          path: ${{ runner.temp }}/desktop-smoke
-          if-no-files-found: ignore
-          retention-days: 7
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
