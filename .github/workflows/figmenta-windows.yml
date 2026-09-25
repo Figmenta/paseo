@@ -1,19 +1,22 @@
-# Figmenta fork: Windows installer of Orchestra Desktop, distributed by hand from
-# downloads.figmenta.site. Same build as desktop-release.yml (publish-windows job), but:
-# x64 NSIS only, no GitHub Release (the fork is public: the installer stays a workflow
-# artifact, 7 days), triggered by pushing a tag `figmenta-win-*` on the figmenta branch.
-name: Figmenta Windows installer
+# Figmenta fork: installers of Orchestra Desktop, distributed by hand from
+# downloads.figmenta.site. Same build as desktop-release.yml, but: one target per
+# platform (Windows x64 NSIS, macOS arm64 dmg), unsigned (internal app), and a workflow
+# artifact instead of a GitHub Release (the fork is public: 7 days retention).
+# Trigger: push a tag `figmenta-win-*` or `figmenta-mac-*` on the figmenta branch.
+name: Figmenta desktop installers
 
 on:
   push:
     tags:
       - "figmenta-win-*"
+      - "figmenta-mac-*"
 
 permissions:
   contents: read
 
 jobs:
   build-windows:
+    if: startsWith(github.ref_name, 'figmenta-win-')
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
@@ -50,5 +53,41 @@ jobs:
           path: |
             packages/desktop/release/*.exe
             packages/desktop/release/*.exe.blockmap
+          if-no-files-found: error
+          retention-days: 7
+
+  build-macos:
+    if: startsWith(github.ref_name, 'figmenta-mac-')
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: package-lock.json
+
+      - name: Install JS dependencies
+        run: node scripts/npm-retry.mjs ci
+
+      - name: Build desktop (macOS arm64, dmg, unsigned)
+        shell: bash
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          set -euo pipefail
+          npm run build:desktop -- --publish never --mac dmg --arm64 \
+            -c.mac.identity=null -c.mac.notarize=false -c.mac.hardenedRuntime=false
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: orchestra-macos-arm64
+          path: packages/desktop/release/*.dmg
           if-no-files-found: error
           retention-days: 7
