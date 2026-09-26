@@ -1,6 +1,6 @@
 # Figmenta fork: installers of Orchestra Desktop, distributed by hand from
 # downloads.figmenta.site. Same build as desktop-release.yml, but: one target per
-# platform (Windows x64 NSIS, macOS arm64 dmg), unsigned (internal app), and a workflow
+# platform (Windows x64 NSIS, macOS arm64 + x64 dmg), unsigned (internal app), and a workflow
 # artifact instead of a GitHub Release (the fork is public: 7 days retention).
 # Trigger: push a tag `figmenta-win-*` or `figmenta-mac-*` on the figmenta branch.
 name: Figmenta desktop installers
@@ -58,7 +58,17 @@ jobs:
 
   build-macos:
     if: startsWith(github.ref_name, 'figmenta-mac-')
-    runs-on: macos-14
+    # One native runner per arch: node-pty and the other native modules are compiled on
+    # the architecture they will run on (Intel Macs got an arm64-only build on 2026-09-25).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+          - arch: x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -75,19 +85,35 @@ jobs:
       - name: Install JS dependencies
         run: node scripts/npm-retry.mjs ci
 
-      - name: Build desktop (macOS arm64, dmg, unsigned)
+      - name: Build desktop (macOS ${{ matrix.arch }}, dmg, unsigned)
         shell: bash
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
           set -euo pipefail
-          npm run build:desktop -- --publish never --mac dmg --arm64 \
+          npm run build:desktop -- --publish never --mac dmg --${{ matrix.arch }} \
             -c.mac.identity=null -c.mac.notarize=false -c.mac.hardenedRuntime=false
+
+      - name: Verify binary architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          want=${{ matrix.arch }}; [ "$want" = x64 ] && want=x86_64
+          dmg=$(ls packages/desktop/release/*.dmg | head -1)
+          mp=$(hdiutil attach -nobrowse -readonly "$dmg" | tail -1 | awk -F'\t' '{print $NF}')
+          app=$(ls -d "$mp"/*.app | head -1)
+          exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")
+          got=$(lipo -archs "$app/Contents/MacOS/$exe")
+          echo "main binary: $got (want $want)"
+          # Native modules: listed, not gated (some packages ship prebuilds for every arch).
+          find "$app" -name '*.node' | while read -r f; do echo "$(lipo -archs "$f") ${f#$app/}"; done
+          hdiutil detach "$mp" -quiet
+          [ "$got" = "$want" ] || { echo "::error::main binary is $got, expected $want"; exit 1; }
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: orchestra-macos-arm64
+          name: orchestra-macos-${{ matrix.arch }}
           path: packages/desktop/release/*.dmg
           if-no-files-found: error
           retention-days: 7
