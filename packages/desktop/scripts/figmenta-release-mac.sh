@@ -35,6 +35,17 @@ if [[ "${1:-}" == "--skip-web" ]]; then
   shift
 fi
 
+# A release is the real app: no e2e flavor (other bundle id, injected LSEnvironment,
+# other config or entry point) can be smuggled in through extra builder arguments.
+for arg in "$@"; do
+  case "$arg" in
+    --config* | -c | --c | *appId* | *extendInfo* | *LSEnvironment* | *extraMetadata* | *e2e* | *E2E*)
+      echo "refusing release override: $arg (e2e flavors are built by the e2e harness only)" >&2
+      exit 1
+      ;;
+  esac
+done
+
 shopt -s nullglob
 keys=("$sign_dir"/AuthKey_*.p8)
 [[ ${#keys[@]} -eq 1 ]] || { echo "expected exactly one AuthKey_*.p8 in $sign_dir" >&2; exit 1; }
@@ -49,8 +60,29 @@ fi
 [[ -f "$keychain" ]] || { echo "missing keychain $keychain" >&2; exit 1; }
 [[ -f "$sign_dir/keychain.pw" ]] || { echo "missing $sign_dir/keychain.pw" >&2; exit 1; }
 
-# Unlock the dedicated keychain for this run (the password never reaches stdout).
-security unlock-keychain -p "$(cat "$sign_dir/keychain.pw")" "$keychain"
+# Cleanup on every exit, error included: relock the keychain, drop the x64 twins and the
+# temporary directories.
+installed_twins=()
+manifests=""
+twins=""
+remove_twins() {
+  # ${a[@]+...}: bash 3.2 treats an empty array as unbound under `set -u`.
+  for target in ${installed_twins[@]+"${installed_twins[@]}"}; do rm -rf "$target"; done
+  installed_twins=()
+}
+cleanup() {
+  security lock-keychain "$keychain" || true
+  remove_twins
+  [[ -n "$manifests" ]] && rm -rf "$manifests"
+  [[ -n "$twins" ]] && rm -rf "$twins"
+  return 0
+}
+trap cleanup EXIT
+
+# Unlock the dedicated keychain for this run. The password goes from its file straight
+# into the Security framework: never on a command line (argv is visible to `ps`), never
+# printed.
+/usr/bin/python3 "$here/figmenta-unlock-keychain.py" "$keychain" "$sign_dir/keychain.pw"
 security find-identity -v -p codesigning "$keychain" | grep -q "Developer ID Application: $identity" \
   || { echo "identity '$identity' not found in $keychain" >&2; exit 1; }
 
@@ -89,12 +121,6 @@ while IFS= read -r line; do twin_specs+=("$line"); done < <(
   '
 )
 
-installed_twins=()
-remove_twins() {
-  # ${a[@]+...}: bash 3.2 treats an empty array as unbound under `set -u`.
-  for target in ${installed_twins[@]+"${installed_twins[@]}"}; do rm -rf "$target"; done
-}
-trap 'remove_twins; rm -rf "$manifests" "$twins"' EXIT
 
 build_arch() {
   local arch="$1"
@@ -130,16 +156,19 @@ done
 
 build_arch x64 "$@"
 remove_twins
-installed_twins=()
-
-# One manifest for both architectures (upstream's merge script, as in desktop-release.yml).
-node "$repo/scripts/merge-mac-manifest.mjs" \
-  "$manifests/latest-mac-arm64.yml" "$manifests/latest-mac-x64.yml" "$release/latest-mac.yml"
 
 # electron-builder notarizes and staples the .app; the dmg around it is notarized here.
 for dmg in "$release"/Orchestra-"$version"-*.dmg; do
   xcrun notarytool submit "$dmg" --key "$asc_key" --key-id "$asc_key_id" --issuer "$asc_issuer" --wait
   xcrun stapler staple "$dmg"
 done
+
+# One manifest for both architectures (upstream's merge script, as in desktop-release.yml),
+# written AFTER the dmgs were stapled and holding the zips only — the files the updater
+# downloads, untouched since electron-builder hashed them. Checked against the disk by
+# figmenta-verify-mac.sh.
+node "$repo/scripts/merge-mac-manifest.mjs" \
+  "$manifests/latest-mac-arm64.yml" "$manifests/latest-mac-x64.yml" "$manifests/merged.yml" > /dev/null
+node "$here/figmenta-mac-manifest.mjs" zips-only "$manifests/merged.yml" "$release/latest-mac.yml"
 
 "$here/figmenta-verify-mac.sh" "$release" "$version"

@@ -242,8 +242,17 @@ Remind me later, no countdown.
 - A newer version: download at once behind a screen that covers every window (a
   `WebContentsView` above the page, keyboard to the page blocked), with progress; then one
   button, **«Installa e riavvia»**. A failed download: same screen, **«Riprova»** (it checks
-  again, then downloads). Before relaunching, the daemon this app launched is stopped.
+  again, then downloads; if the feed is unreachable at that moment the screen goes away until
+  the next round). Before relaunching, the daemon this app launched is stopped.
+- Never a downgrade: an announced version must be strictly newer than the running one,
+  checked twice (state machine and runtime). electron-updater's `channel` setter is never
+  used — assigning it turns `allowDowngrade` back on.
+- macOS, outside `/Applications` (opened from the dmg, a copy in Downloads, a read-only or
+  translocated volume): at launch Orchestra offers to move itself there
+  (`app.moveToApplicationsFolder`, Italian dialog, relaunch). Declined or failed, a failed
+  update explains the location instead of the connection.
 - Code: `src/figmenta/mandatory-update.ts` (state machine, pure, tested),
+  `mandatory-update-runtime.ts` (electron-updater configuration, tested with a fake),
   `mandatory-update-electron.ts` (electron-updater + screen), `update-overlay-page.ts`
   (data: URL page, Italian copy), `update-overlay-preload.ts` (sandboxed).
 - `ORCHESTRA_UPDATE_FEED_URL` overrides the feed **only for a loopback host** (the
@@ -328,7 +337,9 @@ Only on the Mac that holds the Developer ID identity (never CI: the repo is publ
 FIGMENTA_ASC_ISSUER=<App Store Connect issuer id> packages/desktop/scripts/figmenta-release-mac.sh
 ```
 
-- Signing material, read from files and never printed: the dedicated keychain
+- Signing material, read from files and never printed or put on a command line: the
+  keychain is unlocked through the Security framework (`scripts/figmenta-unlock-keychain.py`,
+  not `security unlock-keychain -p`) and relocked on exit, error included. The dedicated keychain
   `~/Library/Keychains/figmenta-codesign.keychain-db` (password in
   `~/.figmenta-codesign/keychain.pw`), identity `Developer ID Application: Figmenta S.r.l.
 (8UK563QG96)`, App Store Connect API key `~/.figmenta-codesign/AuthKey_<id>.p8` (key id from
@@ -340,11 +351,16 @@ FIGMENTA_ASC_ISSUER=<App Store Connect issuer id> packages/desktop/scripts/figme
 - x64 is cross-built on Apple Silicon: node-pty ships N-API prebuilds for both arches, and the
   script unpacks the x64 twins of the two arm64-only optional packages that ship in the app
   (`@esbuild/darwin-*` for the plugin build, `sherpa-onnx-darwin-*`) for the x64 pass only.
-- Merges the two `latest-mac.yml` into one (`scripts/merge-mac-manifest.mjs`, as upstream).
-- Ends with `scripts/figmenta-verify-mac.sh`: per dmg, `spctl` on the dmg, then on the app
-  `codesign --verify --deep --strict`, `spctl -a -vv` (Notarized Developer ID),
-  `stapler validate`, `lipo -archs` of the main binary and of every native module, and the
-  updater cache directory name.
+- Merges the two `latest-mac.yml` into one (`scripts/merge-mac-manifest.mjs`, as upstream)
+  AFTER the dmgs are stapled, keeping the zips only (`scripts/figmenta-mac-manifest.mjs`): the
+  updater downloads zips, and a dmg re-stapled after hashing would carry a stale sha512.
+- Refuses extra builder arguments that would turn the release into another flavor
+  (`--config`, `appId`, `extendInfo`/`LSEnvironment`, `extraMetadata`, `e2e`).
+- Ends with `scripts/figmenta-verify-mac.sh`: per dmg AND per zip, `spctl` on the dmg, then
+  on the app `codesign --verify --deep --strict`, `spctl -a -vv` (Notarized Developer ID),
+  `stapler validate`, bundle id `it.figmenta.orchestra`, no `LSEnvironment`, production feed
+  in `app-update.yml`, `lipo -archs` of the main binary and of every native module; then
+  every entry of `latest-mac.yml` against size and sha512 on disk.
 
 Windows: `.github/workflows/figmenta-windows.yml` (tag `figmenta-win-*`) builds the NSIS
 installer unsigned and now also uploads `latest.yml` + blockmap.

@@ -1,40 +1,41 @@
 #!/usr/bin/env bash
-# Figmenta fork: checks a signed macOS release of Orchestra Desktop, dmg by dmg.
+# Figmenta fork: checks a signed macOS release of Orchestra Desktop, artifact by artifact.
 #   packages/desktop/scripts/figmenta-verify-mac.sh <release-dir> <version>
-# For each Orchestra-<version>-<arch>.dmg: Gatekeeper on the dmg, then on the app inside
-# it (codesign --deep --strict, spctl), the architecture of the main binary and of every
-# native module, and the updater cache directory. Exits non-zero on the first failure.
+# Every Orchestra-<version>-<arch>.dmg and .zip: Gatekeeper on the dmg itself, then on the
+# app inside (codesign --deep --strict, spctl, stapler), bundle id it.figmenta.orchestra,
+# no LSEnvironment (the e2e flavor injects one), version, architecture of the main binary
+# and of every native module, updater cache directory. Then latest-mac.yml against the
+# files on disk. Exits non-zero at the first failing artifact.
 set -euo pipefail
 
 release="${1:?release dir}"
 version="${2:?version}"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+bundle_id="it.figmenta.orchestra"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-shopt -s nullglob
-dmgs=("$release"/Orchestra-"$version"-*.dmg)
-[[ ${#dmgs[@]} -gt 0 ]] || fail "no Orchestra-$version-*.dmg in $release"
-
-for dmg in "${dmgs[@]}"; do
-  arch="${dmg##*-}"
-  arch="${arch%.dmg}"
-  want="$arch"
-  [[ "$want" == x64 ]] && want=x86_64
-  echo "== $(basename "$dmg")"
-  spctl -a -vv -t open --context context:primary-signature "$dmg" 2>&1 | sed 's/^/dmg: /'
-
-  mount="$(mktemp -d)"
-  hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$dmg" > /dev/null
-  app="$mount/Orchestra.app"
-  codesign --verify --deep --strict --verbose=2 "$app" 2>&1 | sed 's/^/codesign: /'
+check_app() {
+  local app="$1" want="$2" label="$3"
+  codesign --verify --deep --strict --verbose=2 "$app" 2>&1 | grep -v -e '--prepared:' -e '--validated:' | sed 's/^/codesign: /'
   spctl -a -vv "$app" 2>&1 | sed 's/^/spctl: /'
+  spctl -a -vv "$app" 2>&1 | grep -q "source=Notarized Developer ID" || fail "$label: not Notarized Developer ID"
   xcrun stapler validate "$app" 2>&1 | sed 's/^/stapler: /'
-  exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+  local plist="$app/Contents/Info.plist"
+  local exe got id shortver
+  exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")"
   got="$(lipo -archs "$app/Contents/MacOS/$exe")"
+  id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")"
+  shortver="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")"
   echo "lipo: $exe = $got (want $want)"
-  shortver="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")"
-  echo "version: $shortver"
+  echo "bundle: $id $shortver"
+  if /usr/libexec/PlistBuddy -c 'Print :LSEnvironment' "$plist" > /dev/null 2>&1; then
+    fail "$label: Info.plist carries an LSEnvironment (e2e flavor?)"
+  fi
+  echo "LSEnvironment: absent"
   grep '^updaterCacheDirName:' "$app/Contents/Resources/app-update.yml" | sed 's/^/app-update.yml: /'
-  bad_native=0
+  grep -q '^url: https://downloads.figmenta.site/orchestra-desktop/updates/$' \
+    "$app/Contents/Resources/app-update.yml" || fail "$label: app-update.yml feed is not the production one"
+  local bad_native=0 native archs
   while IFS= read -r -d '' native; do
     archs="$(lipo -archs "$native" 2>/dev/null || echo '?')"
     case " $archs " in
@@ -42,11 +43,50 @@ for dmg in "${dmgs[@]}"; do
       *) echo "native without $want: $archs ${native#"$app"/}"; bad_native=1 ;;
     esac
   done < <(find "$app" \( -name '*.node' -o -name 'esbuild' -path '*/bin/*' \) -type f -print0)
+
+  [[ "$got" == "$want" ]] || fail "$label: $exe is $got, expected $want"
+  [[ "$id" == "$bundle_id" ]] || fail "$label: bundle id $id, expected $bundle_id"
+  [[ "$shortver" == "$version" ]] || fail "$label: bundle version $shortver, expected $version"
+  [[ $bad_native -eq 0 ]] || fail "$label: native modules without $want"
+}
+
+want_arch() {
+  local arch="${1##*-}"
+  arch="${arch%.*}"
+  [[ "$arch" == x64 ]] && arch=x86_64
+  echo "$arch"
+}
+
+shopt -s nullglob
+dmgs=("$release"/Orchestra-"$version"-*.dmg)
+zips=("$release"/Orchestra-"$version"-*.zip)
+[[ ${#dmgs[@]} -gt 0 ]] || fail "no Orchestra-$version-*.dmg in $release"
+[[ ${#zips[@]} -gt 0 ]] || fail "no Orchestra-$version-*.zip in $release"
+
+for dmg in "${dmgs[@]}"; do
+  want="$(want_arch "$dmg")"
+  echo "== $(basename "$dmg")"
+  spctl -a -vv -t open --context context:primary-signature "$dmg" 2>&1 | sed 's/^/dmg: /'
+  mount="$(mktemp -d)"
+  hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$dmg" > /dev/null
+  status=0
+  (check_app "$mount/Orchestra.app" "$want" "$(basename "$dmg")") || status=$?
   hdiutil detach "$mount" -quiet
   rmdir "$mount" 2>/dev/null || true
-
-  [[ "$got" == "$want" ]] || fail "$exe is $got, expected $want"
-  [[ "$shortver" == "$version" ]] || fail "bundle version $shortver, expected $version"
-  [[ $bad_native -eq 0 ]] || fail "native modules without $want in $(basename "$dmg")"
+  [[ $status -eq 0 ]] || exit "$status"
 done
-echo "OK: ${#dmgs[@]} dmg verified"
+
+for zip in "${zips[@]}"; do
+  want="$(want_arch "$zip")"
+  echo "== $(basename "$zip")"
+  unpacked="$(mktemp -d)"
+  ditto -x -k "$zip" "$unpacked"
+  status=0
+  (check_app "$unpacked/Orchestra.app" "$want" "$(basename "$zip")") || status=$?
+  rm -rf "$unpacked"
+  [[ $status -eq 0 ]] || exit "$status"
+done
+
+echo "== latest-mac.yml"
+node "$here/figmenta-mac-manifest.mjs" verify "$release/latest-mac.yml" "$release"
+echo "OK: ${#dmgs[@]} dmg + ${#zips[@]} zip + manifest verified"
