@@ -4,6 +4,7 @@ import {
   copyFileSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -152,6 +153,38 @@ describe("desktop packaging", () => {
       expect(written).toContain("url: https://example.test/");
     } finally {
       rmSync(resourcesDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps only the target arch of esbuild and sherpa-onnx in a cross-arch build", () => {
+    const afterPack = createRequire(import.meta.url)(
+      join(packageRoot, "scripts", "after-pack.js"),
+    ) as {
+      keepTargetArchOnly(nodeModules: string, platform: string, arch: string): void;
+    };
+    const nodeModules = mkdtempSync(join(tmpdir(), "orchestra-cross-arch-"));
+    const machO = (tag: string) =>
+      Buffer.concat([Buffer.from("cffaedfe", "hex"), Buffer.from(tag)]);
+    try {
+      for (const pkg of ["@esbuild/darwin-arm64", "@esbuild/darwin-x64", "esbuild"]) {
+        mkdirSync(join(nodeModules, pkg, "bin"), { recursive: true });
+      }
+      writeFileSync(join(nodeModules, "@esbuild/darwin-arm64/bin/esbuild"), machO("arm64"));
+      writeFileSync(join(nodeModules, "@esbuild/darwin-x64/bin/esbuild"), machO("x64"));
+      // esbuild's installer copies the HOST binary over its JS shim.
+      writeFileSync(join(nodeModules, "esbuild/bin/esbuild"), machO("arm64"));
+      mkdirSync(join(nodeModules, "sherpa-onnx-darwin-arm64"));
+      mkdirSync(join(nodeModules, "sherpa-onnx-darwin-x64"));
+
+      afterPack.keepTargetArchOnly(nodeModules, "darwin", "x64");
+
+      expect(readdirSync(join(nodeModules, "@esbuild"))).toEqual(["darwin-x64"]);
+      expect(readFileSync(join(nodeModules, "esbuild/bin/esbuild"))).toEqual(machO("x64"));
+      expect(readdirSync(nodeModules).filter((entry) => entry.startsWith("sherpa-onnx"))).toEqual([
+        "sherpa-onnx-darwin-x64",
+      ]);
+    } finally {
+      rmSync(nodeModules, { recursive: true, force: true });
     }
   });
 

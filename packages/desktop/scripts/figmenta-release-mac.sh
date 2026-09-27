@@ -91,7 +91,8 @@ while IFS= read -r line; do twin_specs+=("$line"); done < <(
 
 installed_twins=()
 remove_twins() {
-  for target in "${installed_twins[@]}"; do rm -rf "$target"; done
+  # ${a[@]+...}: bash 3.2 treats an empty array as unbound under `set -u`.
+  for target in ${installed_twins[@]+"${installed_twins[@]}"}; do rm -rf "$target"; done
 }
 trap 'remove_twins; rm -rf "$manifests" "$twins"' EXIT
 

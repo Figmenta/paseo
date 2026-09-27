@@ -102,6 +102,49 @@ function pruneSharpLibvips(nodeModules, platform, arch) {
   }
 }
 
+// Figmenta fork: a cross-arch build (x64 on Apple Silicon, figmenta-release-mac.sh) has both
+// arches of esbuild's and sherpa-onnx's platform packages in node_modules. Keep the target
+// arch only, and make esbuild/bin/esbuild — which esbuild's installer overwrites with the
+// HOST binary — the target-arch binary too. On a native build this finds nothing to do.
+function isNativeExecutable(file) {
+  let fd;
+  try {
+    fd = fs.openSync(file, "r");
+    const head = Buffer.alloc(4);
+    fs.readSync(fd, head, 0, 4, 0);
+    const magic = head.toString("hex");
+    return ["cffaedfe", "cefaedfe", "cafebabe", "7f454c46"].includes(magic);
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+function keepTargetArchOnly(nodeModules, platform, arch) {
+  const target = `${platform}-${arch}`;
+
+  const esbuildScope = path.join(nodeModules, "@esbuild");
+  if (fs.existsSync(path.join(esbuildScope, target))) {
+    pruneChildrenExcept(esbuildScope, new Set([target]));
+    const targetBinary = path.join(esbuildScope, target, "bin", "esbuild");
+    const shim = path.join(nodeModules, "esbuild", "bin", "esbuild");
+    if (fs.existsSync(targetBinary) && isNativeExecutable(shim)) {
+      fs.copyFileSync(targetBinary, shim);
+      fs.chmodSync(shim, 0o755);
+    }
+  }
+
+  const sherpaTarget = `sherpa-onnx-${target}`;
+  if (fs.existsSync(path.join(nodeModules, sherpaTarget))) {
+    for (const entry of fs.readdirSync(nodeModules)) {
+      if (entry.startsWith(`sherpa-onnx-${platform}-`) && entry !== sherpaTarget) {
+        rmSafe(path.join(nodeModules, entry));
+      }
+    }
+  }
+}
+
 function pruneNativeModules(appOutDir, platform, arch) {
   const resourcesDir = resourcesDirFor(appOutDir, platform);
 
@@ -113,6 +156,7 @@ function pruneNativeModules(appOutDir, platform, arch) {
   pruneClaudeAgentSdk(nodeModules, platform, arch);
   pruneNodePty(nodeModules, platform, arch);
   pruneSharpLibvips(nodeModules, platform, arch);
+  keepTargetArchOnly(nodeModules, platform, arch);
 
   const after = dirSizeSync(nodeModules);
   const savedMB = ((before - after) / 1024 / 1024).toFixed(1);
@@ -136,6 +180,7 @@ function fmtMB(bytes) {
 }
 
 exports.setUpdaterCacheDirName = setUpdaterCacheDirName;
+exports.keepTargetArchOnly = keepTargetArchOnly;
 exports.UPDATER_CACHE_DIR_NAME = UPDATER_CACHE_DIR_NAME;
 
 exports.default = async function afterPack(context) {
