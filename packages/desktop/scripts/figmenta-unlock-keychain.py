@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Figmenta fork: unlock a keychain with the password read from a file, via the Security
 framework — the password never appears in any process's argv (unlike
-`security unlock-keychain -p`) and is never printed.
+`security unlock-keychain -p`) and is never printed — then check, without UI, that it
+really is unlocked. Exit 0 only when it is.
 
     figmenta-unlock-keychain.py <keychain-path> <password-file>
 """
@@ -32,6 +33,14 @@ def main() -> int:
     status = security.SecKeychainUnlock(keychain, len(password), password, True)
     if status != 0:
         print(f"SecKeychainUnlock failed: OSStatus {status}", file=sys.stderr)
+        return 1
+    # Confirm without any UI: a signing step against a LOCKED keychain makes securityd
+    # pop a password dialog on the user's screen, which a build must never do.
+    keychain_status = ctypes.c_uint32()
+    status = security.SecKeychainGetStatus(keychain, ctypes.byref(keychain_status))
+    unlocked = status == 0 and bool(keychain_status.value & 1)  # kSecUnlockStateStatus
+    if not unlocked:
+        print(f"keychain still locked after unlock (OSStatus {status})", file=sys.stderr)
         return 1
     return 0
 
