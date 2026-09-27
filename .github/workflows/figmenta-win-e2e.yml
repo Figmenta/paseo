@@ -3,13 +3,14 @@
 # feed), builds a 1.0.1 from this commit (version bump only), serves it from a loopback
 # feed and drives the installed app through CDP: overlay, "Installa e riavvia", silent
 # install, relaunch on 1.0.1; plus a negative case (feed announcing 0.9.0 = no overlay).
-# Nothing is published, no secret is used. Trigger: tag `figmenta-win-e2e-*`.
+# Nothing is published, no secret is used. Trigger: tag `figmenta-e2e-win-*` (not
+# `figmenta-win-*`, which also starts the installer workflow).
 name: Figmenta Windows updater e2e
 
 on:
   push:
     tags:
-      - "figmenta-win-e2e-*"
+      - "figmenta-e2e-win-*"
   workflow_dispatch:
 
 permissions:

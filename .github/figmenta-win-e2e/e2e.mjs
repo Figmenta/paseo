@@ -191,15 +191,42 @@ function logText() {
 }
 const paseoHome = path.join(WORK, "paseo-home");
 mkdirSync(paseoHome, { recursive: true });
+function appEnv(feedPath) {
+  return {
+    PASEO_HOME: paseoHome,
+    ORCHESTRA_URL: BASE,
+    ORCHESTRA_UPDATE_FEED_URL: `${BASE}${feedPath}`,
+    PASEO_ELECTRON_FLAGS: `--remote-debugging-port=${CDP}`,
+  };
+}
+// The NSIS installer relaunches the app through the shell (explorer), not as our child:
+// our process env does not reach it. The same variables are therefore also set at USER
+// level (registry + WM_SETTINGCHANGE broadcast), which explorer passes to what it starts.
+// The runner VM is thrown away after the job.
+function setUserEnv(vars) {
+  const script = Object.entries(vars)
+    .map(([name, value]) => `[Environment]::SetEnvironmentVariable('${name}', '${value}', 'User')`)
+    .join("; ");
+  execFileSync("powershell", ["-NoProfile", "-Command", script], { stdio: "inherit" });
+}
+function processes() {
+  try {
+    return execFileSync(
+      "powershell",
+      [
+        "-NoProfile",
+        "-Command",
+        "Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'Orchestra' } | ForEach-Object { \"$($_.ProcessId) $($_.ParentProcessId) $($_.CommandLine)\" }",
+      ],
+      { encoding: "utf8" },
+    ).trim();
+  } catch (error) {
+    return `process list failed: ${error.message}`;
+  }
+}
 function launch(exe, feedPath) {
   const child = spawn(exe, [], {
-    env: {
-      ...process.env,
-      PASEO_HOME: paseoHome,
-      ORCHESTRA_URL: BASE,
-      ORCHESTRA_UPDATE_FEED_URL: `${BASE}${feedPath}`,
-      PASEO_ELECTRON_FLAGS: `--remote-debugging-port=${CDP}`,
-    },
+    env: { ...process.env, ...appEnv(feedPath) },
     stdio: "ignore",
     detached: true,
   });
@@ -264,6 +291,7 @@ try {
   await closeApp();
 
   // Positive: feed announcing 1.0.1.
+  setUserEnv(appEnv("/updates/"));
   launch(exe, "/updates/");
   const page1 = await waitFor("Orchestra page (positive)", pageTarget, 120_000);
   const overlay = await waitFor("update overlay", overlayTarget, 180_000);
@@ -304,32 +332,70 @@ try {
   await evaluate(overlay, "document.getElementById('install').click(), true");
   record("click 'Installa e riavvia'", true, "clicked");
   await waitFor("old app to go away", async () => (await pageTarget()) === null, 120_000, 500);
-  const page2 = await waitFor(
-    "relaunched app on 1.0.1",
-    async () => {
-      const target = await pageTarget();
-      if (!target) return null;
+  // Relaunch by the installer: poll the version the app reports over CDP, and keep evidence
+  // (processes, exe version, desktop) while waiting.
+  let page2 = null;
+  const relaunchDeadline = Date.now() + 300_000;
+  let tick = 0;
+  while (Date.now() < relaunchDeadline && !page2) {
+    const target = await pageTarget();
+    if (target) {
       const version = await evaluate(
         target,
         "window.orchestraDesktop && window.orchestraDesktop.version",
+      ).catch(() => null);
+      if (version === "1.0.1") page2 = target;
+    }
+    if (!page2 && tick % 30 === 0) {
+      appendFileSync(
+        path.join(OUT, "relaunch-watch.log"),
+        `--- t+${tick}s exe=${fileVersion(exe)}\n${processes()}\n`,
       );
-      return version === "1.0.1" ? target : null;
-    },
-    300_000,
-  );
-  await sleep(5000);
+      if (tick % 60 === 0) desktopShot(`03-waiting-relaunch-t${tick}s-desktop.png`);
+    }
+    if (!page2) await sleep(1000);
+    tick += 1;
+  }
   const newFileVersion = fileVersion(exe);
-  const pageVersion = await evaluate(page2, "window.orchestraDesktop.version");
+  record(
+    "silent install replaced the exe with 1.0.1",
+    newFileVersion.startsWith("1.0.1"),
+    `exe ProductVersion=${newFileVersion}`,
+  );
   const logAfter = logText().slice(logBefore);
   const logSaysNew = /currentVersion: '1\.0\.1'/.test(logAfter);
-  const overlayAfter = await overlayTarget();
-  await shot(page2, "03-after-update-1.0.1-page.png");
-  desktopShot("03-after-update-1.0.1-desktop.png");
-  record(
-    "silent install + relaunch on 1.0.1",
-    pageVersion === "1.0.1" && newFileVersion.startsWith("1.0.1") && overlayAfter === null,
-    `orchestraDesktop.version=${pageVersion}, exe ProductVersion=${newFileVersion}, log feed line with 1.0.1=${logSaysNew}, overlay after relaunch=${overlayAfter ? "PRESENT" : "none"}`,
-  );
+  if (page2) {
+    await sleep(5000);
+    const pageVersion = await evaluate(page2, "window.orchestraDesktop.version");
+    const overlayAfter = await overlayTarget();
+    await shot(page2, "03-after-update-1.0.1-page.png");
+    desktopShot("03-after-update-1.0.1-desktop.png");
+    record(
+      "installer relaunched the app on 1.0.1",
+      pageVersion === "1.0.1" && overlayAfter === null,
+      `orchestraDesktop.version=${pageVersion}, log feed line with 1.0.1=${logSaysNew}, overlay after relaunch=${overlayAfter ? "PRESENT" : "none"}`,
+    );
+  } else {
+    desktopShot("03-no-relaunch-desktop.png");
+    record(
+      "installer relaunched the app on 1.0.1",
+      false,
+      `no app answering on CDP with 1.0.1 within 300 s; log feed line with 1.0.1=${logSaysNew}; processes: ${processes() || "none"}`,
+    );
+    if (newFileVersion.startsWith("1.0.1")) {
+      await closeApp();
+      launch(exe, "/updates/");
+      const manual = await waitFor("installed app (launched by the test)", pageTarget, 120_000);
+      const manualVersion = await evaluate(manual, "window.orchestraDesktop.version");
+      await shot(manual, "04-installed-1.0.1-launched-by-test-page.png");
+      desktopShot("04-installed-1.0.1-launched-by-test-desktop.png");
+      record(
+        "installed app, launched by the test, runs 1.0.1",
+        manualVersion === "1.0.1",
+        `orchestraDesktop.version=${manualVersion}`,
+      );
+    }
+  }
   await closeApp();
 } catch (error) {
   record("run", false, String(error?.stack ?? error));
