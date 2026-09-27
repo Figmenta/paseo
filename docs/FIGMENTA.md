@@ -3,7 +3,8 @@
 Branch `figmenta` = upstream release tag + a minimal set of patches. Rules:
 
 1. Never edit `main`; it mirrors upstream.
-2. Patches live here as separate commits on top of the release tag (today `v0.8.0`).
+2. Patches live here as separate commits on top of the release tag (today `v0.9.2`; rebased
+   from `v0.8.0` on 2026-09-27 on branch `figmenta-092`, see "Rebase on 0.9.2" below).
 3. To align with a new upstream release: `git fetch upstream --tags && git rebase vX.Y.Z figmenta`,
    resolve, rebuild, test, force-push `figmenta`.
 4. Anything that can be a plugin goes to `Figmenta/paseo-orchestra-plugin`, not here.
@@ -136,7 +137,7 @@ tested by `orchestra.test.ts` (no Electron needed):
 - `ORCHESTRA_URL` / `resolveOrchestraUrl(env)` — `https://orchestra.figmenta.site`, override
   with `ORCHESTRA_URL`.
 - `isOrchestraOrigin(url)` — exact origin match (scheme + host + port).
-- `isAllowedNavigation(url)` — Orchestra plus https `*.figmenta.site`, for the login hop.
+- `isAllowedNavigation(url)` — the Orchestra origin only (the OIDC login is on that host).
 - `permissionPolicy(origin, permission)` — Orchestra only, and only `media`, `notifications`,
   `clipboard-read`, `clipboard-sanitized-write`, `local-network-access`. Everything else denied.
 - `seedPaseoConfig` / `seedPaseoConfigText` — the merge applied to `~/.paseo/config.json`.
@@ -193,22 +194,111 @@ only `orchestraDesktop = { version, platform }` and no IPC at all. The version a
 - `startDaemon` is exported.
 - **Daemon provenance.** `desktopManaged: true` in `~/.paseo/paseo.pid` means "a desktop app
   spawned this daemon", not "_this_ app did". Orchestra and an installed Paseo Desktop share
-  `~/.paseo`, so the upstream check would let Orchestra kill Federico's daemon on quit. A
-  module-level `daemonSpawnedByThisApp`, set only when our own spawn returns, gates the
-  stop-on-quit path in `main.ts`. `startDaemon()` returns an already-running daemon untouched,
-  so reuse is the normal case and the flag stays false.
-- `check_app_update` / `install_app_update` are logged no-ops, as is `installAppUpdateOnQuit`
-  in `main.ts`.
+  `~/.paseo`, so only the daemon THIS process launched may be stopped on quit. Since 0.9.2
+  upstream tracks that natively (`ownedLaunch`, set by `startDaemonInstance`'s
+  `onAcquired`); `wasDaemonSpawnedByThisApp()` is `ownedLaunch !== null` and gates the
+  stop-on-quit path in `main.ts`. `startDaemon()` returns an already-running daemon
+  untouched, so reuse is the normal case.
+- `check_app_update` / `install_app_update` answer "nothing to do": updates go through the
+  mandatory updater (below), not upstream's GitHub feed.
+
+### Which daemon Orchestra starts
+
+Reusing a daemon that is already listening is unchanged. When NOTHING is listening,
+Orchestra launches the **newest** `@getpaseo/server` on the machine: its own bundled one, or
+the one inside `/Applications/Paseo.app` (macOS only), run with Paseo's own Electron helper,
+`node-entrypoint-runner.js` and `bin/paseo` — never our binary on its code. A tie, or a
+version that is not semver, keeps the bundled server; a Paseo runtime that fails to start
+falls back to the bundled one. Windows keeps the bundled server (no equally reliable install
+location to probe). Origin of the fix: on 2026-09-27 Orchestra 0.8.0 started before Paseo
+0.9.2 and took `:6767` with a daemon that did not know the newest models.
+
+- `src/figmenta/daemon-runtime.ts` — `compareVersions` (semver precedence) and
+  `pickDaemonRuntime`, pure; `daemon-runtime.test.ts`.
+- `src/daemon/runtime-paths.ts` — `resolveBundledDaemonRuntime`, `resolvePaseoAppDaemonRuntime`.
+- The log says what was chosen: `[desktop daemon] daemon runtime selected {source, version,
+bundledVersion, paseoAppVersion}`.
+- The version-mismatch restart compares the daemon with the server version this app
+  launched (`ownedLaunch.serverVersion`), not with the app version.
+
+### Version line
+
+Orchestra Desktop has its own version line from **1.0.0** (`packages/desktop/package.json`),
+independent of the Paseo server it bundles: upstream releases would otherwise collide with
+ours in the updater's comparison. `window.orchestraDesktop.version` and the
+`X-Orchestra-Desktop` header report it. Bump it for every Orchestra release; the bundled
+server version is whatever upstream tag the branch sits on.
+
+### Mandatory updater
+
+Decision (Federico, 2026-09-27): to use Orchestra you need the latest version. No Skip, no
+Remind me later, no countdown.
+
+- Feed: `https://downloads.figmenta.site/orchestra-desktop/updates/` (electron-updater,
+  `generic` provider): `latest-mac.yml` + `Orchestra-<v>-<arch>.zip` for macOS, `latest.yml` +
+  `Orchestra-Setup-<v>-x64.exe` for Windows (+ `.blockmap`).
+- Check at launch and every 30 minutes. Nothing newer, offline or feed unreachable: nothing
+  happens, the app stays usable, the next round tries again.
+- A newer version: download at once behind a screen that covers every window (a
+  `WebContentsView` above the page, keyboard to the page blocked), with progress; then one
+  button, **«Installa e riavvia»**. A failed download: same screen, **«Riprova»** (it checks
+  again, then downloads). Before relaunching, the daemon this app launched is stopped.
+- Code: `src/figmenta/mandatory-update.ts` (state machine, pure, tested),
+  `mandatory-update-electron.ts` (electron-updater + screen), `update-overlay-page.ts`
+  (data: URL page, Italian copy), `update-overlay-preload.ts` (sandboxed).
+- `ORCHESTRA_UPDATE_FEED_URL` overrides the feed **only for a loopback host** (the
+  end-to-end test); anything else is refused and logged.
+- `after-pack.js` sets `updaterCacheDirName: orchestra-desktop-updater` in `app-update.yml`:
+  electron-builder derives it from the package name, which is Paseo Desktop's too, and
+  electron-updater cleans that directory on every check.
+- macOS installs only a **signed** update (Squirrel.Mac checks the code signature against
+  the running app): CI's unsigned macOS dmgs are not update material.
+- Upstream's updater (`features/auto-updater.ts`, channels, rollout) stays in the tree,
+  unwired.
+
+End-to-end check (2026-09-27, Apple Silicon): a signed 1.0.0 in a test folder, isolated
+with its own `PASEO_HOME` (daemon on a test port via that home's `config.json`
+`daemon.listen` — managed launches drop `PASEO_LISTEN`), `PASEO_ELECTRON_USER_DATA_DIR` and
+a loopback feed. Feed down: no screen, the page works. Feed announcing 1.0.1 without the
+zip: «Download non riuscito» + «Riprova»; zip published, «Riprova»: download, «Installa e
+riavvia», relaunch on 1.0.1 (`orchestraDesktop.version` = 1.0.1) in ~15 s. The e2e build
+differs from a release only in bundle id (`it.figmenta.orchestra.e2e`) and an Info.plist
+`LSEnvironment` carrying the isolation env across the Squirrel relaunch. Known: the log file
+is `~/Library/Logs/Orchestra/main.log` whatever the userData, so a test build writes into
+the same log as the installed Orchestra.
+
+Publishing a release on the feed (by hand, VPS-09 `/home/ivan/public-downloads/orchestra-desktop/`):
+copy the zip/exe and blockmaps into `updates/` FIRST, the `.yml` manifests LAST. Never reuse
+a file name: Cloudflare caches zip/exe/dmg for 4 hours, and a stale file with a new sha512 in
+the manifest is a download that fails on every client.
+
+Cache headers measured on 2026-09-27: every file is served with `cache-control:
+max-age=14400` and zip/exe/dmg are `cf-cache-status: HIT`; a `.yml` is not in Cloudflare's
+default cached extensions, and electron-updater requests the manifest with `Cache-Control:
+no-cache` and a random `?noCache=` query, so it is fetched fresh today. Proposed (not
+applied) to make that explicit at the origin (Caddy, `downloads-figmenta.service`):
+
+```caddyfile
+@orchestra_manifest path /orchestra-desktop/updates/*.yml
+header @orchestra_manifest Cache-Control "no-store, max-age=0"
+@orchestra_artifacts path /orchestra-desktop/updates/*.zip /orchestra-desktop/updates/*.exe /orchestra-desktop/updates/*.blockmap
+header @orchestra_artifacts Cache-Control "public, max-age=31536000, immutable"
+```
+
+plus, on Cloudflare, a Cache Rule "bypass cache" for `/orchestra-desktop/updates/*.yml` and
+Browser Cache TTL "Respect existing headers" for that path.
 
 ### Packaging
 
 `packages/desktop/electron-builder.yml`: `appId it.figmenta.orchestra`, product and executable
-`Orchestra`, `artifactName Orchestra-${version}-${arch}.${ext}`, `publish: null`, and on macOS
-`hardenedRuntime: false`, `notarize: false`, `identity: null` (internal distribution, no
-Developer ID). `afterSign` stays — it only runs the smoke under `PASEO_DESKTOP_SMOKE=1`.
-`bin/paseo`, `scripts/after-pack.js`, `scripts/after-sign.js` and `e2e/packaged-app-smoke.js`
-carry the `Orchestra`/`Orchestra Helper.app` names. Icons in `packages/desktop/assets/` were
-replaced from the Orchestra `.icns`.
+`Orchestra`, `artifactName Orchestra-${version}-${arch}.${ext}`, `publish` = the generic feed
+above (electron-builder writes `app-update.yml` into the app and `latest*.yml` next to the
+artifacts; `--publish never` uploads nothing), and on macOS `hardenedRuntime: true` with
+`identity: null` / `notarize: false` — the repository is public, so signing is switched on
+only by the local release script. `afterSign` stays — it only runs the smoke under
+`PASEO_DESKTOP_SMOKE=1`. `bin/paseo`, `scripts/after-pack.js`, `scripts/after-sign.js` and
+`e2e/packaged-app-smoke.js` carry the `Orchestra`/`Orchestra Helper.app` names. Icons in
+`packages/desktop/assets/` were replaced from the Orchestra `.icns`.
 
 The plugin ships as `extraResources`, from **inside the checkout** (`packages/desktop/figmenta-plugin`,
 a copy of `paseo-orchestra-plugin` at `b15c202`) so the build never reaches a sibling repo.
@@ -219,10 +309,57 @@ The daemon esbuilds the plugin from that directory and externalizes only `react`
 Claude Code is still not bundled (upstream choice, `after-pack.js`): the app uses the `claude`
 on the user's PATH, inherited from the login shell.
 
-Build:
+Unsigned build (development, CI):
 
 ```sh
 npm install   # root, once — postinstall downloads the Electron binary
 CSC_IDENTITY_AUTO_DISCOVERY=false npm run build:desktop -- --publish never \
   --mac dmg --arm64 -c.mac.identity=null -c.mac.notarize=false -c.mac.hardenedRuntime=false
 ```
+
+If `dmg-builder` answers 500 on its bundle download, fetch the bundle by hand and point
+`ELECTRON_BUILDER_BINARIES_DOWNLOAD_OVERRIDE_URL` at it.
+
+### Signed macOS release
+
+Only on the Mac that holds the Developer ID identity (never CI: the repo is public):
+
+```sh
+FIGMENTA_ASC_ISSUER=<App Store Connect issuer id> packages/desktop/scripts/figmenta-release-mac.sh
+```
+
+- Signing material, read from files and never printed: the dedicated keychain
+  `~/Library/Keychains/figmenta-codesign.keychain-db` (password in
+  `~/.figmenta-codesign/keychain.pw`), identity `Developer ID Application: Figmenta S.r.l.
+(8UK563QG96)`, App Store Connect API key `~/.figmenta-codesign/AuthKey_<id>.p8` (key id from
+  the file name). The issuer id comes from `FIGMENTA_ASC_ISSUER` or
+  `~/.figmenta-codesign/asc_issuer`.
+- Builds arm64 and x64 (`dmg` + `zip`), hardened runtime with `build/entitlements.mac.plist`
+  (upstream's: JIT, unsigned executable memory, microphone), notarizes and staples the app
+  (electron-builder), then signs, notarizes and staples each dmg.
+- x64 is cross-built on Apple Silicon: node-pty ships N-API prebuilds for both arches, and the
+  script unpacks the x64 twins of the two arm64-only optional packages that ship in the app
+  (`@esbuild/darwin-*` for the plugin build, `sherpa-onnx-darwin-*`) for the x64 pass only.
+- Merges the two `latest-mac.yml` into one (`scripts/merge-mac-manifest.mjs`, as upstream).
+- Ends with `scripts/figmenta-verify-mac.sh`: per dmg, `spctl` on the dmg, then on the app
+  `codesign --verify --deep --strict`, `spctl -a -vv` (Notarized Developer ID),
+  `stapler validate`, `lipo -archs` of the main binary and of every native module, and the
+  updater cache directory name.
+
+Windows: `.github/workflows/figmenta-windows.yml` (tag `figmenta-win-*`) builds the NSIS
+installer unsigned and now also uploads `latest.yml` + blockmap.
+
+### Rebase on 0.9.2
+
+On 2026-09-27 the 15 Figmenta commits were rebased from `v0.8.0` onto `v0.9.2` (branch
+`figmenta-092`). Conflicts and how they were resolved:
+
+- `daemon-manager.ts`: upstream rewrote daemon start on `startDaemonInstance` /
+  `isSameDaemonInstance`, which tracks the instance this app launched. That replaced the
+  fork's `daemonSpawnedByThisApp` flag; the fork keeps `startDaemon` exported and
+  `wasDaemonSpawnedByThisApp()` now reads `ownedLaunch`.
+- `daemon-manager.test.ts`: upstream's rewritten suite kept; the fork's cases targeted the
+  old spawn path (the "only our own daemon" rule is covered by `orchestra.test.ts`).
+- `after-pack.js`: upstream's `installLinuxLauncher` kept, `EXECUTABLE_NAME = "Orchestra"`.
+- `screen-header.tsx`: the embed-mode guard kept on upstream's reworked header.
+- Version: `packages/desktop/package.json` took 0.9.2 during the rebase, then 1.0.0.
