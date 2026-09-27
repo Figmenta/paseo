@@ -308,25 +308,86 @@ export async function startDaemon(): Promise<DesktopDaemonStatus> {
   // this machine (its own, or an installed Paseo.app's), see figmenta/daemon-runtime.ts.
   const home = getPaseoHome();
   const bundled = resolveBundledDaemonRuntime(getBundledCliShimPath());
-  const picked = pickOrchestraDaemonRuntime(bundled);
-  try {
-    await launchDaemonRuntime(home, picked);
-  } catch (error) {
-    if (picked === bundled) throw error;
-    logDesktopDaemonLifecycle("newer runtime failed to start, falling back to the bundled one", {
-      source: picked.source,
-      version: picked.version,
-      error: error instanceof Error ? error.message : String(error),
-    });
-    await launchDaemonRuntime(home, bundled);
-  }
+  await launchWithBundledFallback(home, bundled, pickOrchestraDaemonRuntime(bundled));
   return resolveDesktopDaemonStatus();
 }
 
-function pickOrchestraDaemonRuntime(bundled: DaemonLaunchRuntime): DaemonLaunchRuntime {
+/**
+ * Launches `picked`; if it is not the bundled runtime and it fails — an exception, or a
+ * supervisor that stays alive without ever becoming ready (DAEMON_NOT_READY) — the process
+ * this app launched is stopped and the bundled server is started instead. The bundled
+ * runtime itself keeps upstream's behaviour (not-ready is left running).
+ */
+export async function launchWithBundledFallback(
+  home: string,
+  bundled: DaemonLaunchRuntime,
+  picked: DaemonLaunchRuntime,
+): Promise<void> {
+  if (picked === bundled) {
+    await launchDaemonRuntime(home, bundled);
+    return;
+  }
+  const abort = new AbortController();
+  let reason: string;
+  try {
+    const outcome = await launchDaemonRuntime(home, picked, abort.signal);
+    if (outcome === "ready") return;
+    reason = "not ready in time";
+  } catch (error) {
+    reason = error instanceof Error ? error.message : String(error);
+  }
+  logDesktopDaemonLifecycle("newer runtime failed to start, falling back to the bundled one", {
+    source: picked.source,
+    version: picked.version,
+    reason,
+  });
+  await abandonLaunch(home, abort);
+  await launchDaemonRuntime(home, bundled);
+}
+
+const ABANDON_WAIT_MS = 15_000;
+
+async function stopAbandonedSupervisor(home: string, launched: DaemonInstance): Promise<void> {
+  const holdsLock = async () => {
+    const current = await readDaemonInstance(home);
+    return Boolean(current && isSameDaemonInstance(current, launched));
+  };
+  try {
+    process.kill(launched.pid, "SIGTERM");
+  } catch {
+    // Already gone.
+  }
+  const deadline = Date.now() + ABANDON_WAIT_MS;
+  while (Date.now() < deadline && (await holdsLock())) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  if (!(await holdsLock())) return;
+  logDesktopDaemonLifecycle("abandoned supervisor still holds the lock, killing it", {
+    pid: launched.pid,
+  });
+  try {
+    process.kill(launched.pid, "SIGKILL");
+  } catch {
+    // Already gone.
+  }
+}
+
+/** Stops the supervisor this app just launched (SIGTERM through startDaemonInstance's
+ * abort signal, SIGKILL if its lock is still held after 15 s) and forgets it. */
+async function abandonLaunch(home: string, abort: AbortController): Promise<void> {
+  const launched = ownedLaunch?.home === home ? ownedLaunch.instance : null;
+  abort.abort();
+  if (launched) await stopAbandonedSupervisor(home, launched);
+  ownedLaunch = null;
+}
+
+export function pickOrchestraDaemonRuntime(
+  bundled: DaemonLaunchRuntime,
+  resolvePaseoApp: () => DaemonLaunchRuntime | null = resolvePaseoAppDaemonRuntime,
+): DaemonLaunchRuntime {
   let paseoApp: DaemonLaunchRuntime | null = null;
   try {
-    paseoApp = resolvePaseoAppDaemonRuntime();
+    paseoApp = resolvePaseoApp();
   } catch (error) {
     logDesktopDaemonLifecycle("installed Paseo.app runtime unreadable, ignored", {
       error: error instanceof Error ? error.message : String(error),
@@ -343,7 +404,11 @@ function pickOrchestraDaemonRuntime(bundled: DaemonLaunchRuntime): DaemonLaunchR
   return picked;
 }
 
-async function launchDaemonRuntime(home: string, runtime: DaemonLaunchRuntime): Promise<void> {
+async function launchDaemonRuntime(
+  home: string,
+  runtime: DaemonLaunchRuntime,
+  signal?: AbortSignal,
+): Promise<"ready" | "not_ready"> {
   const invocation = runtime.createInvocation({
     argvMode: "node-script",
     args: [],
@@ -357,12 +422,15 @@ async function launchDaemonRuntime(home: string, runtime: DaemonLaunchRuntime): 
       env: { ...invocation.env, PASEO_CLI: runtime.cliPath },
       mode: "managed",
       desktopManaged: true,
+      ...(signal ? { signal } : {}),
       onAcquired: (instance) => {
         ownedLaunch = { home, instance, serverVersion: runtime.version };
       },
     });
+    return "ready";
   } catch (error) {
     if (!(error instanceof DaemonInstanceError && error.code === "DAEMON_NOT_READY")) throw error;
+    return "not_ready";
   }
 }
 
