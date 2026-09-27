@@ -29,7 +29,13 @@ import {
   sendLocalTransportMessage,
   closeLocalTransportSession,
 } from "./local-transport.js";
-import { createNodeEntrypointInvocation, resolveDaemonRunnerEntrypoint } from "./runtime-paths.js";
+import {
+  resolveBundledDaemonRuntime,
+  resolveBundledServerVersion,
+  resolvePaseoAppDaemonRuntime,
+  type DaemonLaunchRuntime,
+} from "./runtime-paths.js";
+import { pickDaemonRuntime } from "../figmenta/daemon-runtime.js";
 import { runExternalCliJsonCommand, runExternalCliTextCommand } from "./cli/external.js";
 import {
   createDesktopSettingsCommandHandlers,
@@ -49,7 +55,9 @@ import {
 import { tailFile } from "../diagnostics/tail-file.js";
 
 const DAEMON_LOG_FILENAME = "daemon.log";
-let ownedLaunch: { home: string; instance: DaemonInstance } | null = null;
+// Figmenta fork: `serverVersion` is the @getpaseo/server version of the runtime this app
+// launched — Orchestra's own version (1.x) is not a server version and never compared.
+let ownedLaunch: { home: string; instance: DaemonInstance; serverVersion: string } | null = null;
 
 type DesktopDaemonState = "starting" | "running" | "stopped" | "errored";
 const DESKTOP_DAEMON_STOP_REASON_VALUES = [
@@ -243,12 +251,17 @@ function normalizeVersion(version: string | null): string | null {
 
 // Figmenta fork: a version mismatch restarts only a daemon THIS app spawned. Upstream
 // restarted any `desktopManaged` one, which in Orchestra means a daemon belonging to an
-// installed Paseo Desktop sharing ~/.paseo. A foreign daemon is reused as it is.
+// installed Paseo Desktop sharing ~/.paseo. A foreign daemon is reused as it is. The
+// expected version is the server this app launched, not the app's own 1.x version.
+function expectedOwnedServerVersion(): string | null {
+  return ownedLaunch?.serverVersion ?? null;
+}
+
 function shouldRestartForVersion(current: DesktopDaemonStatus): boolean {
   return shouldRestartDaemonForVersion({
     spawnedByThisApp: current.ownedByDesktop,
     desktopManaged: current.desktopManaged,
-    appVersion: resolveDesktopAppVersion(),
+    expectedVersion: expectedOwnedServerVersion(),
     daemonVersion: current.version,
   });
 }
@@ -274,7 +287,7 @@ export async function startDaemon(): Promise<DesktopDaemonStatus> {
   if (current.status === "running" || current.status === "starting") {
     if (shouldRestartForVersion(current)) {
       logDesktopDaemonLifecycle("daemon version mismatch, restarting", {
-        appVersion: normalizeVersion(resolveDesktopAppVersion()),
+        expectedVersion: normalizeVersion(expectedOwnedServerVersion()),
         daemonVersion: normalizeVersion(current.version),
       });
       await stopDesktopDaemon("version_mismatch");
@@ -284,16 +297,54 @@ export async function startDaemon(): Promise<DesktopDaemonStatus> {
           pid: current.pid,
           listen: current.listen,
           daemonVersion: current.version,
-          appVersion: resolveDesktopAppVersion(),
+          bundledServerVersion: resolveBundledServerVersion(),
         });
       }
       return current;
     }
   }
 
+  // Figmenta fork: nothing is listening, so Orchestra launches one — the newest server on
+  // this machine (its own, or an installed Paseo.app's), see figmenta/daemon-runtime.ts.
   const home = getPaseoHome();
-  const invocation = createNodeEntrypointInvocation({
-    entrypoint: resolveDaemonRunnerEntrypoint(),
+  const bundled = resolveBundledDaemonRuntime(getBundledCliShimPath());
+  const picked = pickOrchestraDaemonRuntime(bundled);
+  try {
+    await launchDaemonRuntime(home, picked);
+  } catch (error) {
+    if (picked === bundled) throw error;
+    logDesktopDaemonLifecycle("newer runtime failed to start, falling back to the bundled one", {
+      source: picked.source,
+      version: picked.version,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    await launchDaemonRuntime(home, bundled);
+  }
+  return resolveDesktopDaemonStatus();
+}
+
+function pickOrchestraDaemonRuntime(bundled: DaemonLaunchRuntime): DaemonLaunchRuntime {
+  let paseoApp: DaemonLaunchRuntime | null = null;
+  try {
+    paseoApp = resolvePaseoAppDaemonRuntime();
+  } catch (error) {
+    logDesktopDaemonLifecycle("installed Paseo.app runtime unreadable, ignored", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  const picked = pickDaemonRuntime(bundled, paseoApp ? [paseoApp] : []);
+  logDesktopDaemonLifecycle("daemon runtime selected", {
+    source: picked.source,
+    version: picked.version,
+    location: picked.location,
+    bundledVersion: bundled.version,
+    paseoAppVersion: paseoApp?.version ?? null,
+  });
+  return picked;
+}
+
+async function launchDaemonRuntime(home: string, runtime: DaemonLaunchRuntime): Promise<void> {
+  const invocation = runtime.createInvocation({
     argvMode: "node-script",
     args: [],
     baseEnv: process.env,
@@ -303,17 +354,16 @@ export async function startDaemon(): Promise<DesktopDaemonStatus> {
       home,
       timeoutMs: 30_000,
       ...invocation,
-      env: { ...invocation.env, PASEO_CLI: getBundledCliShimPath() },
+      env: { ...invocation.env, PASEO_CLI: runtime.cliPath },
       mode: "managed",
       desktopManaged: true,
       onAcquired: (instance) => {
-        ownedLaunch = { home, instance };
+        ownedLaunch = { home, instance, serverVersion: runtime.version };
       },
     });
   } catch (error) {
     if (!(error instanceof DaemonInstanceError && error.code === "DAEMON_NOT_READY")) throw error;
   }
-  return resolveDesktopDaemonStatus();
 }
 
 export async function stopDesktopDaemon(
@@ -429,11 +479,13 @@ export function createDaemonCommandHandlers(): Record<string, DesktopCommandHand
           : "";
       if (sessionId) closeLocalTransportSession(sessionId);
     },
-    // Figmenta fork: Orchestra has no release feed (`publish: null`), so both update
-    // commands answer "already current" and log instead of hitting GitHub.
+    // Figmenta fork: Orchestra updates through its own mandatory updater
+    // (figmenta/mandatory-update-electron.ts), not upstream's GitHub feed with channels and
+    // rollout. These renderer commands are not reachable from the remote Orchestra page;
+    // they answer "nothing to do here" instead of hitting GitHub.
     check_app_update: () => {
       const currentVersion = resolveDesktopAppVersion();
-      log.info("[orchestra] auto-update disabled: check_app_update is a no-op", {
+      log.info("[orchestra] check_app_update is handled by the mandatory updater", {
         currentVersion,
       });
       return Promise.resolve({
@@ -444,13 +496,13 @@ export function createDaemonCommandHandlers(): Record<string, DesktopCommandHand
     },
     install_app_update: () => {
       const currentVersion = resolveDesktopAppVersion();
-      log.info("[orchestra] auto-update disabled: install_app_update is a no-op", {
+      log.info("[orchestra] install_app_update is handled by the mandatory updater", {
         currentVersion,
       });
       return Promise.resolve({
         installed: false,
         version: currentVersion,
-        message: "Auto-update is disabled in Orchestra Desktop.",
+        message: "Orchestra Desktop installs updates through its own update screen.",
       });
     },
     get_local_daemon_version: () => getLocalDaemonVersion(),

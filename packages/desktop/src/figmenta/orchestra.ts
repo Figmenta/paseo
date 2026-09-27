@@ -34,11 +34,16 @@ export function corsAllowsOrchestra(
 
 /** Is our plugin actually running, per `paseo plugin ls --json`? */
 export function pluginIsRunning(payload: unknown, pluginId: string = ORCHESTRA_PLUGIN_ID): boolean {
-  const list = Array.isArray(payload)
-    ? payload
-    : payload !== null && typeof payload === "object" && Array.isArray((payload as { data?: unknown }).data)
-      ? ((payload as { data: unknown[] }).data)
-      : null;
+  let list: unknown[] | null = null;
+  if (Array.isArray(payload)) {
+    list = payload;
+  } else if (
+    payload !== null &&
+    typeof payload === "object" &&
+    Array.isArray((payload as { data?: unknown }).data)
+  ) {
+    list = (payload as { data: unknown[] }).data;
+  }
   if (!list) return false;
   return list.some(
     (entry) =>
@@ -49,9 +54,7 @@ export function pluginIsRunning(payload: unknown, pluginId: string = ORCHESTRA_P
   );
 }
 
-export function resolveOrchestraUrl(
-  env: Record<string, string | undefined> = process.env,
-): string {
+export function resolveOrchestraUrl(env: Record<string, string | undefined> = process.env): string {
   const raw = env.ORCHESTRA_URL?.trim();
   if (!raw) return DEFAULT_ORCHESTRA_URL;
   try {
@@ -108,20 +111,22 @@ export function permissionPolicy(origin: string, permission: string): boolean {
 
 /**
  * Whether a running daemon should be restarted because its version does not match the
- * app's. Upstream restarted any `desktopManaged` daemon; Orchestra shares ~/.paseo with
- * an installed Paseo Desktop, so a daemon we did not spawn is reused as-is — killing
- * someone else's daemon to align a version number is not ours to do.
+ * server version this app launched. Upstream restarted any `desktopManaged` daemon;
+ * Orchestra shares ~/.paseo with an installed Paseo Desktop, so a daemon we did not
+ * spawn is reused as-is — killing someone else's daemon to align a version number is
+ * not ours to do. `expectedVersion` is a @getpaseo/server version: since 1.0.0 the
+ * Orchestra app has its own version line, unrelated to the server it bundles.
  */
 export function shouldRestartDaemonForVersion(input: {
   spawnedByThisApp: boolean;
   desktopManaged: boolean;
-  appVersion: string | null;
+  expectedVersion: string | null;
   daemonVersion: string | null;
 }): boolean {
   if (!input.spawnedByThisApp || !input.desktopManaged) return false;
-  const app = input.appVersion?.trim().replace(/^v/i, "") || null;
+  const expected = input.expectedVersion?.trim().replace(/^v/i, "") || null;
   const daemon = input.daemonVersion?.trim().replace(/^v/i, "") || null;
-  return Boolean(app && daemon && app !== daemon);
+  return Boolean(expected && daemon && expected !== daemon);
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +172,9 @@ export function seedPaseoConfig(config: unknown, options: SeedOptions): JsonObje
   const daemon = asObject(next.daemon);
   const cors = asObject(daemon.cors);
   const existing = Array.isArray(cors.allowedOrigins)
-    ? (cors.allowedOrigins as unknown[]).filter((entry): entry is string => typeof entry === "string")
+    ? (cors.allowedOrigins as unknown[]).filter(
+        (entry): entry is string => typeof entry === "string",
+      )
     : [];
   cors.allowedOrigins = existing.includes(origin) ? existing : [...existing, origin];
   daemon.cors = cors;
@@ -176,9 +183,7 @@ export function seedPaseoConfig(config: unknown, options: SeedOptions): JsonObje
   return next;
 }
 
-export type SeedTextResult =
-  | { status: "ok"; text: string }
-  | { status: "corrupt"; reason: string };
+export type SeedTextResult = { status: "ok"; text: string } | { status: "corrupt"; reason: string };
 
 /**
  * Text-in / text-out wrapper. A missing or empty file seeds from `{}`. A file that does

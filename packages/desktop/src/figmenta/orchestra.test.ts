@@ -63,7 +63,7 @@ describe("isAllowedNavigation", () => {
 });
 
 describe("shouldRestartDaemonForVersion", () => {
-  const base = { spawnedByThisApp: true, desktopManaged: true, appVersion: "0.8.0" };
+  const base = { spawnedByThisApp: true, desktopManaged: true, expectedVersion: "0.8.0" };
 
   it("restarts our own daemon when the versions differ", () => {
     expect(shouldRestartDaemonForVersion({ ...base, daemonVersion: "v0.7.9" })).toBe(true);
@@ -117,7 +117,11 @@ describe("seedPaseoConfig", () => {
 
   it("never overwrites an existing plugin entry", () => {
     const seeded = seedPaseoConfig(
-      { plugins: { "figmenta-sessions": { source: "directory", path: "/work/plugin", enabled: false } } },
+      {
+        plugins: {
+          "figmenta-sessions": { source: "directory", path: "/work/plugin", enabled: false },
+        },
+      },
       { pluginPath: PLUGIN_PATH },
     );
     expect(seeded.plugins).toEqual({
