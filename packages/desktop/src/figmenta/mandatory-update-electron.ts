@@ -1,15 +1,16 @@
 import path from "node:path";
-import { app, BrowserWindow, ipcMain, WebContentsView, type WebContents } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, WebContentsView, type WebContents } from "electron";
 import log from "electron-log/main";
-import { autoUpdater, type ProgressInfo } from "electron-updater";
+import { autoUpdater } from "electron-updater";
 import {
   createMandatoryUpdateController,
   resolveUpdateFeedUrl,
+  shouldOfferMoveToApplications,
   type MandatoryUpdateController,
-  type MandatoryUpdateRuntime,
   type MandatoryUpdateState,
   type MandatoryUpdateView,
 } from "./mandatory-update.js";
+import { ElectronUpdaterRuntime } from "./mandatory-update-runtime.js";
 import { updateOverlayPageUrl } from "./update-overlay-page.js";
 
 // Figmenta fork: the Electron side of the mandatory updater (policy in mandatory-update.ts).
@@ -23,49 +24,63 @@ function logUpdate(message: string, details?: Record<string, unknown>): void {
   log.info(`[orchestra-update] ${message}`, details ?? {});
 }
 
-class ElectronUpdaterRuntime implements MandatoryUpdateRuntime {
-  private progressListener: ((percent: number) => void) | null = null;
+function runsOutsideApplications(): boolean {
+  return process.platform === "darwin" && app.isPackaged && !app.isInApplicationsFolder();
+}
 
-  constructor(feedUrl: string) {
-    autoUpdater.logger = log;
-    autoUpdater.autoDownload = false;
-    // A downloaded update that was never installed still lands at the next quit.
-    autoUpdater.autoInstallOnAppQuit = true;
-    autoUpdater.autoRunAppAfterInstall = true;
-    autoUpdater.allowDowngrade = false;
-    autoUpdater.allowPrerelease = false;
-    autoUpdater.channel = "latest";
-    autoUpdater.setFeedURL({ provider: "generic", url: feedUrl });
-    autoUpdater.on("download-progress", (progress: ProgressInfo) => {
-      this.progressListener?.(progress.percent);
+/**
+ * Before the first window: an Orchestra outside /Applications (opened from the dmg, or a
+ * copy left in Downloads) offers to move itself there, because macOS cannot update it
+ * in place. Moving relaunches the app from /Applications. Declined or failed: the app
+ * starts where it is, and the update screen explains the location if an update fails.
+ */
+export async function offerMoveToApplicationsFolder(): Promise<"moved" | "stayed"> {
+  if (
+    !shouldOfferMoveToApplications({
+      platform: process.platform,
+      isPackaged: app.isPackaged,
+      inApplicationsFolder: process.platform === "darwin" && app.isInApplicationsFolder(),
+      env: process.env,
+    })
+  ) {
+    return "stayed";
+  }
+  const { response } = await dialog.showMessageBox({
+    type: "question",
+    title: "Orchestra",
+    message: "Spostare Orchestra nella cartella Applicazioni?",
+    detail:
+      "Orchestra si aggiorna da sola, e per farlo deve stare in Applicazioni. " +
+      "Da qui (per esempio dall'immagine disco) gli aggiornamenti non si possono installare.",
+    buttons: ["Sposta in Applicazioni", "Non ora"],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+  });
+  if (response !== 0) {
+    logUpdate("move to /Applications declined");
+    return "stayed";
+  }
+  try {
+    // On success the app quits and relaunches from /Applications. An existing copy there
+    // is replaced (moved to the Trash); a RUNNING copy there takes focus and this one quits.
+    const moved = app.moveToApplicationsFolder();
+    logUpdate("move to /Applications", { moved });
+    if (moved) return "moved";
+  } catch (error) {
+    log.error("[orchestra-update] move to /Applications failed", error);
+    await dialog.showMessageBox({
+      type: "warning",
+      title: "Orchestra",
+      message: "Non sono riuscito a spostare Orchestra in Applicazioni.",
+      detail:
+        "Trascina Orchestra nella cartella Applicazioni dal Finder e riaprila da lì: " +
+        "altrimenti gli aggiornamenti non si possono installare.",
+      buttons: ["OK"],
+      noLink: true,
     });
-    // Errors reach the caller through the rejected promises below; without a listener
-    // electron-updater's EventEmitter would throw on "error".
-    autoUpdater.on("error", (error) => {
-      logUpdate("updater error event", { error: error?.message ?? String(error) });
-    });
   }
-
-  async check(): Promise<{ version: string } | null> {
-    const result = await autoUpdater.checkForUpdates();
-    if (!result || !result.isUpdateAvailable) return null;
-    return { version: result.updateInfo.version };
-  }
-
-  async download(onProgress: (percent: number) => void): Promise<void> {
-    this.progressListener = onProgress;
-    try {
-      await autoUpdater.downloadUpdate();
-    } finally {
-      this.progressListener = null;
-    }
-  }
-
-  install(): void {
-    // Silent on Windows (the NSIS wizard would ask again what the user already chose),
-    // and always relaunch. macOS ignores both flags.
-    autoUpdater.quitAndInstall(true, true);
-  }
+  return "stayed";
 }
 
 /**
@@ -200,8 +215,16 @@ export function startMandatoryUpdater(options: { beforeInstall: () => Promise<vo
   logUpdate("feed", { url: feed.url, currentVersion: app.getVersion() });
 
   const view = new UpdateOverlayView();
+  const currentVersion = app.getVersion();
   const updater = createMandatoryUpdateController({
-    runtime: new ElectronUpdaterRuntime(feed.url),
+    runtime: new ElectronUpdaterRuntime(autoUpdater, {
+      feedUrl: feed.url,
+      currentVersion,
+      logger: log,
+      onError: (message) => logUpdate("updater error event", { error: message }),
+    }),
+    currentVersion,
+    failureHint: () => (runsOutsideApplications() ? "location" : "network"),
     view,
     log: logUpdate,
     beforeInstall: options.beforeInstall,

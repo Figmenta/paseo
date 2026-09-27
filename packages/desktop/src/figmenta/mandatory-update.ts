@@ -11,6 +11,8 @@
 // This module is the state machine only; electron-updater and the covering screen are
 // injected (mandatory-update-electron.ts), so every transition is unit-testable.
 
+import { compareVersions } from "./semver.js";
+
 export const DEFAULT_UPDATE_FEED_URL = "https://downloads.figmenta.site/orchestra-desktop/updates/";
 export const UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
 
@@ -21,8 +23,15 @@ export type MandatoryUpdateState =
   | { phase: "idle" }
   | { phase: "downloading"; version: string | null; percent: number | null }
   | { phase: "ready"; version: string }
-  | { phase: "failed"; version: string | null; message: string }
+  | { phase: "failed"; version: string | null; message: string; hint: UpdateFailureHint }
   | { phase: "installing"; version: string };
+
+/**
+ * Why the download most likely failed, for the screen: "network" by default; "location"
+ * when the app runs outside /Applications (a dmg, a read-only volume, a translocated
+ * copy), where macOS cannot replace it and retrying will never help.
+ */
+export type UpdateFailureHint = "network" | "location";
 
 export interface MandatoryUpdateRuntime {
   /** The newer version the feed announces, null when this build is current. Throws when
@@ -40,6 +49,9 @@ export interface MandatoryUpdateView {
 
 export interface MandatoryUpdateDeps {
   runtime: MandatoryUpdateRuntime;
+  /** The running app's version: an announced version that is not newer never blocks. */
+  currentVersion: string;
+  failureHint?: () => UpdateFailureHint;
   view: MandatoryUpdateView;
   log: (message: string, details?: Record<string, unknown>) => void;
   /** Runs before install(): stop the daemon this app launched, like upstream does. */
@@ -69,6 +81,27 @@ export function createMandatoryUpdateController(
   let checking = false;
   let timer: unknown = null;
 
+  function failed(version: string | null, error: unknown): MandatoryUpdateState {
+    return {
+      phase: "failed",
+      version,
+      message: errorMessage(error),
+      hint: deps.failureHint?.() ?? "network",
+    };
+  }
+
+  /** Only a strictly newer, readable version counts: equal, older (a downgrade pushed by
+   * the feed) or unparseable is ignored and never blocks the user. */
+  function newerThanCurrent(found: { version: string } | null): { version: string } | null {
+    if (!found) return null;
+    if (compareVersions(found.version, deps.currentVersion) === 1) return found;
+    deps.log("announced version is not newer, ignored", {
+      announced: found.version,
+      current: deps.currentVersion,
+    });
+    return null;
+  }
+
   function setState(next: MandatoryUpdateState): void {
     state = next;
     deps.view.render(state);
@@ -84,7 +117,7 @@ export function createMandatoryUpdateController(
       });
     } catch (error) {
       deps.log("download failed", { version, error: errorMessage(error) });
-      setState({ phase: "failed", version, message: errorMessage(error) });
+      setState(failed(version, error));
       return;
     }
     deps.log("download complete", { version });
@@ -98,7 +131,7 @@ export function createMandatoryUpdateController(
     checking = true;
     let found: { version: string } | null;
     try {
-      found = await deps.runtime.check();
+      found = newerThanCurrent(await deps.runtime.check());
     } catch (error) {
       // Offline, feed down, DNS: never a reason to lock the user out.
       deps.log("update check failed, retrying next round", { error: errorMessage(error) });
@@ -117,9 +150,15 @@ export function createMandatoryUpdateController(
     setState({ phase: "downloading", version: previous.version, percent: null });
     let found: { version: string } | null;
     try {
-      found = await deps.runtime.check();
+      found = newerThanCurrent(await deps.runtime.check());
     } catch (error) {
-      setState({ phase: "failed", version: previous.version, message: errorMessage(error) });
+      // Same rule as the periodic check: a feed we cannot reach never locks the user out.
+      // The next round checks again and blocks again if the update is still there.
+      deps.log("retry could not reach the feed, unblocking until the next round", {
+        version: previous.version,
+        error: errorMessage(error),
+      });
+      setState({ phase: "idle" });
       return;
     }
     if (!found) {
@@ -147,7 +186,7 @@ export function createMandatoryUpdateController(
       deps.runtime.install();
     } catch (error) {
       deps.log("install failed", { version, error: errorMessage(error) });
-      setState({ phase: "failed", version, message: errorMessage(error) });
+      setState(failed(version, error));
     }
   }
 
@@ -201,4 +240,23 @@ export function resolveUpdateFeedUrl(
   }
   const url = parsed.toString();
   return { url: url.endsWith("/") ? url : `${url}/`, refusedOverride: null };
+}
+
+/** E2E-only: the test build runs from a scratch folder and must not be offered the move. */
+export const KEEP_LOCATION_ENV = "ORCHESTRA_E2E_KEEP_LOCATION";
+
+/**
+ * macOS replaces the app in place on update, which fails from a dmg, a read-only volume
+ * or a translocated copy: an Orchestra outside /Applications offers to move itself there
+ * at launch. Otherwise the mandatory update would lock the user on «Riprova» forever.
+ */
+export function shouldOfferMoveToApplications(input: {
+  platform: NodeJS.Platform;
+  isPackaged: boolean;
+  inApplicationsFolder: boolean;
+  env: Record<string, string | undefined>;
+}): boolean {
+  if (input.platform !== "darwin" || !input.isPackaged) return false;
+  if (input.inApplicationsFolder) return false;
+  return input.env[KEEP_LOCATION_ENV] !== "1";
 }

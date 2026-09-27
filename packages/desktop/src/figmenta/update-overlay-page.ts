@@ -73,8 +73,10 @@ export const UPDATE_OVERLAY_PAGE_HTML = `<!doctype html>
         install.focus();
         break;
       case "failed":
-        $("title").textContent = "Download non riuscito";
-        $("lead").textContent = "Non sono riuscito a scaricare " + label(state.version) + ". Controlla la connessione e riprova.";
+        $("title").textContent = "Aggiornamento non riuscito";
+        $("lead").textContent = state.hint === "location"
+          ? "Orchestra non è nella cartella Applicazioni, e da qui non si può aggiornare. Esci, trascina Orchestra in Applicazioni dal Finder e riaprila da lì."
+          : "Non sono riuscito a scaricare " + label(state.version) + ". Controlla la connessione e riprova.";
         error.hidden = false;
         error.textContent = state.message || "";
         retry.hidden = false;

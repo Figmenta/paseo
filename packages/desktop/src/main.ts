@@ -110,7 +110,10 @@ import {
   seedPaseoConfigText,
   titleBarInset,
 } from "./figmenta/orchestra.js";
-import { startMandatoryUpdater } from "./figmenta/mandatory-update-electron.js";
+import {
+  offerMoveToApplicationsFolder,
+  startMandatoryUpdater,
+} from "./figmenta/mandatory-update-electron.js";
 import { registerBrowserAutomationIpc } from "./features/browser-automation/ipc.js";
 import { BrowserKeyboard } from "./features/browser-keyboard/index.js";
 import {
@@ -1233,6 +1236,9 @@ async function bootstrap(): Promise<void> {
     });
   });
 
+  // Figmenta fork: outside /Applications macOS cannot update Orchestra in place; offer
+  // the move before anything else starts (a successful move relaunches the app).
+  if ((await offerMoveToApplicationsFolder()) === "moved") return;
   installOrchestraSessionPolicies();
   await seedOrchestraDaemonConfig();
   await startOrchestraDaemon();

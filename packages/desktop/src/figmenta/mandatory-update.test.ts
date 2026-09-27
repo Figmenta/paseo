@@ -2,13 +2,17 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createMandatoryUpdateController,
   DEFAULT_UPDATE_FEED_URL,
+  shouldOfferMoveToApplications,
   resolveUpdateFeedUrl,
   UPDATE_CHECK_INTERVAL_MS,
   type MandatoryUpdateRuntime,
   type MandatoryUpdateState,
 } from "./mandatory-update.js";
 
-function harness(runtime: Partial<MandatoryUpdateRuntime> = {}) {
+function harness(
+  runtime: Partial<MandatoryUpdateRuntime> = {},
+  options: { currentVersion?: string; failureHint?: () => "network" | "location" } = {},
+) {
   const rendered: MandatoryUpdateState[] = [];
   const intervals: Array<{ callback: () => void; ms: number }> = [];
   const fullRuntime: MandatoryUpdateRuntime = {
@@ -20,6 +24,8 @@ function harness(runtime: Partial<MandatoryUpdateRuntime> = {}) {
   const beforeInstall = vi.fn(async () => undefined);
   const controller = createMandatoryUpdateController({
     runtime: fullRuntime,
+    currentVersion: options.currentVersion ?? "1.0.0",
+    failureHint: options.failureHint,
     view: { render: (state) => rendered.push(state) },
     log: () => undefined,
     beforeInstall,
@@ -93,6 +99,7 @@ describe("mandatory update controller", () => {
       phase: "failed",
       version: "1.0.1",
       message: "HTTP 404",
+      hint: "network",
     });
     await controller.retry();
     expect(controller.getState()).toEqual({ phase: "ready", version: "1.0.1" });
@@ -113,11 +120,12 @@ describe("mandatory update controller", () => {
     expect(controller.getState().phase).toBe("failed");
   });
 
-  it("a retry that cannot reach the feed stays blocked on the retry screen", async () => {
+  it("a retry that cannot reach the feed unblocks: an unreachable feed never locks", async () => {
     const check = vi
       .fn<MandatoryUpdateRuntime["check"]>()
       .mockResolvedValueOnce({ version: "1.0.1" })
-      .mockRejectedValueOnce(new Error("offline"));
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValueOnce({ version: "1.0.1" });
     const { controller } = harness({
       check,
       download: async () => {
@@ -125,12 +133,38 @@ describe("mandatory update controller", () => {
       },
     });
     await controller.checkNow();
+    expect(controller.getState().phase).toBe("failed");
     await controller.retry();
-    expect(controller.getState()).toEqual({
-      phase: "failed",
-      version: "1.0.1",
-      message: "offline",
-    });
+    expect(controller.getState()).toEqual({ phase: "idle" });
+    // The next round blocks again if the update is still announced.
+    await controller.checkNow();
+    expect(check).toHaveBeenCalledTimes(3);
+    expect(controller.getState().phase).toBe("failed");
+  });
+
+  it("never blocks on a version that is not newer than the running one", async () => {
+    for (const announced of ["0.9.0", "1.0.0", "v1.0.0", "garbage"]) {
+      const { controller, rendered, runtime } = harness({
+        check: async () => ({ version: announced }),
+      });
+      await controller.checkNow();
+      expect(rendered, announced).toEqual([]);
+      expect(runtime.download, announced).not.toHaveBeenCalled();
+    }
+  });
+
+  it("explains the location when the app cannot be updated where it runs", async () => {
+    const { controller } = harness(
+      {
+        check: async () => ({ version: "1.0.1" }),
+        download: async () => {
+          throw new Error("EROFS");
+        },
+      },
+      { failureHint: () => "location" },
+    );
+    await controller.checkNow();
+    expect(controller.getState()).toMatchObject({ phase: "failed", hint: "location" });
   });
 
   it("installs only from the ready state, after stopping the daemon", async () => {
@@ -179,5 +213,27 @@ describe("resolveUpdateFeedUrl", () => {
         refusedOverride: raw,
       });
     }
+  });
+});
+
+describe("shouldOfferMoveToApplications", () => {
+  const base = {
+    platform: "darwin" as const,
+    isPackaged: true,
+    inApplicationsFolder: false,
+    env: {},
+  };
+
+  it("offers the move for a packaged macOS app outside /Applications", () => {
+    expect(shouldOfferMoveToApplications(base)).toBe(true);
+  });
+
+  it("stays quiet in /Applications, in development, on other platforms and in the e2e build", () => {
+    expect(shouldOfferMoveToApplications({ ...base, inApplicationsFolder: true })).toBe(false);
+    expect(shouldOfferMoveToApplications({ ...base, isPackaged: false })).toBe(false);
+    expect(shouldOfferMoveToApplications({ ...base, platform: "win32" })).toBe(false);
+    expect(
+      shouldOfferMoveToApplications({ ...base, env: { ORCHESTRA_E2E_KEEP_LOCATION: "1" } }),
+    ).toBe(false);
   });
 });
