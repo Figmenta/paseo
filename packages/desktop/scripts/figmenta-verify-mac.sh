@@ -3,7 +3,7 @@
 #   packages/desktop/scripts/figmenta-verify-mac.sh <release-dir> <version>
 # Every Orchestra-<version>-<arch>.dmg and .zip: Gatekeeper on the dmg itself, then on the
 # app inside (codesign --deep --strict, spctl, stapler), bundle id it.figmenta.orchestra,
-# no LSEnvironment (the e2e flavor injects one), version, architecture of the main binary
+# LSEnvironment limited to Electron's MallocNanoZone (the e2e flavor injects its env there), version, architecture of the main binary
 # and of every native module, updater cache directory. Then latest-mac.yml against the
 # files on disk. Exits non-zero at the first failing artifact.
 set -euo pipefail
@@ -28,10 +28,15 @@ check_app() {
   shortver="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")"
   echo "lipo: $exe = $got (want $want)"
   echo "bundle: $id $shortver"
-  if /usr/libexec/PlistBuddy -c 'Print :LSEnvironment' "$plist" > /dev/null 2>&1; then
-    fail "$label: Info.plist carries an LSEnvironment (e2e flavor?)"
-  fi
-  echo "LSEnvironment: absent"
+  # Electron's own Info.plist sets LSEnvironment { MallocNanoZone = 0 }; any other key is
+  # injected (the e2e flavor carries its isolation env there) and fails the release.
+  local env_keys
+  env_keys="$(plutil -extract LSEnvironment json -o - "$plist" 2>/dev/null \
+    | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(Object.keys(JSON.parse(s||"{}")).sort().join(" ")))')"
+  echo "LSEnvironment keys: ${env_keys:-none}"
+  for key in $env_keys; do
+    [[ "$key" == MallocNanoZone ]] || fail "$label: Info.plist LSEnvironment carries $key (e2e flavor?)"
+  done
   grep '^updaterCacheDirName:' "$app/Contents/Resources/app-update.yml" | sed 's/^/app-update.yml: /'
   grep -q '^url: https://downloads.figmenta.site/orchestra-desktop/updates/$' \
     "$app/Contents/Resources/app-update.yml" || fail "$label: app-update.yml feed is not the production one"

@@ -358,7 +358,8 @@ FIGMENTA_ASC_ISSUER=<App Store Connect issuer id> packages/desktop/scripts/figme
   (`--config`, `appId`, `extendInfo`/`LSEnvironment`, `extraMetadata`, `e2e`).
 - Ends with `scripts/figmenta-verify-mac.sh`: per dmg AND per zip, `spctl` on the dmg, then
   on the app `codesign --verify --deep --strict`, `spctl -a -vv` (Notarized Developer ID),
-  `stapler validate`, bundle id `it.figmenta.orchestra`, no `LSEnvironment`, production feed
+  `stapler validate`, bundle id `it.figmenta.orchestra`, `LSEnvironment` limited to Electron's own
+  `MallocNanoZone`, production feed
   in `app-update.yml`, `lipo -archs` of the main binary and of every native module; then
   every entry of `latest-mac.yml` against size and sha512 on disk.
 
