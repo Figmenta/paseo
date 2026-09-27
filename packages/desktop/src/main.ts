@@ -110,6 +110,7 @@ import {
   seedPaseoConfigText,
   titleBarInset,
 } from "./figmenta/orchestra.js";
+import { startMandatoryUpdater } from "./figmenta/mandatory-update-electron.js";
 import { registerBrowserAutomationIpc } from "./features/browser-automation/ipc.js";
 import { BrowserKeyboard } from "./features/browser-keyboard/index.js";
 import {
@@ -1102,7 +1103,7 @@ function showDaemonSeedWarning(): void {
       noLink: true,
     })
     .then(async (result) => {
-      if (!ours || result.response !== 0) return;
+      if (!ours || result.response !== 0) return undefined;
       try {
         await stopDesktopDaemonViaCli("quit");
         await startDaemon();
@@ -1110,6 +1111,7 @@ function showDaemonSeedWarning(): void {
       } catch (error) {
         log.error("[orchestra] engine restart failed", error);
       }
+      return undefined;
     })
     .catch((error: unknown) => {
       log.error("[orchestra] failed to show the engine warning", error);
@@ -1244,6 +1246,17 @@ async function bootstrap(): Promise<void> {
   });
   pendingOpenProjectPath = null;
 
+  // Figmenta fork: mandatory updater — checks now and every 30 minutes; a newer version
+  // covers every window until it is installed. Before relaunching, stop the daemon this
+  // app launched (never someone else's), as upstream does before an update.
+  startMandatoryUpdater({
+    beforeInstall: async () => {
+      if (wasDaemonSpawnedByThisApp() && isDesktopManagedDaemonRunningSync()) {
+        await stopDesktopDaemonViaCli("app_update");
+      }
+    },
+  });
+
   // Protocol + IPC handlers and the first window now exist: release any
   // second-instance launches that arrived during cold start.
   bootstrapIsComplete = true;
@@ -1292,12 +1305,10 @@ const quitLifecycle = createQuitLifecycle({
       stopDaemon: () => stopDesktopDaemonViaCli("quit"),
       showShutdownFeedback: showDaemonShutdownDialog,
     }),
-  // Figmenta fork: Orchestra ships without an update feed (publish: null), so there is
-  // never a downloaded update to validate on quit. Kept as a logged no-op.
-  installAppUpdateOnQuit: async () => {
-    log.info("[orchestra] auto-update disabled: nothing to install on quit");
-    return false;
-  },
+  // Figmenta fork: the mandatory updater (figmenta/mandatory-update-electron.ts) installs
+  // through its own screen; a download left uninstalled at quit is applied by
+  // electron-updater's autoInstallOnAppQuit. Upstream's revalidate-on-quit stays off.
+  installAppUpdateOnQuit: async () => false,
   createUpdateDeadlineSignal: () => AbortSignal.timeout(UPDATE_QUIT_DEADLINE_MS),
   onStopError: (error) => {
     log.error("[desktop daemon] failed to stop managed daemon on quit", error);

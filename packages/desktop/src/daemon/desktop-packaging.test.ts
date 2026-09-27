@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -117,6 +118,41 @@ describe("desktop packaging", () => {
     expect(serverPackage).toContain("fs.rmSync('dist/server/skills',{recursive:true,force:true})");
     expect(serverPackage).toContain("fs.cpSync('../../skills','dist/server/skills'");
     expect(runtimeTrace).toContain('"packages/server/dist/server/skills/**"');
+  });
+
+  // Figmenta fork: the mandatory updater's feed and its private cache directory.
+  it("publishes Orchestra's own generic update feed, hardened runtime on", () => {
+    const config = readFileSync(join(packageRoot, "electron-builder.yml"), "utf8");
+
+    expect(config).toMatch(
+      /^publish:\n {2}provider: generic\n {2}url: https:\/\/downloads\.figmenta\.site\/orchestra-desktop\/updates\/$/m,
+    );
+    expect(config).toContain("hardenedRuntime: true");
+  });
+
+  it("gives electron-updater a cache directory that Paseo Desktop does not use", () => {
+    const afterPack = createRequire(import.meta.url)(
+      join(packageRoot, "scripts", "after-pack.js"),
+    ) as {
+      setUpdaterCacheDirName(resourcesDir: string): boolean;
+      UPDATER_CACHE_DIR_NAME: string;
+    };
+    const resourcesDir = mkdtempSync(join(tmpdir(), "orchestra-app-update-"));
+    try {
+      expect(afterPack.setUpdaterCacheDirName(resourcesDir)).toBe(false);
+      writeFileSync(
+        join(resourcesDir, "app-update.yml"),
+        "provider: generic\nurl: https://example.test/\nupdaterCacheDirName: '@getpaseodesktop-updater'\n",
+      );
+      expect(afterPack.setUpdaterCacheDirName(resourcesDir)).toBe(true);
+      const written = readFileSync(join(resourcesDir, "app-update.yml"), "utf8");
+      expect(afterPack.UPDATER_CACHE_DIR_NAME).toBe("orchestra-desktop-updater");
+      expect(written).toContain("updaterCacheDirName: orchestra-desktop-updater");
+      expect(written).not.toContain("@getpaseodesktop-updater");
+      expect(written).toContain("url: https://example.test/");
+    } finally {
+      rmSync(resourcesDir, { recursive: true, force: true });
+    }
   });
 
   it("registers Orchestra agent links with the operating system", () => {

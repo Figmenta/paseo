@@ -44,16 +44,23 @@ extraResources:
       - "!**/*.test.tsx"
   - from: ../../node_modules/zod
     to: plugins/figmenta-sessions/node_modules/zod
-# Figmenta fork: Orchestra is distributed by hand, not through a GitHub release feed.
-# The in-app update commands are no-ops (daemon-manager.ts) to match.
-publish: null
+# Figmenta fork: Orchestra's own update feed (generic provider, mandatory updater in
+# src/figmenta/mandatory-update*.ts). With this set, electron-builder writes
+# app-update.yml into Resources and latest-mac.yml / latest.yml next to the artifacts;
+# `--publish never` keeps it from uploading anything — the feed is filled by hand.
+publish:
+  provider: generic
+  url: https://downloads.figmenta.site/orchestra-desktop/updates/
 mac:
   artifactName: "Orchestra-${version}-${arch}.${ext}"
   minimumSystemVersion: "13.0.0"
   category: public.app-category.developer-tools
   icon: assets/icon.icns
-  # Figmenta fork: internal distribution, no Developer ID signing or notarization.
-  hardenedRuntime: false
+  # Figmenta fork: hardened runtime as upstream. The repository is public, so signing
+  # stays OFF here (CI builds are unsigned) and the release script turns it on locally
+  # with the Developer ID identity, a dedicated keychain and notarization:
+  # scripts/figmenta-release-mac.sh (docs/FIGMENTA.md, "Release firmata macOS").
+  hardenedRuntime: true
   notarize: false
   identity: null
   entitlements: build/entitlements.mac.plist

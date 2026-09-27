@@ -7,6 +7,33 @@ const { installLinuxLauncher } = require("./linux-sandbox");
 
 const EXECUTABLE_NAME = "Orchestra";
 
+// Figmenta fork: electron-updater keeps downloads in ~/Library/Caches/<updaterCacheDirName>
+// (%LOCALAPPDATA% on Windows) and cleans that directory on every check. electron-builder
+// derives the name from the package name, `@getpaseo/desktop`, the same as an installed
+// Paseo Desktop: the two apps would delete each other's pending update. Orchestra gets
+// its own. User hooks run after electron-builder's own afterPack handlers, so the
+// app-update.yml it writes already exists here, and signing has not happened yet.
+const UPDATER_CACHE_DIR_NAME = "orchestra-desktop-updater";
+
+function resourcesDirFor(appOutDir, platform) {
+  return platform === "darwin"
+    ? path.join(appOutDir, `${EXECUTABLE_NAME}.app`, "Contents", "Resources")
+    : path.join(appOutDir, "resources");
+}
+
+function setUpdaterCacheDirName(resourcesDir, dirName = UPDATER_CACHE_DIR_NAME) {
+  const file = path.join(resourcesDir, "app-update.yml");
+  if (!fs.existsSync(file)) return false;
+  const text = fs.readFileSync(file, "utf8");
+  const line = `updaterCacheDirName: ${dirName}`;
+  const next = /^updaterCacheDirName:.*$/m.test(text)
+    ? text.replace(/^updaterCacheDirName:.*$/m, line)
+    : `${text.replace(/\n?$/, "\n")}${line}\n`;
+  if (next !== text) fs.writeFileSync(file, next);
+  console.log(`app-update.yml: ${line}`);
+  return true;
+}
+
 // electron-builder arch enum → Node.js arch string
 const ARCH_MAP = { 0: "ia32", 1: "x64", 2: "armv7l", 3: "arm64", 4: "universal" };
 
@@ -76,10 +103,7 @@ function pruneSharpLibvips(nodeModules, platform, arch) {
 }
 
 function pruneNativeModules(appOutDir, platform, arch) {
-  const resourcesDir =
-    platform === "darwin"
-      ? path.join(appOutDir, `${EXECUTABLE_NAME}.app`, "Contents", "Resources")
-      : path.join(appOutDir, "resources");
+  const resourcesDir = resourcesDirFor(appOutDir, platform);
 
   const nodeModules = path.join(resourcesDir, "app.asar.unpacked", "node_modules");
   if (!fs.existsSync(nodeModules)) return;
@@ -111,11 +135,15 @@ function fmtMB(bytes) {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+exports.setUpdaterCacheDirName = setUpdaterCacheDirName;
+exports.UPDATER_CACHE_DIR_NAME = UPDATER_CACHE_DIR_NAME;
+
 exports.default = async function afterPack(context) {
   const platform = context.electronPlatformName;
   const arch = ARCH_MAP[context.arch] || process.arch;
 
   pruneNativeModules(context.appOutDir, platform, arch);
+  setUpdaterCacheDirName(resourcesDirFor(context.appOutDir, platform));
 
   if (platform === "linux") {
     installLinuxLauncher(context.appOutDir);
