@@ -3,6 +3,12 @@
 # platform (Windows x64 NSIS, macOS arm64 + x64 dmg), unsigned (internal app), and a workflow
 # artifact instead of a GitHub Release (the fork is public: 7 days retention).
 # Trigger: push a tag `figmenta-win-*` or `figmenta-mac-*` on the figmenta branch.
+#
+# Updates: the Windows job also uploads latest.yml + the blockmap, the manifest the
+# mandatory updater reads from downloads.figmenta.site/orchestra-desktop/updates/.
+# macOS updates are NOT built here: Squirrel.Mac only installs a signed update, and the
+# signing identity never goes to a public repository — the signed macOS release is
+# local (packages/desktop/scripts/figmenta-release-mac.sh, docs/FIGMENTA.md).
 name: Figmenta desktop installers
 
 on:
@@ -46,6 +52,16 @@ jobs:
           set -euo pipefail
           npm run build:desktop -- --publish never --win nsis --x64
 
+      - name: Verify the update manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest=packages/desktop/release/latest.yml
+          [ -f "$manifest" ] || { echo "::error::latest.yml was not generated"; exit 1; }
+          cat "$manifest"
+          exe=$(sed -n 's/^path: //p' "$manifest")
+          [ -f "packages/desktop/release/$exe" ] || { echo "::error::latest.yml points at a missing $exe"; exit 1; }
+
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
@@ -53,6 +69,7 @@ jobs:
           path: |
             packages/desktop/release/*.exe
             packages/desktop/release/*.exe.blockmap
+            packages/desktop/release/latest.yml
           if-no-files-found: error
           retention-days: 7
 
