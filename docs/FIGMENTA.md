@@ -246,12 +246,13 @@ Remind me later, no countdown.
   button, **«Installa e riavvia»**. A failed download: same screen, **«Riprova»** (it checks
   again, then downloads; if the feed is unreachable at that moment the screen goes away until
   the next round). Before relaunching, the daemon this app launched is stopped.
-- Windows relaunch: the update runs the installer with `--updated /S --force-run`. From 1.0.3
-  the installer is **one-click, per user** (`nsis.oneClick: true`, `runAfterFinish: true`):
-  the assisted installer (1.0.0–1.0.2) did not reopen Orchestra after a silent update
-  (real PC and CI, 2026-09-28; electron-builder #2179, #8026). Same install folder
-  (`%LOCALAPPDATA%\Programs\Orchestra`) and same registry keys, so an assisted install is
-  upgraded in place. The PowerShell relaunch helper tried in 1.0.2 is gone.
+- Windows relaunch: the update runs the installer with `--updated /S --force-run`; the
+  installer (one-click, per user, from 1.0.3) relaunches `Orchestra.exe --updated`. Until
+  1.0.4 that argument was read as a CLI call (`paseo --updated`) and the relaunched app
+  exited at once, so Orchestra never came back after an update (CI run 36404199037).
+  `--updated` is now a GUI launch (`daemon/cli/passthrough.ts`). The first version that
+  comes back on its own is the one being INSTALLED (the relaunched binary), so an update
+  from 1.0.0–1.0.3 to 1.0.4 already reopens.
 - Never a downgrade: an announced version must be strictly newer than the running one,
   checked twice (state machine and runtime). electron-updater's `channel` setter is never
   used — assigning it turns `allowDowngrade` back on.
