@@ -246,13 +246,12 @@ Remind me later, no countdown.
   button, **«Installa e riavvia»**. A failed download: same screen, **«Riprova»** (it checks
   again, then downloads; if the feed is unreachable at that moment the screen goes away until
   the next round). Before relaunching, the daemon this app launched is stopped.
-- Windows relaunch: the NSIS installer's own relaunch (`--force-run`, ExecShellAsUser on its
-  shortcut) did not bring Orchestra back (real PC and CI, 2026-09-28). Right before
-  installing, Orchestra starts a hidden detached PowerShell helper
-  (`src/figmenta/windows-relaunch.ts`) that waits for Orchestra to exit, for the installer to
-  finish and for the installed exe to report the new version, then starts that exe —
-  unless one is already running; 180 s deadline. The installer then runs without
-  `--force-run`; if the helper cannot start, the installer's relaunch is kept.
+- Windows relaunch: the update runs the installer with `--updated /S --force-run`. From 1.0.3
+  the installer is **one-click, per user** (`nsis.oneClick: true`, `runAfterFinish: true`):
+  the assisted installer (1.0.0–1.0.2) did not reopen Orchestra after a silent update
+  (real PC and CI, 2026-09-28; electron-builder #2179, #8026). Same install folder
+  (`%LOCALAPPDATA%\Programs\Orchestra`) and same registry keys, so an assisted install is
+  upgraded in place. The PowerShell relaunch helper tried in 1.0.2 is gone.
 - Never a downgrade: an announced version must be strictly newer than the running one,
   checked twice (state machine and runtime). electron-updater's `channel` setter is never
   used — assigning it turns `allowDowngrade` back on.

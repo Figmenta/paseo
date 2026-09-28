@@ -115,7 +115,13 @@ win:
       arch:
         - x64
         - arm64
+# Figmenta fork: one-click, per user. The mandatory updater installs silently
+# (--updated /S --force-run) and the installer must reopen Orchestra; the assisted
+# installer (oneClick: false) ties that relaunch to its finish page (electron-builder
+# #2179, #8026). One-click keeps the same per-user location and registry keys
+# (%LOCALAPPDATA%\Programs\Orchestra, key from appId), so an assisted install upgrades
+# in place. allowToChangeInstallationDirectory does not apply to one-click.
 nsis:
-  oneClick: false
+  oneClick: true
   perMachine: false
-  allowToChangeInstallationDirectory: true
+  runAfterFinish: true
