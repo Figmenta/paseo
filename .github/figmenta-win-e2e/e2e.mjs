@@ -212,7 +212,7 @@ function processes() {
       [
         "-NoProfile",
         "-Command",
-        "Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'Orchestra' } | ForEach-Object { \"$($_.ProcessId) $($_.ParentProcessId) $($_.CommandLine)\" }",
+        "Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'Orchestra|powershell' } | ForEach-Object { $c = [string]$_.CommandLine; if ($c.Length -gt 200) { $c = $c.Substring(0, 200) + '...' }; \"$($_.ProcessId) $($_.ParentProcessId) $($_.Name) $c\" }",
       ],
       { encoding: "utf8" },
     ).trim();
@@ -401,6 +401,10 @@ try {
       file,
       path.join(OUT, `${path.basename(path.dirname(path.dirname(file)))}-main.log`),
     );
+  for (const file of logFiles()) {
+    const helperLog = path.join(path.dirname(file), "relaunch-helper.log");
+    if (existsSync(helperLog)) copyFileSync(helperLog, path.join(OUT, "relaunch-helper.log"));
+  }
   const daemonLog = path.join(paseoHome, "daemon.log");
   if (existsSync(daemonLog)) copyFileSync(daemonLog, path.join(OUT, "daemon.log"));
   writeFileSync(path.join(OUT, "results.json"), JSON.stringify(results, null, 2));
