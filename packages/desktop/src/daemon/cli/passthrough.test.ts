@@ -45,6 +45,24 @@ describe("passthrough CLI", () => {
     ).toBeNull();
   });
 
+  // Figmenta fork: the NSIS installer's relaunch after a silent update.
+  it("treats the installer's relaunch (--updated) as a GUI launch, not a CLI call", () => {
+    expect(
+      parsePassthroughCliArgs({
+        argv: ["C:\\Users\\u\\AppData\\Local\\Programs\\Orchestra\\Orchestra.exe", "--updated"],
+        isDefaultApp: false,
+        forceCli: false,
+      }),
+    ).toBeNull();
+    expect(
+      parsePassthroughCliArgs({
+        argv: ["Orchestra.exe", "--updated", "status"],
+        isDefaultApp: false,
+        forceCli: false,
+      }),
+    ).toEqual(["status"]);
+  });
+
   it("ignores --no-sandbox injected by Linux wrapper", () => {
     expect(
       parsePassthroughCliArgs({

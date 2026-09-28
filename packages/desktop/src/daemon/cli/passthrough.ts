@@ -3,6 +3,11 @@ import { resolvePassthroughCliEntrypoint } from "./entrypoints.js";
 
 const DESKTOP_CLI_ENV = "PASEO_DESKTOP_CLI";
 const IGNORED_ARG_PREFIXES = ["-psn_", "--class=", "--no-sandbox", "--remote-debugging-port="];
+// Figmenta fork: after a silent Windows update the NSIS installer relaunches the app as
+// `Orchestra.exe --updated`. Read as CLI arguments, that launch ran `paseo --updated` and
+// exited: the update installed and Orchestra never came back (CI run 36404199037, the
+// relaunched 1.0.3/1.0.4 logged "app startup" and nothing else). It is a GUI launch.
+const IGNORED_EXACT_ARGS = new Set(["--updated"]);
 
 export type PassthroughCliRunner = (argv: string[]) => Promise<number>;
 
@@ -15,7 +20,10 @@ export function parsePassthroughCliArgs(input: {
   const effective: string[] = [];
 
   for (const arg of input.argv.slice(startIndex)) {
-    if (IGNORED_ARG_PREFIXES.some((prefix) => arg.startsWith(prefix))) {
+    if (
+      IGNORED_EXACT_ARGS.has(arg) ||
+      IGNORED_ARG_PREFIXES.some((prefix) => arg.startsWith(prefix))
+    ) {
       continue;
     }
     effective.push(arg);
