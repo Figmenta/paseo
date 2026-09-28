@@ -7,12 +7,19 @@ import {
   UPDATE_CHECK_INTERVAL_MS,
   type MandatoryUpdateRuntime,
   type MandatoryUpdateState,
+  type WakeReason,
+  WAKE_CHECK_MIN_INTERVAL_MS,
 } from "./mandatory-update.js";
 
 function harness(
   runtime: Partial<MandatoryUpdateRuntime> = {},
-  options: { currentVersion?: string; failureHint?: () => "network" | "location" } = {},
+  options: {
+    currentVersion?: string;
+    failureHint?: () => "network" | "location";
+    now?: () => number;
+  } = {},
 ) {
+  let wake: ((reason: WakeReason) => void) | null = null;
   const rendered: MandatoryUpdateState[] = [];
   const intervals: Array<{ callback: () => void; ms: number }> = [];
   const fullRuntime: MandatoryUpdateRuntime = {
@@ -26,6 +33,10 @@ function harness(
     runtime: fullRuntime,
     currentVersion: options.currentVersion ?? "1.0.0",
     failureHint: options.failureHint,
+    now: options.now,
+    subscribeWake: (onWake) => {
+      wake = onWake;
+    },
     view: { render: (state) => rendered.push(state) },
     log: () => undefined,
     beforeInstall,
@@ -35,7 +46,14 @@ function harness(
     },
     clearInterval: () => undefined,
   });
-  return { controller, runtime: fullRuntime, rendered, intervals, beforeInstall };
+  return {
+    controller,
+    runtime: fullRuntime,
+    rendered,
+    intervals,
+    beforeInstall,
+    wake: (reason: WakeReason) => wake?.(reason),
+  };
 }
 
 describe("mandatory update controller", () => {
@@ -48,6 +66,43 @@ describe("mandatory update controller", () => {
     expect(UPDATE_CHECK_INTERVAL_MS).toBe(30 * 60 * 1000);
     intervals[0].callback();
     await vi.waitFor(() => expect(runtime.check).toHaveBeenCalledTimes(2));
+  });
+
+  it("checks again on resume, unlock and focus, at most once every 5 minutes", async () => {
+    let clock = 1_000_000;
+    const { controller, runtime, wake } = harness({}, { now: () => clock });
+    controller.start();
+    await vi.waitFor(() => expect(runtime.check).toHaveBeenCalledTimes(1));
+    wake("focus");
+    await Promise.resolve();
+    expect(runtime.check).toHaveBeenCalledTimes(1);
+    clock += WAKE_CHECK_MIN_INTERVAL_MS - 1;
+    wake("unlock-screen");
+    await Promise.resolve();
+    expect(runtime.check).toHaveBeenCalledTimes(1);
+    clock += 1;
+    wake("resume");
+    await vi.waitFor(() => expect(runtime.check).toHaveBeenCalledTimes(2));
+    wake("focus");
+    await Promise.resolve();
+    expect(runtime.check).toHaveBeenCalledTimes(2);
+    expect(WAKE_CHECK_MIN_INTERVAL_MS).toBe(5 * 60 * 1000);
+  });
+
+  it("a wake check finds a release published while the machine slept", async () => {
+    let clock = 0;
+    const check = vi
+      .fn<MandatoryUpdateRuntime["check"]>()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ version: "1.0.1" });
+    const { controller, wake } = harness({ check }, { now: () => clock });
+    controller.start();
+    await vi.waitFor(() => expect(check).toHaveBeenCalledTimes(1));
+    clock += 40 * 60 * 1000;
+    wake("resume");
+    await vi.waitFor(() =>
+      expect(controller.getState()).toEqual({ phase: "ready", version: "1.0.1" }),
+    );
   });
 
   it("stays out of the way when the build is current", async () => {
@@ -177,6 +232,7 @@ describe("mandatory update controller", () => {
     await controller.install();
     expect(beforeInstall).toHaveBeenCalledTimes(1);
     expect(runtime.install).toHaveBeenCalledTimes(1);
+    expect(runtime.install).toHaveBeenCalledWith("1.0.1");
     expect(controller.getState()).toEqual({ phase: "installing", version: "1.0.1" });
   });
 });
