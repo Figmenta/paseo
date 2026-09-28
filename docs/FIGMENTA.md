@@ -237,13 +237,22 @@ Remind me later, no countdown.
 - Feed: `https://downloads.figmenta.site/orchestra-desktop/updates/` (electron-updater,
   `generic` provider): `latest-mac.yml` + `Orchestra-<v>-<arch>.zip` for macOS, `latest.yml` +
   `Orchestra-Setup-<v>-x64.exe` for Windows (+ `.blockmap`).
-- Check at launch and every 30 minutes. Nothing newer, offline or feed unreachable: nothing
+- Check at launch, every 30 minutes, and on wake — powerMonitor `resume` / `unlock-screen`
+  and window focus — at most once every 5 minutes (a machine that slept through the timer
+  would otherwise stay on the old version). Nothing newer, offline or feed unreachable: nothing
   happens, the app stays usable, the next round tries again.
 - A newer version: download at once behind a screen that covers every window (a
   `WebContentsView` above the page, keyboard to the page blocked), with progress; then one
   button, **«Installa e riavvia»**. A failed download: same screen, **«Riprova»** (it checks
   again, then downloads; if the feed is unreachable at that moment the screen goes away until
   the next round). Before relaunching, the daemon this app launched is stopped.
+- Windows relaunch: the NSIS installer's own relaunch (`--force-run`, ExecShellAsUser on its
+  shortcut) did not bring Orchestra back (real PC and CI, 2026-09-28). Right before
+  installing, Orchestra starts a hidden detached PowerShell helper
+  (`src/figmenta/windows-relaunch.ts`) that waits for Orchestra to exit, for the installer to
+  finish and for the installed exe to report the new version, then starts that exe —
+  unless one is already running; 180 s deadline. The installer then runs without
+  `--force-run`; if the helper cannot start, the installer's relaunch is kept.
 - Never a downgrade: an announced version must be strictly newer than the running one,
   checked twice (state machine and runtime). electron-updater's `channel` setter is never
   used — assigning it turns `allowDowngrade` back on.

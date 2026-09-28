@@ -31,8 +31,12 @@ export class ElectronUpdaterRuntime implements MandatoryUpdateRuntime {
       currentVersion: string;
       logger: MandatoryUpdaterClient["logger"];
       onError: (message: string) => void;
+      /** Starts Orchestra's own relauncher (Windows) for `version`; true when it is
+       * running, and the installer is then told NOT to relaunch (no double start). */
+      prepareRelaunch?: (version: string) => boolean;
     },
   ) {
+    this.prepareRelaunch = options.prepareRelaunch ?? null;
     this.currentVersion = options.currentVersion;
     updater.logger = options.logger;
     updater.autoDownload = false;
@@ -57,6 +61,7 @@ export class ElectronUpdaterRuntime implements MandatoryUpdateRuntime {
   }
 
   private readonly currentVersion: string;
+  private readonly prepareRelaunch: ((version: string) => boolean) | null;
 
   async check(): Promise<{ version: string } | null> {
     const result = await this.updater.checkForUpdates();
@@ -77,9 +82,16 @@ export class ElectronUpdaterRuntime implements MandatoryUpdateRuntime {
     }
   }
 
-  install(): void {
-    // Silent on Windows (the NSIS wizard would ask again what the user already chose),
-    // and always relaunch. macOS ignores both flags.
-    this.updater.quitAndInstall(true, true);
+  install(version: string): void {
+    // Silent on Windows (the NSIS wizard would ask again what the user already chose).
+    // Relaunch: by Orchestra's own helper when it started, else by the installer
+    // (--force-run). macOS ignores both flags and relaunches through Squirrel.
+    let helperStarted = false;
+    try {
+      helperStarted = this.prepareRelaunch?.(version) ?? false;
+    } catch {
+      helperStarted = false;
+    }
+    this.updater.quitAndInstall(true, !helperStarted);
   }
 }

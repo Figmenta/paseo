@@ -15,6 +15,11 @@ import { compareVersions } from "./semver.js";
 
 export const DEFAULT_UPDATE_FEED_URL = "https://downloads.figmenta.site/orchestra-desktop/updates/";
 export const UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
+/** Extra checks on wake (resume, unlock, window focus): at most one every 5 minutes. */
+export const WAKE_CHECK_MIN_INTERVAL_MS = 5 * 60 * 1000;
+
+/** Moments when a machine that was asleep or away is used again. */
+export type WakeReason = "resume" | "unlock-screen" | "focus";
 
 /** Env override for the feed, honoured ONLY for a loopback host (end-to-end tests). */
 export const UPDATE_FEED_OVERRIDE_ENV = "ORCHESTRA_UPDATE_FEED_URL";
@@ -39,8 +44,8 @@ export interface MandatoryUpdateRuntime {
   check(): Promise<{ version: string } | null>;
   /** Downloads (and on macOS stages) the version the last check announced. */
   download(onProgress: (percent: number) => void): Promise<void>;
-  /** Quits and relaunches on the new version. */
-  install(): void;
+  /** Quits and relaunches on `version`, the one just downloaded. */
+  install(version: string): void;
 }
 
 export interface MandatoryUpdateView {
@@ -57,6 +62,12 @@ export interface MandatoryUpdateDeps {
   /** Runs before install(): stop the daemon this app launched, like upstream does. */
   beforeInstall?: () => Promise<void>;
   setInterval: (callback: () => void, ms: number) => unknown;
+  /** Clock for the wake-check throttle. */
+  now?: () => number;
+  /** Subscribes to wake events (powerMonitor resume/unlock-screen, window focus). A
+   * machine that slept through the 30-minute timer would otherwise stay on an old version
+   * until the next tick; each event checks again, throttled. */
+  subscribeWake?: (onWake: (reason: WakeReason) => void) => void;
   clearInterval: (handle: unknown) => void;
   intervalMs?: number;
 }
@@ -65,6 +76,7 @@ export interface MandatoryUpdateController {
   start(): void;
   stop(): void;
   checkNow(): Promise<void>;
+  onWake(reason: WakeReason): Promise<void>;
   retry(): Promise<void>;
   install(): Promise<void>;
   getState(): MandatoryUpdateState;
@@ -80,6 +92,8 @@ export function createMandatoryUpdateController(
   let state: MandatoryUpdateState = { phase: "idle" };
   let checking = false;
   let timer: unknown = null;
+  let lastCheckAt: number | null = null;
+  const now = deps.now ?? (() => Date.now());
 
   function failed(version: string | null, error: unknown): MandatoryUpdateState {
     return {
@@ -129,6 +143,7 @@ export function createMandatoryUpdateController(
     // a periodic round never reopens it, and never runs two checks at once.
     if (checking || state.phase !== "idle") return;
     checking = true;
+    lastCheckAt = now();
     let found: { version: string } | null;
     try {
       found = newerThanCurrent(await deps.runtime.check());
@@ -183,16 +198,25 @@ export function createMandatoryUpdateController(
     }
     deps.log("quit and install", { version });
     try {
-      deps.runtime.install();
+      deps.runtime.install(version);
     } catch (error) {
       deps.log("install failed", { version, error: errorMessage(error) });
       setState(failed(version, error));
     }
   }
 
+  async function onWake(reason: WakeReason): Promise<void> {
+    if (lastCheckAt !== null && now() - lastCheckAt < WAKE_CHECK_MIN_INTERVAL_MS) return;
+    deps.log("wake check", { reason });
+    await checkNow();
+  }
+
   return {
     start() {
       if (timer !== null) return;
+      deps.subscribeWake?.((reason) => {
+        void onWake(reason);
+      });
       void checkNow();
       timer = deps.setInterval(() => {
         void checkNow();
@@ -204,6 +228,7 @@ export function createMandatoryUpdateController(
       timer = null;
     },
     checkNow,
+    onWake,
     retry,
     install,
     getState: () => state,
