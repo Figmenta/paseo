@@ -1,8 +1,8 @@
 # Figmenta fork: end-to-end test of Orchestra Desktop's mandatory updater on a real
-# Windows machine. Installs the PUBLISHED 1.0.0 installer (checked against the published
-# feed), builds a 1.0.1 from this commit (version bump only), serves it from a loopback
-# feed and drives the installed app through CDP: overlay, "Installa e riavvia", silent
-# install, relaunch on 1.0.1; plus a negative case (feed announcing 0.9.0 = no overlay).
+# Windows machine. Builds this commit as released (X) and the same code bumped to X+1,
+# installs X, announces X+1 on a loopback feed and drives the installed app through CDP:
+# overlay, "Installa e riavvia", silent install, and Orchestra's own relaunch on X+1
+# within 60 s; plus a negative case (feed announcing 0.9.0 = no overlay).
 # Nothing is published, no secret is used. Trigger: tag `figmenta-e2e-win-*` (not
 # `figmenta-win-*`, which also starts the installer workflow).
 name: Figmenta Windows updater e2e
@@ -20,8 +20,6 @@ jobs:
   updater-e2e:
     runs-on: windows-latest
     timeout-minutes: 90
-    env:
-      FEED: https://downloads.figmenta.site/orchestra-desktop/updates/
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,39 +39,30 @@ jobs:
           cache: "npm"
           cache-dependency-path: package-lock.json
 
-      - name: Download the published 1.0.0 installer and check it against the published feed
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$E2E_WORK" "$E2E_OUT"
-          curl -fsSL "${FEED}latest.yml" -o "$E2E_WORK/published-latest.yml"
-          cat "$E2E_WORK/published-latest.yml"
-          url=$(sed -n 's/^path: //p' "$E2E_WORK/published-latest.yml")
-          want=$(sed -n 's/^sha512: //p' "$E2E_WORK/published-latest.yml")
-          version=$(sed -n 's/^version: //p' "$E2E_WORK/published-latest.yml")
-          [ "$version" = "1.0.0" ] || { echo "::error::published feed is at $version, this test expects 1.0.0"; exit 1; }
-          curl -fsSL "${FEED}${url}" -o "$E2E_WORK/installer-1.0.0.exe"
-          got=$(node -e "const c=require('crypto');console.log(c.createHash('sha512').update(require('fs').readFileSync(process.argv[1])).digest('base64'))" "$E2E_WORK/installer-1.0.0.exe")
-          echo "published sha512: $want"
-          echo "downloaded sha512: $got"
-          [ "$got" = "$want" ] || { echo "::error::sha512 mismatch"; exit 1; }
-          cp "$E2E_WORK/published-latest.yml" "$E2E_OUT/published-latest.yml"
-
       - name: Install JS dependencies
         run: node scripts/npm-retry.mjs ci
 
-      - name: Build 1.0.1 from this commit (version bump only)
+      - name: Build the version under test (this commit) and a newer one to announce
         shell: bash
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
           set -euo pipefail
-          node -e "const f='packages/desktop/package.json';const fs=require('fs');const p=JSON.parse(fs.readFileSync(f,'utf8'));p.version='1.0.1';fs.writeFileSync(f,JSON.stringify(p,null,2)+'\n')"
+          mkdir -p "$E2E_WORK/feed-new" "$E2E_WORK/feed-old" "$E2E_OUT"
+          from=$(node -p "require('./packages/desktop/package.json').version")
+          to=$(node -p "const [a,b,c]=process.argv[1].split('.').map(Number);[a,b,c+1].join('.')" "$from")
+          echo "E2E_FROM=$from" >> "$GITHUB_ENV"
+          echo "E2E_TO=$to" >> "$GITHUB_ENV"
+          # 1. the version that updates itself: this commit, as released
           npm run build:desktop -- --publish never --win nsis --x64
-          mkdir -p "$E2E_WORK/feed-new" "$E2E_WORK/feed-old"
-          cp packages/desktop/release/latest.yml packages/desktop/release/*.exe packages/desktop/release/*.exe.blockmap "$E2E_WORK/feed-new/"
+          cp "packages/desktop/release/Orchestra-Setup-$from-x64.exe" "$E2E_WORK/installer.exe"
+          cp packages/desktop/release/latest.yml "$E2E_OUT/installed-$from-latest.yml"
+          # 2. the version it updates to: same code, version bump only (packaging only)
+          node -e "const f='packages/desktop/package.json';const fs=require('fs');const p=JSON.parse(fs.readFileSync(f,'utf8'));p.version=process.argv[1];fs.writeFileSync(f,JSON.stringify(p,null,2)+'\n')" "$to"
+          (cd packages/desktop && npm run build:main && npx electron-builder --config electron-builder.yml --publish never --win nsis --x64)
+          cp packages/desktop/release/latest.yml "packages/desktop/release/Orchestra-Setup-$to-x64.exe" "packages/desktop/release/Orchestra-Setup-$to-x64.exe.blockmap" "$E2E_WORK/feed-new/"
           cat "$E2E_WORK/feed-new/latest.yml"
-          cp "$E2E_WORK/feed-new/latest.yml" "$E2E_OUT/built-1.0.1-latest.yml"
+          cp "$E2E_WORK/feed-new/latest.yml" "$E2E_OUT/announced-$to-latest.yml"
           cat > "$E2E_WORK/feed-old/latest.yml" <<'EOF'
           version: 0.9.0
           files:
@@ -85,7 +74,7 @@ jobs:
           releaseDate: '2026-01-01T00:00:00.000Z'
           EOF
 
-      - name: Run the updater e2e (installed 1.0.0 -> 1.0.1)
+      - name: Run the updater e2e (installed version -> announced version)
         run: node .github/figmenta-win-e2e/e2e.mjs
 
       - name: Upload screenshots and logs

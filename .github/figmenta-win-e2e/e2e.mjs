@@ -3,12 +3,15 @@
 // DevTools Protocol (--remote-debugging-port via PASEO_ELECTRON_FLAGS).
 //
 //   node e2e.mjs
-// env: E2E_WORK (dir with installer-1.0.0.exe, feed-new/, feed-old/), E2E_OUT (artifacts)
+// env: E2E_WORK (dir with installer.exe, feed-new/, feed-old/), E2E_OUT (artifacts),
+//      E2E_FROM (installed version, e.g. 1.0.2), E2E_TO (announced version, e.g. 1.0.3)
 //
 // Cases:
 //   negative  feed announces 0.9.0            -> no overlay, page usable
-//   positive  feed announces 1.0.1 (built)    -> overlay covers the window, "ready",
-//             click "Installa e riavvia" -> silent install -> relaunch on 1.0.1
+//   positive  feed announces E2E_TO           -> overlay covers the window, "ready",
+//             click "Installa e riavvia" -> silent install -> Orchestra's own relaunch
+//             helper starts E2E_TO within 60 s (the test does not help it: no user-level
+//             env, nothing launched by the test until the verdict is taken)
 import { execFileSync, spawn } from "node:child_process";
 import {
   createReadStream,
@@ -26,6 +29,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const WORK = process.env.E2E_WORK;
+const FROM = process.env.E2E_FROM;
+const TO = process.env.E2E_TO;
+const RELAUNCH_BUDGET_MS = 60_000;
 const OUT = process.env.E2E_OUT;
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 18765;
@@ -199,16 +205,6 @@ function appEnv(feedPath) {
     PASEO_ELECTRON_FLAGS: `--remote-debugging-port=${CDP}`,
   };
 }
-// The NSIS installer relaunches the app through the shell (explorer), not as our child:
-// our process env does not reach it. The same variables are therefore also set at USER
-// level (registry + WM_SETTINGCHANGE broadcast), which explorer passes to what it starts.
-// The runner VM is thrown away after the job.
-function setUserEnv(vars) {
-  const script = Object.entries(vars)
-    .map(([name, value]) => `[Environment]::SetEnvironmentVariable('${name}', '${value}', 'User')`)
-    .join("; ");
-  execFileSync("powershell", ["-NoProfile", "-Command", script], { stdio: "inherit" });
-}
 function processes() {
   try {
     return execFileSync(
@@ -258,12 +254,12 @@ async function closeApp() {
 // ---------------------------------------------------------------- run
 let exitCode = 0;
 try {
-  execFileSync(path.join(WORK, "installer-1.0.0.exe"), ["/S"], { stdio: "inherit" });
+  execFileSync(path.join(WORK, "installer.exe"), ["/S"], { stdio: "inherit" });
   const exe = await waitFor("installed Orchestra.exe", async () => findInstalledExe(), 60_000);
   const installedVersion = fileVersion(exe);
   record(
-    "install 1.0.0 silently (/S)",
-    installedVersion.startsWith("1.0.0"),
+    `install ${FROM} silently (/S)`,
+    installedVersion.startsWith(FROM),
     `${exe} ProductVersion=${installedVersion}`,
   );
 
@@ -290,8 +286,7 @@ try {
   );
   await closeApp();
 
-  // Positive: feed announcing 1.0.1.
-  setUserEnv(appEnv("/updates/"));
+  // Positive: feed announcing TO.
   launch(exe, "/updates/");
   const page1 = await waitFor("Orchestra page (positive)", pageTarget, 120_000);
   const overlay = await waitFor("update overlay", overlayTarget, 180_000);
@@ -329,72 +324,73 @@ try {
   );
 
   const logBefore = logText().length;
+  const clickedAt = Date.now();
   await evaluate(overlay, "document.getElementById('install').click(), true");
   record("click 'Installa e riavvia'", true, "clicked");
-  await waitFor("old app to go away", async () => (await pageTarget()) === null, 120_000, 500);
-  // Relaunch by the installer: poll the version the app reports over CDP, and keep evidence
-  // (processes, exe version, desktop) while waiting.
+  await waitFor("old app to go away", async () => (await pageTarget()) === null, 120_000, 250);
+  const goneAfterMs = Date.now() - clickedAt;
+  // Orchestra's helper must bring TO back on its own: poll CDP, record processes.
   let page2 = null;
-  const relaunchDeadline = Date.now() + 300_000;
+  let relaunchedAfterMs = null;
   let tick = 0;
-  while (Date.now() < relaunchDeadline && !page2) {
+  while (Date.now() - clickedAt < 180_000 && !page2) {
     const target = await pageTarget();
     if (target) {
       const version = await evaluate(
         target,
         "window.orchestraDesktop && window.orchestraDesktop.version",
       ).catch(() => null);
-      if (version === "1.0.1") page2 = target;
+      if (version === TO) {
+        page2 = target;
+        relaunchedAfterMs = Date.now() - clickedAt;
+      }
     }
-    if (!page2 && tick % 30 === 0) {
+    if (!page2 && tick % 20 === 0) {
       appendFileSync(
         path.join(OUT, "relaunch-watch.log"),
-        `--- t+${tick}s exe=${fileVersion(exe)}\n${processes()}\n`,
+        `--- t+${Math.round((Date.now() - clickedAt) / 1000)}s exe=${fileVersion(exe)}\n${processes()}\n`,
       );
-      if (tick % 60 === 0) desktopShot(`03-waiting-relaunch-t${tick}s-desktop.png`);
     }
-    if (!page2) await sleep(1000);
+    if (!page2) await sleep(500);
     tick += 1;
   }
   const newFileVersion = fileVersion(exe);
   record(
-    "silent install replaced the exe with 1.0.1",
-    newFileVersion.startsWith("1.0.1"),
-    `exe ProductVersion=${newFileVersion}`,
+    `silent install replaced the exe with ${TO}`,
+    newFileVersion.startsWith(TO),
+    `exe ProductVersion=${newFileVersion}; old app gone ${goneAfterMs} ms after the click`,
   );
   const logAfter = logText().slice(logBefore);
-  const logSaysNew = /currentVersion: '1\.0\.1'/.test(logAfter);
+  const helperLogged = /relaunch helper started/.test(logText());
   if (page2) {
-    await sleep(5000);
+    const procs = processes();
+    await sleep(3000);
     const pageVersion = await evaluate(page2, "window.orchestraDesktop.version");
     const overlayAfter = await overlayTarget();
-    await shot(page2, "03-after-update-1.0.1-page.png");
-    desktopShot("03-after-update-1.0.1-desktop.png");
+    await shot(page2, `03-relaunched-${TO}-page.png`);
+    desktopShot(`03-relaunched-${TO}-desktop.png`);
+    writeFileSync(path.join(OUT, "processes-after-relaunch.txt"), procs);
     record(
-      "installer relaunched the app on 1.0.1",
-      pageVersion === "1.0.1" && overlayAfter === null,
-      `orchestraDesktop.version=${pageVersion}, log feed line with 1.0.1=${logSaysNew}, overlay after relaunch=${overlayAfter ? "PRESENT" : "none"}`,
+      `relaunched on its own on ${TO} within ${RELAUNCH_BUDGET_MS / 1000} s`,
+      pageVersion === TO && relaunchedAfterMs <= RELAUNCH_BUDGET_MS && overlayAfter === null,
+      `orchestraDesktop.version=${pageVersion} ${relaunchedAfterMs} ms after the click; helper logged=${helperLogged}; overlay after relaunch=${overlayAfter ? "PRESENT" : "none"}`,
+    );
+    const instances = procs
+      .split("\n")
+      .filter((line) => line.toLowerCase().includes(exe.toLowerCase()))
+      .filter((line) => !/--type=|node-entrypoint-runner/.test(line));
+    record(
+      "one Orchestra main process after relaunch (no double start)",
+      instances.length === 1,
+      `${instances.length} main process(es)`,
     );
   } else {
     desktopShot("03-no-relaunch-desktop.png");
     record(
-      "installer relaunched the app on 1.0.1",
+      `relaunched on its own on ${TO} within ${RELAUNCH_BUDGET_MS / 1000} s`,
       false,
-      `no app answering on CDP with 1.0.1 within 300 s; log feed line with 1.0.1=${logSaysNew}; processes: ${processes() || "none"}`,
+      `no app answering on CDP with ${TO} within 180 s; helper logged=${helperLogged}; log tail: ${logAfter.slice(-600).replace(/\n/g, " ")}; processes: ${processes() || "none"}`,
     );
-    if (newFileVersion.startsWith("1.0.1")) {
-      await closeApp();
-      launch(exe, "/updates/");
-      const manual = await waitFor("installed app (launched by the test)", pageTarget, 120_000);
-      const manualVersion = await evaluate(manual, "window.orchestraDesktop.version");
-      await shot(manual, "04-installed-1.0.1-launched-by-test-page.png");
-      desktopShot("04-installed-1.0.1-launched-by-test-desktop.png");
-      record(
-        "installed app, launched by the test, runs 1.0.1",
-        manualVersion === "1.0.1",
-        `orchestraDesktop.version=${manualVersion}`,
-      );
-    }
   }
   await closeApp();
 } catch (error) {
