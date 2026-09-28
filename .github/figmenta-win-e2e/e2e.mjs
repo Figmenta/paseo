@@ -273,10 +273,12 @@ async function updateCase(label, from, to, feedPath) {
   const exe = expectedExe;
   launch(exe, feedPath);
   const page = await waitFor(`${label}: Orchestra page`, pageTarget, 120_000);
-  const fromVersion = await evaluate(
-    page,
-    "window.orchestraDesktop && window.orchestraDesktop.version",
-  );
+  const fromVersion = await waitFor(
+    `${label}: app version from the page`,
+    async () => evaluate(page, "window.orchestraDesktop && window.orchestraDesktop.version"),
+    30_000,
+    500,
+  ).catch(() => "unknown");
   const overlay = await waitFor(`${label}: update overlay`, overlayTarget, 180_000);
   await waitFor(
     `${label}: overlay 'Aggiornamento pronto'`,
