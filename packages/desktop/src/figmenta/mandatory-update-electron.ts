@@ -20,7 +20,11 @@ import {
   type MandatoryUpdateView,
 } from "./mandatory-update.js";
 import { ElectronUpdaterRuntime } from "./mandatory-update-runtime.js";
-import { needsRelaunchHelper, windowsRelaunchCommand } from "./windows-relaunch.js";
+import {
+  needsRelaunchHelper,
+  relaunchHelperEnv,
+  windowsRelaunchCommand,
+} from "./windows-relaunch.js";
 import { updateOverlayPageUrl } from "./update-overlay-page.js";
 
 // Figmenta fork: the Electron side of the mandatory updater (policy in mandatory-update.ts).
@@ -216,9 +220,15 @@ function startWindowsRelaunchHelper(version: string): boolean {
     parentPid: process.pid,
     installerPath,
     targetVersion: version,
+    logPath: path.join(app.getPath("logs"), "relaunch-helper.log"),
   });
   try {
-    const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true });
+    const child = spawn(command, args, {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+      env: relaunchHelperEnv(process.env),
+    });
     child.on("error", (error) => {
       log.error("[orchestra-update] relaunch helper failed", error);
     });
