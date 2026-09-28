@@ -38,18 +38,13 @@ class FakeUpdater {
   }
 }
 
-function runtimeFor(
-  feedVersion: string,
-  currentVersion = "1.0.0",
-  prepareRelaunch?: (version: string) => boolean,
-) {
+function runtimeFor(feedVersion: string, currentVersion = "1.0.0") {
   const fake = new FakeUpdater(feedVersion, currentVersion);
   const runtime = new ElectronUpdaterRuntime(fake as unknown as MandatoryUpdaterClient, {
     feedUrl: "http://127.0.0.1:1/updates/",
     currentVersion,
     logger: null,
     onError: () => undefined,
-    prepareRelaunch,
   });
   return { fake, runtime };
 }
@@ -80,30 +75,9 @@ describe("ElectronUpdaterRuntime", () => {
     await expect(runtime.check()).resolves.toBeNull();
   });
 
-  it("starts Orchestra's relauncher first, then installs WITHOUT the installer's relaunch", () => {
-    const calls: string[] = [];
-    const { fake, runtime } = runtimeFor("1.0.3", "1.0.2", (version) => {
-      calls.push(`helper ${version}`);
-      return true;
-    });
-    fake.quitAndInstall.mockImplementation((silent: boolean, forceRun: boolean) => {
-      calls.push(`quitAndInstall silent=${silent} forceRun=${forceRun}`);
-    });
+  it("installs silently and asks the installer to relaunch Orchestra", () => {
+    const { fake, runtime } = runtimeFor("1.0.3", "1.0.2");
     runtime.install("1.0.3");
-    expect(calls).toEqual(["helper 1.0.3", "quitAndInstall silent=true forceRun=false"]);
-  });
-
-  it("falls back to the installer's relaunch when the helper did not start or threw", () => {
-    const off = runtimeFor("1.0.3", "1.0.2", () => false);
-    off.runtime.install("1.0.3");
-    expect(off.fake.quitAndInstall).toHaveBeenCalledWith(true, true);
-    const broken = runtimeFor("1.0.3", "1.0.2", () => {
-      throw new Error("spawn EACCES");
-    });
-    broken.runtime.install("1.0.3");
-    expect(broken.fake.quitAndInstall).toHaveBeenCalledWith(true, true);
-    const mac = runtimeFor("1.0.3", "1.0.2");
-    mac.runtime.install("1.0.3");
-    expect(mac.fake.quitAndInstall).toHaveBeenCalledWith(true, true);
+    expect(fake.quitAndInstall).toHaveBeenCalledWith(true, true);
   });
 });

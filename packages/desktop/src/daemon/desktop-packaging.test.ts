@@ -188,6 +188,17 @@ describe("desktop packaging", () => {
     }
   });
 
+  // Figmenta fork: the silent update must be able to reopen Orchestra on Windows.
+  it("builds a one-click, per-user NSIS installer that relaunches after a silent update", () => {
+    const config = readFileSync(join(packageRoot, "electron-builder.yml"), "utf8");
+    const nsis = config.slice(config.indexOf("\nnsis:\n"));
+
+    expect(nsis).toMatch(/^ {2}oneClick: true$/m);
+    expect(nsis).toMatch(/^ {2}perMachine: false$/m);
+    expect(nsis).toMatch(/^ {2}runAfterFinish: true$/m);
+    expect(nsis).not.toContain("allowToChangeInstallationDirectory");
+  });
+
   it("registers Orchestra agent links with the operating system", () => {
     const config = readFileSync(join(packageRoot, "electron-builder.yml"), "utf8");
 

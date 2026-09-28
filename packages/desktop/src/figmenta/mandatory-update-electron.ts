@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import path from "node:path";
 import {
   app,
@@ -20,11 +19,6 @@ import {
   type MandatoryUpdateView,
 } from "./mandatory-update.js";
 import { ElectronUpdaterRuntime } from "./mandatory-update-runtime.js";
-import {
-  needsRelaunchHelper,
-  relaunchHelperEnv,
-  windowsRelaunchCommand,
-} from "./windows-relaunch.js";
 import { updateOverlayPageUrl } from "./update-overlay-page.js";
 
 // Figmenta fork: the Electron side of the mandatory updater (policy in mandatory-update.ts).
@@ -207,45 +201,6 @@ class UpdateOverlayView implements MandatoryUpdateView {
   }
 }
 
-/**
- * Windows: start the detached relaunch helper (windows-relaunch.ts) before the installer
- * runs. Returns false — and the installer relaunches as before — if it cannot start.
- */
-function startWindowsRelaunchHelper(version: string): boolean {
-  if (!needsRelaunchHelper(process.platform)) return false;
-  const installerPath =
-    (autoUpdater as unknown as { installerPath?: string | null }).installerPath ?? null;
-  const { command, args } = windowsRelaunchCommand({
-    exePath: process.execPath,
-    parentPid: process.pid,
-    installerPath,
-    targetVersion: version,
-    logPath: path.join(app.getPath("logs"), "relaunch-helper.log"),
-  });
-  try {
-    const child = spawn(command, args, {
-      detached: true,
-      stdio: "ignore",
-      windowsHide: true,
-      env: relaunchHelperEnv(process.env),
-    });
-    child.on("error", (error) => {
-      log.error("[orchestra-update] relaunch helper failed", error);
-    });
-    child.unref();
-    logUpdate("relaunch helper started", {
-      pid: child.pid ?? null,
-      exe: process.execPath,
-      installerPath,
-      version,
-    });
-    return typeof child.pid === "number";
-  } catch (error) {
-    log.error("[orchestra-update] relaunch helper could not start", error);
-    return false;
-  }
-}
-
 function subscribeWakeEvents(onWake: (reason: "resume" | "unlock-screen" | "focus") => void): void {
   powerMonitor.on("resume", () => onWake("resume"));
   powerMonitor.on("unlock-screen", () => onWake("unlock-screen"));
@@ -283,7 +238,6 @@ export function startMandatoryUpdater(options: { beforeInstall: () => Promise<vo
       currentVersion,
       logger: log,
       onError: (message) => logUpdate("updater error event", { error: message }),
-      prepareRelaunch: startWindowsRelaunchHelper,
     }),
     currentVersion,
     failureHint: () => (runsOutsideApplications() ? "location" : "network"),
