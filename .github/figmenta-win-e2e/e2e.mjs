@@ -7,7 +7,7 @@
 //      E2E_OUT   artifacts dir
 //      E2E_PUBLISHED, E2E_NEW, E2E_NEXT  the three versions
 //
-// Case A, migration: published assisted install -> "Installa e riavvia" -> NEW one-click
+// Case A, migration: published assisted install -> "Install and restart" -> NEW one-click
 //   installed in the same folder, ONE Uninstall entry, Orchestra NEW back on its own <= 60 s.
 // Case B, steady state: NEW (one-click) -> NEXT, same checks. Main acceptance.
 //
@@ -264,9 +264,12 @@ async function closeApp() {
   await sleep(3000);
 }
 
+const OVERLAY_READY_TITLES = new Set(["Update ready", "Aggiornamento pronto"]);
+const OVERLAY_FAILED_TITLES = new Set(["Update failed", "Aggiornamento non riuscito"]);
+
 /**
  * One update: installed `from` is launched against `feedPath` (announcing `to`), the
- * overlay reaches "pronto", the test clicks "Installa e riavvia", then watches for the
+ * overlay reaches "ready", the test clicks the install button, then watches for the
  * installer's own relaunch of `to` — process list + main.log, never helped by the test.
  */
 async function updateCase(label, from, to, feedPath) {
@@ -281,13 +284,14 @@ async function updateCase(label, from, to, feedPath) {
   ).catch(() => "unknown");
   const overlay = await waitFor(`${label}: update overlay`, overlayTarget, 180_000);
   await waitFor(
-    `${label}: overlay 'Aggiornamento pronto'`,
+    `${label}: overlay 'Update ready'`,
     async () => {
+      // The overlay is drawn by the RUNNING version: Italian up to 1.0.4, English from 1.0.5.
       const title = await evaluate(overlay, "document.getElementById('title').textContent");
-      if (title === "Aggiornamento non riuscito") {
+      if (OVERLAY_FAILED_TITLES.has(title)) {
         throw new Error(await evaluate(overlay, "document.getElementById('error').textContent"));
       }
-      return title === "Aggiornamento pronto";
+      return OVERLAY_READY_TITLES.has(title);
     },
     600_000,
     500,
