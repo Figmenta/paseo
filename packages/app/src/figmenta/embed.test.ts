@@ -1,14 +1,17 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  DEFAULT_COMPOSER_LOCK_LABEL,
   installEmbedBridge,
   lastAgentRoute,
+  readEmbedComposerLock,
   readEmbedTheme,
   reduceComposerInsert,
   rememberAgentRoute,
   resetEmbedModeCache,
   shouldBlockEmbedRoute,
   subscribeToEmbedComposerInsert,
+  subscribeToEmbedComposerLock,
 } from "./embed";
 
 function setLocation(search: string): void {
@@ -134,6 +137,128 @@ describe("maestro.composer.insert routing", () => {
 
     expect(first).toEqual([]);
     expect(second).toEqual([]);
+  });
+});
+
+describe("maestro.composer.lock routing", () => {
+  const unsubscribes: Array<() => void> = [];
+
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    setLocation("?embed=1");
+    resetEmbedModeCache();
+    installEmbedBridge();
+    while (unsubscribes.length) unsubscribes.pop()?.();
+  });
+
+  function post(data: unknown, origin = window.location.origin): void {
+    window.dispatchEvent(new MessageEvent("message", { data, origin }));
+  }
+
+  it("locks the agent it names and no other", () => {
+    post({ type: "maestro.composer.lock", agentId: "a1", locked: true, label: "Not available" });
+
+    expect(readEmbedComposerLock("a1")).toBe("Not available");
+    expect(readEmbedComposerLock("a2")).toBeNull();
+  });
+
+  it("unlocks with locked:false, leaving the other agents locked", () => {
+    post({ type: "maestro.composer.lock", agentId: "a1", locked: true, label: "Session expired" });
+    post({ type: "maestro.composer.lock", agentId: "a2", locked: true, label: "Not available" });
+
+    post({ type: "maestro.composer.lock", agentId: "a1", locked: false });
+
+    expect(readEmbedComposerLock("a1")).toBeNull();
+    expect(readEmbedComposerLock("a2")).toBe("Not available");
+  });
+
+  it("falls back to «Session expired» when the label is null, absent or blank", () => {
+    post({ type: "maestro.composer.lock", agentId: "a1", locked: true, label: null });
+    post({ type: "maestro.composer.lock", agentId: "a2", locked: true });
+    post({ type: "maestro.composer.lock", agentId: "a3", locked: true, label: "  " });
+
+    expect(DEFAULT_COMPOSER_LOCK_LABEL).toBe("Session expired");
+    expect(readEmbedComposerLock("a1")).toBe("Session expired");
+    expect(readEmbedComposerLock("a2")).toBe("Session expired");
+    expect(readEmbedComposerLock("a3")).toBe("Session expired");
+  });
+
+  it("takes the latest label for an agent already locked", () => {
+    post({ type: "maestro.composer.lock", agentId: "a1", locked: true, label: "Session expired" });
+    post({
+      type: "maestro.composer.lock",
+      agentId: "a1",
+      locked: true,
+      label: "Resumed in another tab",
+    });
+
+    expect(readEmbedComposerLock("a1")).toBe("Resumed in another tab");
+  });
+
+  it("ignores a lock without a usable agentId", () => {
+    const notified: number[] = [];
+    unsubscribes.push(subscribeToEmbedComposerLock(() => notified.push(1)));
+
+    post({ type: "maestro.composer.lock", locked: true, label: "x" });
+    post({ type: "maestro.composer.lock", agentId: "", locked: true, label: "x" });
+    post({ type: "maestro.composer.lock", agentId: 7, locked: true, label: "x" });
+
+    expect(readEmbedComposerLock("")).toBeNull();
+    expect(readEmbedComposerLock("7")).toBeNull();
+    expect(notified).toEqual([]);
+  });
+
+  it("ignores a lock whose locked flag is not a boolean, either way", () => {
+    post({ type: "maestro.composer.lock", agentId: "a1", locked: true, label: "Session expired" });
+
+    // Neither unlocks a1 ...
+    post({ type: "maestro.composer.lock", agentId: "a1", label: "x" });
+    post({ type: "maestro.composer.lock", agentId: "a1", locked: "false", label: "x" });
+    post({ type: "maestro.composer.lock", agentId: "a1", locked: 0, label: "x" });
+    // ... nor locks a2.
+    post({ type: "maestro.composer.lock", agentId: "a2", locked: "true", label: "x" });
+
+    expect(readEmbedComposerLock("a1")).toBe("Session expired");
+    expect(readEmbedComposerLock("a2")).toBeNull();
+  });
+
+  it("ignores a lock from another origin", () => {
+    post(
+      { type: "maestro.composer.lock", agentId: "a1", locked: true, label: "x" },
+      "https://elsewhere.example",
+    );
+
+    expect(readEmbedComposerLock("a1")).toBeNull();
+  });
+
+  it("notifies subscribers on lock and unlock, not on a repeat", () => {
+    const notified: Array<string | null> = [];
+    unsubscribes.push(
+      subscribeToEmbedComposerLock(() => notified.push(readEmbedComposerLock("a1"))),
+    );
+
+    post({ type: "maestro.composer.lock", agentId: "a1", locked: true, label: "Session expired" });
+    post({ type: "maestro.composer.lock", agentId: "a1", locked: true, label: "Session expired" });
+    post({ type: "maestro.composer.lock", agentId: "a1", locked: false });
+    post({ type: "maestro.composer.lock", agentId: "a1", locked: false });
+
+    expect(notified).toEqual(["Session expired", null]);
+  });
+
+  it("drops a composer insert for a locked agent, and delivers again once unlocked", () => {
+    const applied: string[] = [];
+    unsubscribes.push(
+      subscribeToEmbedComposerInsert((insert) => {
+        if (insert.agentId === "a1") applied.push(insert.text);
+      }),
+    );
+
+    post({ type: "maestro.composer.lock", agentId: "a1", locked: true });
+    post({ type: "maestro.composer.insert", text: "/maestro", agentId: "a1" });
+    post({ type: "maestro.composer.lock", agentId: "a1", locked: false });
+    post({ type: "maestro.composer.insert", text: "/again", agentId: "a1" });
+
+    expect(applied).toEqual(["/again"]);
   });
 });
 

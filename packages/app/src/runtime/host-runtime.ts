@@ -79,6 +79,7 @@ import {
 import { projectIconCache } from "@/projects/icon-cache";
 import { nativePerformanceTrace } from "@/performance/native-trace";
 import { revokePushNotifications } from "@/push-notifications";
+import { readEmbedComposerLock, subscribeToEmbedComposerLock } from "@/figmenta/embed";
 import { createAppWebSocketFactory } from "./websocket-factory";
 
 export type HostRuntimeConnectionStatus = "idle" | "connecting" | "online" | "offline" | "error";
@@ -1407,6 +1408,11 @@ export class HostRuntimeStore {
     this.storage = input?.storage ?? AsyncStorage;
     this.replicaCache = new ReplicaCache(input?.replicaRowStore ?? createReplicaRowStore());
     this.revokePushNotifications = input?.revokePushNotifications ?? revokePushNotifications;
+    // Figmenta embed (docs/FIGMENTA.md): a queue held back by a composer lock leaves
+    // when the lock falls. Outside the embed no lock ever arrives and this never fires.
+    subscribeToEmbedComposerLock((agentId) =>
+      this.drainQueuedAgentMessageAfterEmbedUnlock(agentId),
+    );
   }
 
   // --- Host registry ---
@@ -2167,6 +2173,8 @@ export class HostRuntimeStore {
   }
 
   drainQueuedAgentMessage(serverId: string, agentId: string): void {
+    // Figmenta embed: a locked composer sends nothing, its queue included. The row stays.
+    if (readEmbedComposerLock(agentId) !== null) return;
     const drainKey = `${serverId}:${agentId}`;
     if (this.queuedAgentDrainInFlight.has(drainKey)) return;
     const store = useSessionStore.getState();
@@ -2215,6 +2223,17 @@ export class HostRuntimeStore {
       .finally(() => {
         this.queuedAgentDrainInFlight.delete(drainKey);
       });
+  }
+
+  // Called on every lock change; the drain itself refuses while the lock holds. After an
+  // unlock, the turn end that should have drained the queue may be past: drain on every
+  // host this store runs where the agent sits idle. A running agent drains at turn end.
+  private drainQueuedAgentMessageAfterEmbedUnlock(agentId: string): void {
+    for (const serverId of this.directorySyncByServer.keys()) {
+      const session = useSessionStore.getState().sessions[serverId];
+      const agent = session?.agents.get(agentId) ?? session?.agentDetails.get(agentId);
+      if (agent?.turn.phase === "idle") this.drainQueuedAgentMessage(serverId, agentId);
+    }
   }
 
   applyAgentTurnLiveness(

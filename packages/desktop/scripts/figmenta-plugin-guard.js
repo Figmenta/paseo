@@ -38,6 +38,31 @@ function parseSource(text) {
   return out;
 }
 
+// The synced package.json: present, parseable, at the expected version, with every required file.
+function checkPackage(pluginDir, expected, errors) {
+  const pkgText = readText(path.join(pluginDir, "package.json"));
+  if (pkgText === null) {
+    errors.push(
+      "packages/desktop/figmenta-plugin/package.json is missing: the plugin was not synced",
+    );
+    return null;
+  }
+  let version = null;
+  try {
+    version = JSON.parse(pkgText).version ?? null;
+  } catch (error) {
+    errors.push(`figmenta-plugin/package.json does not parse: ${error.message}`);
+  }
+  if (expected && version !== expected) {
+    errors.push(`figmenta-plugin is ${version ?? "unversioned"}, this app expects ${expected}`);
+  }
+  for (const file of REQUIRED_FILES) {
+    if (!fs.existsSync(path.join(pluginDir, file)))
+      errors.push(`figmenta-plugin/${file} is missing`);
+  }
+  return version;
+}
+
 function checkFigmentaPlugin(desktopDir = DESKTOP_DIR) {
   const pluginDir = path.join(desktopDir, "figmenta-plugin");
   const errors = [];
@@ -48,35 +73,23 @@ function checkFigmentaPlugin(desktopDir = DESKTOP_DIR) {
     errors.push("packages/desktop/figmenta-plugin.version is missing or empty");
   }
 
-  const pkgText = readText(path.join(pluginDir, "package.json"));
-  let version = null;
-  if (pkgText === null) {
-    errors.push("packages/desktop/figmenta-plugin/package.json is missing: the plugin was not synced");
-  } else {
-    try {
-      version = JSON.parse(pkgText).version ?? null;
-    } catch (error) {
-      errors.push(`figmenta-plugin/package.json does not parse: ${error.message}`);
-    }
-    if (expected && version !== expected) {
-      errors.push(`figmenta-plugin is ${version ?? "unversioned"}, this app expects ${expected}`);
-    }
-    for (const file of REQUIRED_FILES) {
-      if (!fs.existsSync(path.join(pluginDir, file))) errors.push(`figmenta-plugin/${file} is missing`);
-    }
-  }
+  const version = checkPackage(pluginDir, expected, errors);
 
   const sourceText = readText(path.join(pluginDir, ".source"));
   const source = sourceText === null ? {} : parseSource(sourceText);
   if (sourceText !== null && expected && source.version !== expected) {
-    errors.push(`figmenta-plugin/.source records ${source.version ?? "no version"}, expected ${expected}`);
+    errors.push(
+      `figmenta-plugin/.source records ${source.version ?? "no version"}, expected ${expected}`,
+    );
   }
 
   // The version the plugin announces over the bridge must match package.json.
   const versionTs = readText(path.join(pluginDir, "shared", "version.ts"));
   const announced = versionTs && /PLUGIN_VERSION\s*=\s*["']([^"']+)["']/.exec(versionTs);
   if (announced && expected && announced[1] !== expected) {
-    errors.push(`figmenta-plugin/shared/version.ts announces ${announced[1]}, expected ${expected}`);
+    errors.push(
+      `figmenta-plugin/shared/version.ts announces ${announced[1]}, expected ${expected}`,
+    );
   }
 
   return { ok: errors.length === 0, errors, expected, version, source, pluginDir };

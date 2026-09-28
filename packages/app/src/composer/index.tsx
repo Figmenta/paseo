@@ -161,6 +161,12 @@ import {
   resolveWorkspaceFileDrop,
   type WorkspaceFileDragPayload,
 } from "@/attachments/workspace-file-drag";
+import {
+  assertEmbedComposerUnlocked,
+  EmbedComposerLockGate,
+  isEmbedComposerLocked,
+  useEmbedComposerLockGuard,
+} from "@/figmenta/composer-lock";
 
 const composerImageAttachmentPersister: Pick<
   AttachmentPersister,
@@ -1402,6 +1408,9 @@ function ComposerContentImpl({
     agentId,
   });
   const isComposerLocked = resolveIsComposerLocked(submitBehavior, isSubmitLoading);
+  // Figmenta embed: Orchestra can lock this agent's composer (docs/FIGMENTA.md). The
+  // input gives way to a read-only bar; the guards below close the other ways out.
+  const isEmbedLocked = useEmbedComposerLockGuard({ agentId, serverId, voice });
   const keyboardHandlerIdRef = useRef(
     `message-input:${serverId}:${agentId}:${Math.random().toString(36).slice(2)}`,
   );
@@ -1536,6 +1545,7 @@ function ComposerContentImpl({
 
   const submitMessage = useCallback(
     async (text: string, submitAttachments: ComposerAttachment[]) => {
+      assertEmbedComposerUnlocked(agentIdRef.current);
       onMessageSent?.();
       if (onSubmitMessageRef.current) {
         await onSubmitMessageRef.current({ text, attachments: submitAttachments, cwd });
@@ -1712,6 +1722,8 @@ function ComposerContentImpl({
 
   const handleSubmit = useCallback(
     (payload: MessagePayload) => {
+      // Before slash commands and the running-agent queue, which never reach submitMessage.
+      if (isEmbedComposerLocked(agentIdRef.current)) return;
       const outgoingAttachments = buildOutgoingAttachments(attachments);
       const clientSlashCommand = resolveClientSlashCommand({
         text: payload.text,
@@ -1965,6 +1977,7 @@ function ComposerContentImpl({
 
   const handleQueue = useCallback(
     (payload: MessagePayload) => {
+      if (isEmbedComposerLocked(agentIdRef.current)) return;
       const outgoingAttachments = buildOutgoingAttachments(attachments);
       const clientSlashCommand = resolveClientSlashCommand({
         text: payload.text,
@@ -2381,7 +2394,7 @@ function ComposerContentImpl({
       onGenericFiles: handleGenericFilesDropped,
       onWorkspaceFile: handleWorkspaceFileDropped,
     },
-    { disabled: isSubmitLoadingVisible },
+    { disabled: isSubmitLoadingVisible || isEmbedLocked },
   );
 
   const messageInputAutoFocus = autoFocus && isDesktopWebBreakpoint;
@@ -2416,7 +2429,7 @@ function ComposerContentImpl({
         {/* Input area */}
         <View style={inputAreaContainerStyle}>
           <View style={styles.inputAreaContent}>
-            {queueList}
+            {isEmbedLocked ? null : queueList}
             {sendErrorNode}
 
             <View ref={messageInputContainerRef} style={styles.messageInputContainer}>
@@ -2425,7 +2438,7 @@ function ComposerContentImpl({
                 cursor={cursor}
                 inputRef={messageInputRef}
                 anchorRef={messageInputContainerRef}
-                show={mode.showAutocomplete}
+                show={mode.showAutocomplete && !isEmbedLocked}
                 ref={autocompleteRef}
                 configuration={autocompleteConfiguration}
               />
@@ -2436,8 +2449,9 @@ function ComposerContentImpl({
                 onResolvingChange={setIsForgeResolving}
               />
 
-              {/* MessageInput handles everything: text, dictation, attachments, all buttons */}
-              <RenderProfile id="MessageInput">
+              {/* MessageInput handles everything: text, dictation, attachments, all buttons.
+                  A Figmenta embed lock renders a read-only bar in its place. */}
+              <EmbedComposerLockGate agentId={agentId} profileId="MessageInput">
                 <StableMessageInput
                   ref={messageInputRef}
                   value={textSource.getSnapshot()}
@@ -2484,7 +2498,7 @@ function ComposerContentImpl({
                   textReplacement={textReplacement}
                   submitLabel={submitLabel}
                 />
-              </RenderProfile>
+              </EmbedComposerLockGate>
               <Combobox
                 options={githubSearchOptions}
                 value=""

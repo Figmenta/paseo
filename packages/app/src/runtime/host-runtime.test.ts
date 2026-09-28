@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { AppStateStatus } from "react-native";
 import { bindHostRuntimeAppState } from "@/navigation/host-runtime-bootstrap";
 import type {
@@ -16,6 +16,7 @@ import { useSessionStore, type Agent } from "@/stores/session-store";
 import { normalizeAgentSnapshot } from "@/utils/agent-snapshots";
 import { isAgentArchiving, setAgentArchiving } from "@/hooks/use-archive-agent";
 import { queryClient } from "@/data/query-client";
+import { applyEmbedComposerLock, resetEmbedModeCache } from "@/figmenta/embed";
 import {
   HostRuntimeController,
   HostRuntimeStore,
@@ -2904,6 +2905,137 @@ describe("HostRuntimeStore", () => {
         useSessionStore.getState().sessions[host.serverId]?.queuedMessages.get("agent"),
       ).toEqual([]);
     });
+    useSessionStore.getState().clearSession(host.serverId);
+  });
+
+  it("holds the queue at turn end while the Figmenta embed locks the composer, sends it on unlock", async () => {
+    onTestFinished(() => resetEmbedModeCache());
+    const host = makeHost({
+      serverId: "srv_embed_locked_queue",
+      connections: [{ id: "direct:lan:6767", type: "directTcp", endpoint: "lan:6767" }],
+    });
+    const fakeClient = new FakeDaemonClient();
+    fakeClient.setConnectionState({ status: "connected" });
+    const entry = makeFetchAgentsEntry({
+      id: "locked-agent",
+      cwd: "/repo",
+      updatedAt: "2026-07-12T10:00:00.000Z",
+    });
+    fakeClient.fetchAgentsResponses.push(
+      makeFetchAgentsPayload({
+        entries: [{ ...entry, agent: { ...entry.agent, status: "idle" } }],
+      }),
+    );
+    const store = new HostRuntimeStore({
+      deps: {
+        createClient: () => fakeClient as unknown as DaemonClient,
+        connectToDaemon: async () => ({
+          client: fakeClient as unknown as DaemonClient,
+          serverId: host.serverId,
+          hostname: null,
+        }),
+        getClientId: async () => "cid_embed_locked_queue",
+      },
+    });
+    const sessionStore = useSessionStore.getState();
+    sessionStore.initializeSession(host.serverId, fakeClient as unknown as DaemonClient, 1);
+    sessionStore.setAgents(
+      host.serverId,
+      new Map([
+        [
+          "locked-agent",
+          {
+            ...replicaAgent(entry.agent, host.serverId),
+            turn: { phase: "open", turnId: null, startedAt: null, cancellationRequestId: null },
+          },
+        ],
+      ]),
+    );
+    const queued = { id: "held", text: "wait for the unlock", attachments: [] };
+    sessionStore.setQueuedMessages(host.serverId, new Map([["locked-agent", [queued]]]));
+    applyEmbedComposerLock({ agentId: "locked-agent", locked: true, label: "Session expired" });
+    const readQueue = () =>
+      useSessionStore.getState().sessions[host.serverId]?.queuedMessages.get("locked-agent");
+
+    store.syncHosts([host]);
+    await waitForHostOnline(store, host.serverId);
+    await store.refreshAgentDirectory({ serverId: host.serverId, subscribe: {} });
+
+    // The turn ended (open → idle), which drains the queue, but under the lock: the row stays.
+    expect(
+      useSessionStore.getState().sessions[host.serverId]?.agents.get("locked-agent")?.turn.phase,
+    ).toBe("idle");
+    expect(readQueue()).toEqual([queued]);
+    expect(fakeClient.sentAgentMessages).toEqual([]);
+
+    applyEmbedComposerLock({ agentId: "locked-agent", locked: false });
+
+    await vi.waitFor(() => expect(fakeClient.sentAgentMessages).toHaveLength(1));
+    expect(fakeClient.sentAgentMessages.map(([agentId, text]) => [agentId, text])).toEqual([
+      ["locked-agent", "wait for the unlock"],
+    ]);
+    expect(readQueue()).toEqual([]);
+
+    store.syncHosts([]);
+    useSessionStore.getState().clearSession(host.serverId);
+  });
+
+  it("keeps the queue of a still-running agent past the Figmenta embed unlock, until its turn ends", async () => {
+    onTestFinished(() => resetEmbedModeCache());
+    const host = makeHost({
+      serverId: "srv_embed_unlocked_running",
+      connections: [{ id: "direct:lan:6767", type: "directTcp", endpoint: "lan:6767" }],
+    });
+    const fakeClient = new FakeDaemonClient();
+    fakeClient.setConnectionState({ status: "connected" });
+    const entry = makeFetchAgentsEntry({
+      id: "running-agent",
+      cwd: "/repo",
+      updatedAt: "2026-07-12T10:00:00.000Z",
+    });
+    fakeClient.fetchAgentsResponses.push(
+      makeFetchAgentsPayload({
+        entries: [{ ...entry, agent: { ...entry.agent, status: "running" } }],
+      }),
+    );
+    const store = new HostRuntimeStore({
+      deps: {
+        createClient: () => fakeClient as unknown as DaemonClient,
+        connectToDaemon: async () => ({
+          client: fakeClient as unknown as DaemonClient,
+          serverId: host.serverId,
+          hostname: null,
+        }),
+        getClientId: async () => "cid_embed_unlocked_running",
+      },
+    });
+    const sessionStore = useSessionStore.getState();
+    sessionStore.initializeSession(host.serverId, fakeClient as unknown as DaemonClient, 1);
+    const queued = { id: "behind-the-turn", text: "after this turn", attachments: [] };
+    sessionStore.setQueuedMessages(host.serverId, new Map([["running-agent", [queued]]]));
+    applyEmbedComposerLock({ agentId: "running-agent", locked: true, label: null });
+    store.syncHosts([host]);
+    await waitForHostOnline(store, host.serverId);
+    await store.refreshAgentDirectory({ serverId: host.serverId, subscribe: {} });
+
+    applyEmbedComposerLock({ agentId: "running-agent", locked: false });
+
+    expect(
+      useSessionStore.getState().sessions[host.serverId]?.queuedMessages.get("running-agent"),
+    ).toEqual([queued]);
+
+    fakeClient.agentUpdate({
+      kind: "upsert",
+      agent: { ...entry.agent, status: "idle" },
+      project: entry.project,
+    });
+
+    await vi.waitFor(() => expect(fakeClient.sentAgentMessages).toHaveLength(1));
+    expect(fakeClient.sentAgentMessages.map(([agentId, text]) => [agentId, text])).toEqual([
+      ["running-agent", "after this turn"],
+    ]);
+
+    store.syncHosts([]);
     useSessionStore.getState().clearSession(host.serverId);
   });
 

@@ -11,6 +11,7 @@
  *
  * Not part of upstream Paseo: see docs/FIGMENTA.md.
  */
+import { useSyncExternalStore } from "react";
 import { UnistylesRuntime } from "react-native-unistyles";
 import { isWeb } from "@/constants/platform";
 import { THEME_TO_UNISTYLES } from "@/styles/theme";
@@ -57,18 +58,23 @@ export function isEmbedMode(): boolean {
   return cached;
 }
 
-/** Test seam: forget what was read, so the next call re-reads the document. */
+/**
+ * Test seam: forget what was read, so the next call re-reads the document.
+ * Composer locks go too: they are per-document state Orchestra re-sends.
+ */
 export function resetEmbedModeCache(): void {
   cached = null;
   cachedTheme = undefined;
+  composerLocks.clear();
 }
 
 // ---------------------------------------------------------------------------
 // Embed bridge v2 — Orchestra → iframe (docs/FIGMENTA.md, «Embed bridge v2»).
 //
-// Orchestra owns the chrome AND the theme. Two messages come in over
-// postMessage, same-origin only, and nothing goes back out:
+// Orchestra owns the chrome AND the theme. Messages come in over postMessage,
+// same-origin only, and nothing goes back out:
 //   { type: "maestro.composer.insert", text, agentId }  append, that agent only
+//   { type: "maestro.composer.lock", agentId, locked, label }  read-only bar
 //   { type: "maestro.theme", theme }           hot dark/light switch
 // The theme also arrives as `?theme=dark|light` on the first URL, latched like
 // `?embed=1` because the router rewrites the query away.
@@ -225,6 +231,67 @@ function emitComposerInsert(insert: EmbedComposerInsert): void {
   }
 }
 
+/** Shown when Orchestra locks a composer without saying why (`label` null or absent). */
+export const DEFAULT_COMPOSER_LOCK_LABEL = "Session expired";
+
+/** agentId → label of the read-only bar. Absent = the composer is free. */
+const composerLocks = new Map<string, string>();
+const composerLockListeners = new Set<(agentId: string) => void>();
+
+/** The label of the bar that replaces this agent's input, or null when it is not locked. */
+export function readEmbedComposerLock(agentId: string): string | null {
+  return composerLocks.get(agentId) ?? null;
+}
+
+/** Called with the agentId whose lock changed; read its state with `readEmbedComposerLock`. */
+export function subscribeToEmbedComposerLock(listener: (agentId: string) => void): () => void {
+  composerLockListeners.add(listener);
+  return () => {
+    composerLockListeners.delete(listener);
+  };
+}
+
+/** Re-renders the caller when Orchestra locks or unlocks this agent's composer. */
+export function useEmbedComposerLock(agentId: string): string | null {
+  return useSyncExternalStore(
+    subscribeToEmbedComposerLock,
+    () => readEmbedComposerLock(agentId),
+    () => readEmbedComposerLock(agentId),
+  );
+}
+
+function setComposerLock(agentId: string, label: string | null): void {
+  if (composerLocks.get(agentId) === (label ?? undefined)) return;
+  if (label === null) composerLocks.delete(agentId);
+  else composerLocks.set(agentId, label);
+  for (const listener of Array.from(composerLockListeners)) {
+    try {
+      listener(agentId);
+    } catch (error) {
+      console.warn("[Figmenta] composer lock listener failed", error);
+    }
+  }
+}
+
+function resolveComposerLockLabel(label: unknown): string {
+  return typeof label === "string" && label.trim().length > 0 ? label : DEFAULT_COMPOSER_LOCK_LABEL;
+}
+
+/**
+ * The `maestro.composer.lock` case of the bridge, past the origin check. Exported so
+ * the host runtime tests, which run without a window, lock an agent the same way.
+ */
+export function applyEmbedComposerLock(data: {
+  agentId?: unknown;
+  locked?: unknown;
+  label?: unknown;
+}): void {
+  // Same rule as the insert: a lock that names no agent locks nothing.
+  if (typeof data.agentId !== "string" || data.agentId.length === 0) return;
+  if (data.locked === true) setComposerLock(data.agentId, resolveComposerLockLabel(data.label));
+  else if (data.locked === false) setComposerLock(data.agentId, null);
+}
+
 function handleEmbedMessage(event: MessageEvent): void {
   if (event.origin !== window.location.origin) return;
   const data = event.data as {
@@ -232,6 +299,8 @@ function handleEmbedMessage(event: MessageEvent): void {
     text?: unknown;
     theme?: unknown;
     agentId?: unknown;
+    locked?: unknown;
+    label?: unknown;
   } | null;
   if (typeof data?.type !== "string") return;
 
@@ -241,7 +310,14 @@ function handleEmbedMessage(event: MessageEvent): void {
       // No agent named, no delivery: an insert without a target would land in
       // every mounted composer at once.
       if (typeof data.agentId !== "string" || data.agentId.length === 0) return;
+      // A locked composer has no input to land in: the text would sit unseen
+      // in the draft and resurface on unlock.
+      if (composerLocks.has(data.agentId)) return;
       emitComposerInsert({ text: data.text, agentId: data.agentId });
+      return;
+    }
+    case "maestro.composer.lock": {
+      applyEmbedComposerLock(data);
       return;
     }
     case "maestro.theme": {
