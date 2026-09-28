@@ -986,7 +986,8 @@ function setupSingleInstanceLock(): boolean {
 // ---------------------------------------------------------------------------
 
 // Where the `figmenta-sessions` plugin lives: shipped under Resources/plugins in a
-// packaged build, read straight from the monorepo copy in development.
+// packaged build; in development, packages/desktop/figmenta-plugin — git-ignored and filled
+// from the private plugin repo by scripts/figmenta-plugin-sync.sh.
 function resolveOrchestraPluginPath(): string {
   return app.isPackaged
     ? path.join(process.resourcesPath, "plugins", ORCHESTRA_PLUGIN_ID)

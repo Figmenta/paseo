@@ -182,7 +182,8 @@ tested by `orchestra.test.ts` (no Electron needed):
   first window. In Paseo the renderer called `start_desktop_daemon` over IPC; the Orchestra
   page is remote and has no such bridge, so the main process does it.
 - The plugin path is `<resources>/plugins/figmenta-sessions` when packaged, and
-  `packages/desktop/figmenta-plugin` in development.
+  `packages/desktop/figmenta-plugin` in development, filled by the sync (see
+  "Plugin injection").
 
 `packages/desktop/src/preload.ts` — rewritten. Upstream exposed `paseoDesktop` (the whole
 `paseo:invoke` surface) to any document; against a remote origin that is a hole. It now exposes
@@ -309,6 +310,45 @@ header @orchestra_artifacts Cache-Control "public, max-age=31536000, immutable"
 plus, on Cloudflare, a Cache Rule "bypass cache" for `/orchestra-desktop/updates/*.yml` and
 Browser Cache TTL "Respect existing headers" for that path.
 
+### Plugin injection
+
+The `figmenta-sessions` plugin is private (`Figmenta/paseo-orchestra-plugin`) and this
+repository is public. Its source is never committed here, pushed here, or uploaded as an
+artifact of a workflow of this repository. `packages/desktop/figmenta-plugin/` is
+git-ignored and filled right before a build.
+
+1. **Sync**, from a checkout of the private repository at an exact ref:
+
+   ```sh
+   packages/desktop/scripts/figmenta-plugin-sync.sh <path-to-paseo-orchestra-plugin> <git-ref>
+   ```
+
+   It empties the folder and extracts `git archive` of that commit, keeping only what the
+   daemon esbuilds: `index.server.ts`, `index.client.tsx`, `server/`, `client/`, `shared/`,
+   `package.json`, `paseo-plugin.json`, `tsconfig.json`. Tests, fixtures, README, lockfile
+   and CI files stay out; a top-level entry the script does not know fails the sync until it
+   is added to its keep or skip list. `figmenta-plugin/.source` records ref, sha and version.
+2. **Guard**. `packages/desktop/figmenta-plugin.version` (committed: a version number, no
+   code) names the plugin version this app ships. `scripts/figmenta-plugin-guard.js` fails
+   the build when `figmenta-plugin/package.json` is missing, when its version, the one in
+   `.source` or `PLUGIN_VERSION` in `shared/version.ts` differs, or when an entry point is
+   missing. It is electron-builder's `beforePack` hook, so it stops `npm run build:desktop`,
+   the signed macOS release and CI alike; `node packages/desktop/scripts/figmenta-plugin-guard.js`
+   runs it alone, and `figmenta-release-mac.sh` runs it before building anything.
+3. **Windows** is built in the private repository: `.github/workflows/desktop-windows.yml` of
+   `paseo-orchestra-plugin`, on a tag `desktop-win-v<app version>` or by hand. It checks out
+   this fork (public, no token) at the full sha in the plugin's `desktop/FORK_REF`, syncs the
+   plugin at the triggering ref, runs the guard, then the unsigned NSIS build and the
+   `latest.yml` check, and uploads exe, blockmap and `latest.yml` as a private artifact
+   (7 days). A tag must equal `packages/desktop/package.json`'s version at `FORK_REF`. This
+   repository's `figmenta-windows.yml` only fails, with a pointer.
+4. **macOS**: sync, then the signed release on the Mac with the Developer ID identity
+   ("Signed macOS release" below).
+
+A release that moves the plugin: bump `figmenta-plugin.version` (and the app version) in the
+fork and commit; write that fork commit's full sha into the plugin's `desktop/FORK_REF` and
+commit; tag the plugin commit. The tag then pins both sides.
+
 ### Packaging
 
 `packages/desktop/electron-builder.yml`: `appId it.figmenta.orchestra`, product and executable
@@ -321,19 +361,20 @@ only by the local release script. `afterSign` stays — it only runs the smoke u
 `e2e/packaged-app-smoke.js` carry the `Orchestra`/`Orchestra Helper.app` names. Icons in
 `packages/desktop/assets/` were replaced from the Orchestra `.icns`.
 
-The plugin ships as `extraResources`, from **inside the checkout** (`packages/desktop/figmenta-plugin`,
-a copy of `paseo-orchestra-plugin` at `b15c202`) so the build never reaches a sibling repo.
-The daemon esbuilds the plugin from that directory and externalizes only `react`,
-`react-native` and `@getpaseo/plugin/*`; `zod` is its one bundled runtime dependency, so
-`node_modules/zod` is copied next to it. No other `node_modules` are shipped.
+The plugin ships as `extraResources` from `packages/desktop/figmenta-plugin` (filled by the
+sync above, never committed; tests and `__fixtures__` filtered out). The daemon esbuilds the
+plugin from that directory and externalizes only `react`, `react-native` and
+`@getpaseo/plugin/*`; `zod` is its one bundled runtime dependency, so `node_modules/zod` is
+copied next to it. No other `node_modules` are shipped.
 
 Claude Code is still not bundled (upstream choice, `after-pack.js`): the app uses the `claude`
 on the user's PATH, inherited from the login shell.
 
-Unsigned build (development, CI):
+Unsigned build (development):
 
 ```sh
 npm install   # root, once — postinstall downloads the Electron binary
+packages/desktop/scripts/figmenta-plugin-sync.sh <path-to-paseo-orchestra-plugin> <git-ref>
 CSC_IDENTITY_AUTO_DISCOVERY=false npm run build:desktop -- --publish never \
   --mac dmg --arm64 -c.mac.identity=null -c.mac.notarize=false -c.mac.hardenedRuntime=false
 ```
@@ -346,6 +387,7 @@ If `dmg-builder` answers 500 on its bundle download, fetch the bundle by hand an
 Only on the Mac that holds the Developer ID identity (never CI: the repo is public):
 
 ```sh
+packages/desktop/scripts/figmenta-plugin-sync.sh <path-to-paseo-orchestra-plugin> <git-ref>
 FIGMENTA_ASC_ISSUER=<App Store Connect issuer id> packages/desktop/scripts/figmenta-release-mac.sh
 ```
 
@@ -375,8 +417,7 @@ FIGMENTA_ASC_ISSUER=<App Store Connect issuer id> packages/desktop/scripts/figme
   in `app-update.yml`, `lipo -archs` of the main binary and of every native module; then
   every entry of `latest-mac.yml` against size and sha512 on disk.
 
-Windows: `.github/workflows/figmenta-windows.yml` (tag `figmenta-win-*`) builds the NSIS
-installer unsigned and now also uploads `latest.yml` + blockmap.
+Windows: in the private plugin repository (see "Plugin injection").
 
 ### Rebase on 0.9.2
 

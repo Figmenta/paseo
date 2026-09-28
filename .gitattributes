@@ -1,0 +1,4 @@
+# Figmenta fork: shell scripts keep LF on every checkout. The Windows desktop build runs
+# packages/desktop/scripts/figmenta-plugin-sync.sh under Git Bash, where a CRLF checkout
+# (core.autocrlf=true on hosted Windows runners) would break it.
+packages/desktop/scripts/*.sh text eol=lf

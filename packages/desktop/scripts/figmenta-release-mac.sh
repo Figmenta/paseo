@@ -58,6 +58,11 @@ if [[ -z "$asc_issuer" && -f "$sign_dir/asc_issuer" ]]; then
 fi
 [[ -n "$asc_issuer" ]] || { echo "set FIGMENTA_ASC_ISSUER or write $sign_dir/asc_issuer" >&2; exit 1; }
 [[ -f "$keychain" ]] || { echo "missing keychain $keychain" >&2; exit 1; }
+
+# The private plugin must be synced into figmenta-plugin/ first (figmenta-plugin-sync.sh).
+# electron-builder's beforePack runs the same guard; checking here fails before the long
+# web export instead of after it.
+node "$here/figmenta-plugin-guard.js"
 [[ -f "$sign_dir/keychain.pw" ]] || { echo "missing $sign_dir/keychain.pw" >&2; exit 1; }
 
 # Cleanup on every exit, error included: relock the keychain, drop the x64 twins and the

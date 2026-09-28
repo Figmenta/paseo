@@ -1,15 +1,14 @@
-# Figmenta fork: installers of Orchestra Desktop, distributed by hand from
-# downloads.figmenta.site. Same build as desktop-release.yml, but: one target per
-# platform (Windows x64 NSIS, macOS arm64 + x64 dmg), unsigned (internal app), and a workflow
-# artifact instead of a GitHub Release (the fork is public: 7 days retention).
-# Trigger: push a tag `figmenta-win-*` or `figmenta-mac-*` on the figmenta branch.
+# Figmenta fork: Orchestra Desktop installers are no longer built in this repository.
 #
-# Updates: the Windows job also uploads latest.yml + the blockmap, the manifest the
-# mandatory updater reads from downloads.figmenta.site/orchestra-desktop/updates/.
-# macOS updates are NOT built here: Squirrel.Mac only installs a signed update, and the
-# signing identity never goes to a public repository — the signed macOS release is
-# local (packages/desktop/scripts/figmenta-release-mac.sh, docs/FIGMENTA.md).
-name: Figmenta desktop installers
+# From Orchestra Desktop 1.1.0 the app ships the private figmenta-sessions plugin, whose source
+# never enters this public repository nor an artifact of its workflows (docs/FIGMENTA.md,
+# "Plugin injection"). A build here would have no plugin, so these tags fail at once with a
+# pointer instead of burning a runner on an installer the build guard would refuse anyway:
+#   - Windows: .github/workflows/desktop-windows.yml in the private repository
+#     Figmenta/paseo-orchestra-plugin, tag `desktop-win-v<app version>`.
+#   - macOS: the signed release on the Mac with the Developer ID identity, after the plugin
+#     sync (packages/desktop/scripts/figmenta-release-mac.sh).
+name: Figmenta desktop installers (moved)
 
 on:
   push:
@@ -17,120 +16,14 @@ on:
       - "figmenta-win-*"
       - "figmenta-mac-*"
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
-  build-windows:
-    if: startsWith(github.ref_name, 'figmenta-win-')
-    runs-on: windows-latest
-    timeout-minutes: 90
+  moved:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: "npm"
-          cache-dependency-path: package-lock.json
-
-      - name: Install JS dependencies
-        run: node scripts/npm-retry.mjs ci
-
-      - name: Build desktop (Windows x64, NSIS)
-        shell: bash
-        # No PASEO_DESKTOP_SMOKE: the upstream smoke waits for the paseo://app/ renderer,
-        # while the fork's window loads https://orchestra.figmenta.site, so it can never
-        # pass here (same as the local macOS build). The CLI shim cold daemon start it
-        # also runs passed on run 36118006318.
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      - name: Point at the private build
         run: |
-          set -euo pipefail
-          npm run build:desktop -- --publish never --win nsis --x64
-
-      - name: Verify the update manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-          manifest=packages/desktop/release/latest.yml
-          [ -f "$manifest" ] || { echo "::error::latest.yml was not generated"; exit 1; }
-          cat "$manifest"
-          exe=$(sed -n 's/^path: //p' "$manifest")
-          [ -f "packages/desktop/release/$exe" ] || { echo "::error::latest.yml points at a missing $exe"; exit 1; }
-
-      - name: Upload installer
-        uses: actions/upload-artifact@v4
-        with:
-          name: orchestra-windows-x64
-          path: |
-            packages/desktop/release/*.exe
-            packages/desktop/release/*.exe.blockmap
-            packages/desktop/release/latest.yml
-          if-no-files-found: error
-          retention-days: 7
-
-  build-macos:
-    if: startsWith(github.ref_name, 'figmenta-mac-')
-    # One native runner per arch: node-pty and the other native modules are compiled on
-    # the architecture they will run on (Intel Macs got an arm64-only build on 2026-09-25).
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            runner: macos-14
-          - arch: x64
-            runner: macos-15-intel
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: "npm"
-          cache-dependency-path: package-lock.json
-
-      - name: Install JS dependencies
-        run: node scripts/npm-retry.mjs ci
-
-      - name: Build desktop (macOS ${{ matrix.arch }}, dmg, unsigned)
-        shell: bash
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        run: |
-          set -euo pipefail
-          npm run build:desktop -- --publish never --mac dmg --${{ matrix.arch }} \
-            -c.mac.identity=null -c.mac.notarize=false -c.mac.hardenedRuntime=false
-
-      - name: Verify binary architecture
-        shell: bash
-        run: |
-          set -euo pipefail
-          want=${{ matrix.arch }}; [ "$want" = x64 ] && want=x86_64
-          dmg=$(ls packages/desktop/release/*.dmg | head -1)
-          mp=$(hdiutil attach -nobrowse -readonly "$dmg" | tail -1 | awk -F'\t' '{print $NF}')
-          app=$(ls -d "$mp"/*.app | head -1)
-          exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")
-          got=$(lipo -archs "$app/Contents/MacOS/$exe")
-          echo "main binary: $got (want $want)"
-          # Native modules: listed, not gated (some packages ship prebuilds for every arch).
-          find "$app" -name '*.node' | while read -r f; do echo "$(lipo -archs "$f") ${f#$app/}"; done
-          hdiutil detach "$mp" -quiet
-          [ "$got" = "$want" ] || { echo "::error::main binary is $got, expected $want"; exit 1; }
-
-      - name: Upload installer
-        uses: actions/upload-artifact@v4
-        with:
-          name: orchestra-macos-${{ matrix.arch }}
-          path: packages/desktop/release/*.dmg
-          if-no-files-found: error
-          retention-days: 7
+          echo "::error::Orchestra Desktop is not built from this public repository any more (the plugin is private). Windows: tag desktop-win-v<version> in Figmenta/paseo-orchestra-plugin (.github/workflows/desktop-windows.yml). macOS: figmenta-plugin-sync.sh, then packages/desktop/scripts/figmenta-release-mac.sh on the signing Mac. See docs/FIGMENTA.md, \"Plugin injection\"."
+          exit 1

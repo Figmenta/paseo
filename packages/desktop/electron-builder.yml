@@ -6,6 +6,9 @@ protocols:
   - name: Orchestra agent link
     schemes:
       - paseo
+# Figmenta fork: fails the build when the private plugin was not synced into
+# figmenta-plugin/ or is not the version in figmenta-plugin.version.
+beforePack: ./scripts/figmenta-plugin-guard.js
 afterPack: ./scripts/after-pack.js
 afterSign: ./scripts/after-sign.js
 directories:
@@ -32,16 +35,19 @@ extraResources:
   - from: assets/editor-targets
     to: editor-target-icons
   # Figmenta fork: the figmenta-sessions plugin ships inside the app and is seeded into
-  # ~/.paseo/config.json at boot. The source lives in the monorepo (packages/desktop/
-  # figmenta-plugin) so the build never reaches outside the checkout. The daemon esbuilds
-  # the plugin from this directory and externalizes only react/react-native/@getpaseo/plugin,
-  # so `zod` — its one bundled runtime dependency — must be resolvable from here.
+  # ~/.paseo/config.json at boot. Its source is private, so figmenta-plugin/ is git-ignored
+  # and filled before the build by scripts/figmenta-plugin-sync.sh from the private repo
+  # (docs/FIGMENTA.md, "Plugin injection"); the beforePack guard above refuses a build
+  # without it. The daemon esbuilds the plugin from this directory and externalizes only
+  # react/react-native/@getpaseo/plugin, so `zod` — its one bundled runtime dependency —
+  # must be resolvable from here.
   - from: figmenta-plugin
     to: plugins/figmenta-sessions
     filter:
       - "!node_modules"
       - "!**/*.test.ts"
       - "!**/*.test.tsx"
+      - "!**/__fixtures__/**"
   - from: ../../node_modules/zod
     to: plugins/figmenta-sessions/node_modules/zod
 # Figmenta fork: Orchestra's own update feed (generic provider, mandatory updater in

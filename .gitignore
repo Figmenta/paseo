@@ -93,3 +93,8 @@ app.json
 
 # Heap snapshots dumped by --heapsnapshot-near-heap-limit; keep them for debugging.
 *.heapsnapshot
+
+# Figmenta fork: the figmenta-sessions plugin is private and this repository is public.
+# Its source is injected right before a build by packages/desktop/scripts/figmenta-plugin-sync.sh
+# and never committed (docs/FIGMENTA.md, "Plugin injection").
+packages/desktop/figmenta-plugin/
