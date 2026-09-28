@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildWindowsRelaunchScript,
   needsRelaunchHelper,
+  relaunchHelperEnv,
   RELAUNCH_HELPER_TIMEOUT_SECONDS,
   windowsRelaunchCommand,
 } from "./windows-relaunch.js";
@@ -28,9 +29,15 @@ describe("buildWindowsRelaunchScript", () => {
         l.includes("Test-InstallerRunning") &&
         l.includes("Test-TargetInstalled"),
     );
-    const bailOut = script.findIndex((l) => l === "if (-not (Test-TargetInstalled)) { exit 2 }");
-    const alreadyRunning = script.findIndex((l) => l === "if ($running) { exit 0 }");
-    const start = script.findIndex((l) => l === "Start-Process -FilePath $exe");
+    const bailOut = script.findIndex(
+      (l) => l.startsWith("if (-not (Test-TargetInstalled))") && l.endsWith("exit 2 }"),
+    );
+    const alreadyRunning = script.findIndex(
+      (l) => l.startsWith("if ($running)") && l.endsWith("exit 0 }"),
+    );
+    const start = script.findIndex(
+      (l) => l === "$started = Start-Process -FilePath $exe -PassThru",
+    );
     for (const index of [waitParent, waitInstall, bailOut, alreadyRunning, start]) {
       expect(index).toBeGreaterThanOrEqual(0);
     }
@@ -45,7 +52,7 @@ describe("buildWindowsRelaunchScript", () => {
     expect(script).toContain(
       "$running = Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $exe }",
     );
-    expect(script).toContain("if ($running) { exit 0 }");
+    expect(script).toContain("if ($running) { Log 'already running, not starting'; exit 0 }");
   });
 
   it("starts nothing if the new version never lands before the deadline", () => {
@@ -54,7 +61,9 @@ describe("buildWindowsRelaunchScript", () => {
       `$deadline = (Get-Date).AddSeconds(${RELAUNCH_HELPER_TIMEOUT_SECONDS})`,
     );
     expect(script).toContain("$v -eq $target -or $v.StartsWith($target + '.')");
-    expect(script).toContain("if (-not (Test-TargetInstalled)) { exit 2 }");
+    expect(script).toContain(
+      "if (-not (Test-TargetInstalled)) { Log 'target version never installed, giving up'; exit 2 }",
+    );
   });
 
   it("quotes paths as PowerShell literals and carries pid, installer and version", () => {
@@ -95,5 +104,29 @@ describe("needsRelaunchHelper", () => {
     expect(needsRelaunchHelper("win32")).toBe(true);
     expect(needsRelaunchHelper("darwin")).toBe(false);
     expect(needsRelaunchHelper("linux")).toBe(false);
+  });
+});
+
+describe("relaunchHelperEnv", () => {
+  it("keeps the user's environment and drops this process's Chromium runtime variables", () => {
+    expect(
+      relaunchHelperEnv({
+        PATH: "C:\\Windows",
+        PASEO_HOME: "C:\\h",
+        CHROME_CRASHPAD_PIPE_NAME: "\\\\.\\pipe\\crashpad_1",
+        ELECTRON_RUN_AS_NODE: "1",
+        ELECTRON_NO_ATTACH_CONSOLE: "1",
+      }),
+    ).toEqual({ PATH: "C:\\Windows", PASEO_HOME: "C:\\h" });
+  });
+
+  it("writes a log of what it did when given a path", () => {
+    const script = buildWindowsRelaunchScript({
+      ...plan,
+      logPath: "C:\\logs\\relaunch-helper.log",
+    });
+    expect(script).toContain("$logPath = 'C:\\logs\\relaunch-helper.log'");
+    expect(script).toContain("Log 'installed, starting'");
+    expect(buildWindowsRelaunchScript(plan)).toContain("$logPath = $null");
   });
 });
