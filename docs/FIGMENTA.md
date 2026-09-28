@@ -243,7 +243,7 @@ Remind me later, no countdown.
   happens, the app stays usable, the next round tries again.
 - A newer version: download at once behind a screen that covers every window (a
   `WebContentsView` above the page, keyboard to the page blocked), with progress; then one
-  button, **«Installa e riavvia»**. A failed download: same screen, **«Riprova»** (it checks
+  button, **«Install and restart»**. A failed download: same screen, **«Retry»** (it checks
   again, then downloads; if the feed is unreachable at that moment the screen goes away until
   the next round). Before relaunching, the daemon this app launched is stopped.
 - Windows relaunch: the update runs the installer with `--updated /S --force-run`; the
@@ -253,17 +253,20 @@ Remind me later, no countdown.
   `--updated` is now a GUI launch (`daemon/cli/passthrough.ts`). The first version that
   comes back on its own is the one being INSTALLED (the relaunched binary), so an update
   from 1.0.0–1.0.3 to 1.0.4 already reopens.
+- UI copy is English from 1.0.5 (Federico, 2026-09-28): the update screen and both
+  move-to-Applications dialogs. Up to 1.0.4 they were Italian, and the screen is drawn by
+  the RUNNING version, so an update from 1.0.4 to 1.0.5 still shows the Italian one.
 - Never a downgrade: an announced version must be strictly newer than the running one,
   checked twice (state machine and runtime). electron-updater's `channel` setter is never
   used — assigning it turns `allowDowngrade` back on.
 - macOS, outside `/Applications` (opened from the dmg, a copy in Downloads, a read-only or
   translocated volume): at launch Orchestra offers to move itself there
-  (`app.moveToApplicationsFolder`, Italian dialog, relaunch). Declined or failed, a failed
+  (`app.moveToApplicationsFolder`, English dialog, relaunch). Declined or failed, a failed
   update explains the location instead of the connection.
 - Code: `src/figmenta/mandatory-update.ts` (state machine, pure, tested),
   `mandatory-update-runtime.ts` (electron-updater configuration, tested with a fake),
   `mandatory-update-electron.ts` (electron-updater + screen), `update-overlay-page.ts`
-  (data: URL page, Italian copy), `update-overlay-preload.ts` (sandboxed).
+  (data: URL page, English copy), `update-overlay-preload.ts` (sandboxed).
 - `ORCHESTRA_UPDATE_FEED_URL` overrides the feed **only for a loopback host** (the
   end-to-end test); anything else is refused and logged.
 - `after-pack.js` sets `updaterCacheDirName: orchestra-desktop-updater` in `app-update.yml`:

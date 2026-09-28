@@ -5,8 +5,8 @@
 //     -> nothing new, or the feed is unreachable: nothing happens, the app stays usable,
 //        the next round tries again
 //     -> a newer version: download it at once, behind a screen that covers the window
-//        (progress), then ONE button, "Installa e riavvia"
-//     -> the download fails: the same screen, with "Riprova"
+//        (progress), then ONE button, "Install and restart"
+//     -> the download fails: the same screen, with "Retry"
 //
 // This module is the state machine only; electron-updater and the covering screen are
 // injected (mandatory-update-electron.ts), so every transition is unit-testable.
@@ -273,7 +273,7 @@ export const KEEP_LOCATION_ENV = "ORCHESTRA_E2E_KEEP_LOCATION";
 /**
  * macOS replaces the app in place on update, which fails from a dmg, a read-only volume
  * or a translocated copy: an Orchestra outside /Applications offers to move itself there
- * at launch. Otherwise the mandatory update would lock the user on «Riprova» forever.
+ * at launch. Otherwise the mandatory update would lock the user on «Retry» forever.
  */
 export function shouldOfferMoveToApplications(input: {
   platform: NodeJS.Platform;

@@ -56,11 +56,11 @@ export async function offerMoveToApplicationsFolder(): Promise<"moved" | "stayed
   const { response } = await dialog.showMessageBox({
     type: "question",
     title: "Orchestra",
-    message: "Spostare Orchestra nella cartella Applicazioni?",
+    message: "Move Orchestra to the Applications folder?",
     detail:
-      "Orchestra si aggiorna da sola, e per farlo deve stare in Applicazioni. " +
-      "Da qui (per esempio dall'immagine disco) gli aggiornamenti non si possono installare.",
-    buttons: ["Sposta in Applicazioni", "Non ora"],
+      "Orchestra updates itself, and to do that it has to be in Applications. " +
+      "From here (the disk image, for example) updates cannot be installed.",
+    buttons: ["Move to Applications", "Not Now"],
     defaultId: 0,
     cancelId: 1,
     noLink: true,
@@ -80,10 +80,10 @@ export async function offerMoveToApplicationsFolder(): Promise<"moved" | "stayed
     await dialog.showMessageBox({
       type: "warning",
       title: "Orchestra",
-      message: "Non sono riuscito a spostare Orchestra in Applicazioni.",
+      message: "Could not move Orchestra to Applications.",
       detail:
-        "Trascina Orchestra nella cartella Applicazioni dal Finder e riaprila da lì: " +
-        "altrimenti gli aggiornamenti non si possono installare.",
+        "Drag Orchestra to the Applications folder in the Finder and reopen it from there, " +
+        "otherwise updates cannot be installed.",
       buttons: ["OK"],
       noLink: true,
     });

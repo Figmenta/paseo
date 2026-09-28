@@ -1,13 +1,13 @@
 // Figmenta fork: the mandatory-update screen, served as a data: URL so it needs no file
 // in the bundle and never touches the network. It talks to the main process only through
-// `window.orchestraUpdate` (update-overlay-preload.ts). Italian copy, one action at a time.
+// `window.orchestraUpdate` (update-overlay-preload.ts). English copy, one action at a time.
 
 export const UPDATE_OVERLAY_PAGE_HTML = `<!doctype html>
-<html lang="it">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
-<title>Aggiornamento di Orchestra</title>
+<title>Updating Orchestra</title>
 <style>
   :root { color-scheme: dark; }
   html, body { margin: 0; height: 100%; }
@@ -37,17 +37,17 @@ export const UPDATE_OVERLAY_PAGE_HTML = `<!doctype html>
 </head>
 <body>
 <main>
-  <h1 id="title">Aggiornamento di Orchestra</h1>
-  <p id="lead">Per usare Orchestra serve l'ultima versione.</p>
+  <h1 id="title">Updating Orchestra</h1>
+  <p id="lead">Orchestra needs the latest version to run.</p>
   <div id="bar" class="bar indeterminate" hidden><div id="fill" class="fill"></div></div>
   <div id="pct" class="pct" hidden></div>
   <div id="error" class="error" hidden></div>
-  <button id="install" type="button" hidden>Installa e riavvia</button>
-  <button id="retry" type="button" hidden>Riprova</button>
+  <button id="install" type="button" hidden>Install and restart</button>
+  <button id="retry" type="button" hidden>Retry</button>
 </main>
 <script>
   const $ = (id) => document.getElementById(id);
-  const label = (version) => (version ? "la versione " + version : "una nuova versione");
+  const label = (version) => (version ? "version " + version : "a new version");
   function render(state) {
     if (!state || typeof state !== "object") return;
     const bar = $("bar"), fill = $("fill"), pct = $("pct"), error = $("error");
@@ -55,8 +55,8 @@ export const UPDATE_OVERLAY_PAGE_HTML = `<!doctype html>
     bar.hidden = pct.hidden = error.hidden = install.hidden = retry.hidden = true;
     switch (state.phase) {
       case "downloading": {
-        $("title").textContent = "Aggiornamento di Orchestra";
-        $("lead").textContent = "Sto scaricando " + label(state.version) + ". Per usare Orchestra serve l'ultima versione.";
+        $("title").textContent = "Updating Orchestra";
+        $("lead").textContent = "Downloading " + label(state.version) + ". Orchestra needs the latest version to run.";
         bar.hidden = false;
         const known = typeof state.percent === "number";
         bar.classList.toggle("indeterminate", !known);
@@ -66,25 +66,25 @@ export const UPDATE_OVERLAY_PAGE_HTML = `<!doctype html>
         break;
       }
       case "ready":
-        $("title").textContent = "Aggiornamento pronto";
-        $("lead").textContent = "Orchestra " + state.version + " è pronta: installala per continuare.";
+        $("title").textContent = "Update ready";
+        $("lead").textContent = "Orchestra " + state.version + " is ready. Install it to continue.";
         install.hidden = false;
         install.disabled = false;
         install.focus();
         break;
       case "failed":
-        $("title").textContent = "Aggiornamento non riuscito";
+        $("title").textContent = "Update failed";
         $("lead").textContent = state.hint === "location"
-          ? "Orchestra non è nella cartella Applicazioni, e da qui non si può aggiornare. Esci, trascina Orchestra in Applicazioni dal Finder e riaprila da lì."
-          : "Non sono riuscito a scaricare " + label(state.version) + ". Controlla la connessione e riprova.";
+          ? "Orchestra is not in the Applications folder and cannot update from here. Quit, drag Orchestra to Applications in the Finder and reopen it from there."
+          : "Could not download " + label(state.version) + ". Check your connection and try again.";
         error.hidden = false;
         error.textContent = state.message || "";
         retry.hidden = false;
         retry.focus();
         break;
       case "installing":
-        $("title").textContent = "Installazione in corso";
-        $("lead").textContent = "Orchestra si riavvia da sola sulla versione " + state.version + ".";
+        $("title").textContent = "Installing update";
+        $("lead").textContent = "Orchestra will restart on its own with version " + state.version + ".";
         bar.hidden = false;
         bar.classList.add("indeterminate");
         fill.style.width = "";
