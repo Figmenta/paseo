@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 /**
- * The `maestro.models.allow` hunk in `composer/agent-controls/index.tsx` (`AgentControls`):
- * the list reaches every surface that picks a model for that agent. The surfaces themselves
- * are stand-ins that record what they were given; the store, the snapshot and the profiles
- * are fixtures.
+ * The `maestro.models.allow` hunks in `composer/agent-controls/index.tsx` (`AgentControls` and
+ * `DraftAgentControls`): the list reaches every surface that picks a model for that agent, and
+ * the person's default (agentId "*") every draft and every agent Orchestra never named. The
+ * surfaces themselves are stand-ins that record what they were given; the store, the snapshot
+ * and the profiles are fixtures.
  */
 import React from "react";
 import { act, cleanup, render, screen } from "@testing-library/react";
@@ -127,7 +128,7 @@ vi.mock("@/agent-profiles", () => ({
   }),
 }));
 
-import { AgentControls } from "@/composer/agent-controls";
+import { AgentControls, DraftAgentControls } from "@/composer/agent-controls";
 
 // App sources compile against the classic JSX runtime, which expects React on the global.
 beforeEach(() => vi.stubGlobal("React", React));
@@ -167,6 +168,8 @@ function rowIds(providers: unknown): string[] {
 function profileIds(profiles: unknown): string[] {
   return (profiles as AgentProfilePicker).rows.map((entry) => entry.id);
 }
+
+function noop(): void {}
 
 function post(data: unknown): void {
   act(() => {
@@ -358,5 +361,183 @@ describe("AgentControls under maestro.models.allow hidden", () => {
 
     expect(screen.queryByTestId(DESKTOP)).not.toBeNull();
     expect(rowIds(seen.desktop?.providers)).toEqual(ALL);
+  });
+});
+
+describe('AgentControls under the person\'s default (agentId "*")', () => {
+  const DESKTOP = "stand-in-desktop-model-selector";
+
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    window.history.replaceState({}, "", "/agents-ui/?embed=1");
+    resetEmbedModeCache();
+    installEmbedBridge();
+    seen.desktop = null;
+    seen.compact = null;
+    seen.commandCenter = null;
+    seen.profiles = PROFILES;
+    // The agent /clear or a fork just created: Orchestra has never named it.
+    const agent = {
+      provider: "claude",
+      cwd: "/tmp",
+      runtimeInfo: { model: "claude-sonnet-5" },
+      model: "claude-sonnet-5",
+      features: [],
+      thinkingOptionId: "high",
+      lastUsage: null,
+    };
+    seen.state = {
+      sessions: { s1: { agents: new Map([["a1", agent]]), client: {} } },
+    };
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("an agent Orchestra never named takes a hidden default: no selector, no model group", () => {
+    renderControls(false);
+
+    post({ type: "maestro.models.allow", agentId: "*", models: [], hidden: true });
+
+    expect(screen.queryByTestId(DESKTOP)).toBeNull();
+    expect(screen.queryByTestId("agent-thinking-selector")).not.toBeNull();
+    expect(rowIds(seen.commandCenter?.models.providers)).toEqual([]);
+  });
+
+  it("an agent Orchestra never named is narrowed by a shown default", () => {
+    renderControls(false);
+
+    post({ type: "maestro.models.allow", agentId: "*", models: ["claude-sonnet-5"] });
+
+    expect(rowIds(seen.desktop?.providers)).toEqual(["claude-sonnet-5"]);
+    expect(rowIds(seen.commandCenter?.models.providers)).toEqual(["claude-sonnet-5"]);
+  });
+
+  it("the agent's own entry beats the default", () => {
+    renderControls(false);
+    post({ type: "maestro.models.allow", agentId: "*", models: [], hidden: true });
+    expect(screen.queryByTestId(DESKTOP)).toBeNull();
+
+    post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-opus-5"] });
+
+    expect(screen.queryByTestId(DESKTOP)).not.toBeNull();
+    expect(rowIds(seen.desktop?.providers)).toEqual(["claude-opus-5"]);
+  });
+});
+
+describe('DraftAgentControls under the person\'s default (agentId "*")', () => {
+  const DESKTOP = "stand-in-desktop-model-selector";
+  const COMPACT = "stand-in-compact-model-sheet";
+  const THINKING = [
+    { id: "low", label: "Low" },
+    { id: "high", label: "High", isDefault: true },
+  ];
+
+  function claudeProviders(): ProviderSelectorProvider[] {
+    return [
+      {
+        id: "claude",
+        label: "Claude",
+        modelSelection: {
+          kind: "models",
+          rows: ALL.map((modelId) => ({
+            favoriteKey: `claude:${modelId}`,
+            provider: "claude",
+            providerLabel: "Claude",
+            modelId,
+            modelLabel: modelId,
+          })),
+        },
+      },
+    ];
+  }
+
+  function renderDraft(isCompactLayout: boolean) {
+    return render(
+      <DraftAgentControls
+        providerDefinitions={[]}
+        selectedProvider="claude"
+        modeOptions={[{ id: "default", label: "Default" }]}
+        selectedMode="default"
+        onSelectMode={noop}
+        models={[]}
+        selectedModel="claude-sonnet-5"
+        onSelectModel={noop}
+        isModelLoading={false}
+        modelSelectorProviders={claudeProviders()}
+        isAllModelsLoading={false}
+        onSelectProviderAndModel={noop}
+        thinkingOptions={THINKING}
+        selectedThinkingOptionId="high"
+        onSelectThinkingOption={noop}
+        onApplyAgentProfile={noop}
+        modelSelectorServerId="s1"
+        isCompactLayout={isCompactLayout}
+      />,
+    );
+  }
+
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    window.history.replaceState({}, "", "/agents-ui/?embed=1");
+    resetEmbedModeCache();
+    installEmbedBridge();
+    seen.desktop = null;
+    seen.compact = null;
+    seen.profiles = PROFILES;
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("shows every model and profile while there is no default", () => {
+    renderDraft(false);
+
+    // An agent's own word does not reach a draft: it has no agentId.
+    post({ type: "maestro.models.allow", agentId: "a1", models: [], hidden: true });
+
+    expect(screen.queryByTestId(DESKTOP)).not.toBeNull();
+    expect(rowIds(seen.desktop?.providers)).toEqual(ALL);
+    expect(profileIds(seen.desktop?.profiles)).toEqual(["p-opus", "p-plan"]);
+  });
+
+  it("desktop: a hidden default removes the model selector, effort and mode stay", () => {
+    renderDraft(false);
+
+    post({ type: "maestro.models.allow", agentId: "*", models: [], hidden: true });
+
+    expect(screen.queryByTestId(DESKTOP)).toBeNull();
+    expect(screen.queryByTestId("agent-thinking-selector")).not.toBeNull();
+    expect(screen.queryByTestId("stand-in-mode-control")).not.toBeNull();
+  });
+
+  it("compact: a hidden default removes the model sheet, the toolbar keeps effort and mode", () => {
+    renderDraft(true);
+    expect(screen.queryByTestId(COMPACT)).not.toBeNull();
+
+    post({ type: "maestro.models.allow", agentId: "*", models: [], hidden: true });
+
+    expect(screen.queryByTestId(COMPACT)).toBeNull();
+    expect(screen.queryByTestId(DESKTOP)).toBeNull();
+    expect(screen.queryByTestId("agent-thinking-selector")).not.toBeNull();
+    expect(screen.queryByTestId("stand-in-mode-control")).not.toBeNull();
+  });
+
+  it("a shown default narrows the draft menu and its profiles, desktop and compact", () => {
+    renderDraft(false);
+    post({ type: "maestro.models.allow", agentId: "*", models: [], hidden: true });
+
+    post({ type: "maestro.models.allow", agentId: "*", models: ["claude-sonnet-5"] });
+
+    expect(screen.queryByTestId(DESKTOP)).not.toBeNull();
+    expect(rowIds(seen.desktop?.providers)).toEqual(["claude-sonnet-5"]);
+    expect(profileIds(seen.desktop?.profiles)).toEqual(["p-plan"]);
+
+    cleanup();
+    renderDraft(true);
+    expect(rowIds(seen.compact?.providers)).toEqual(["claude-sonnet-5"]);
+    expect(profileIds(seen.compact?.profiles)).toEqual(["p-plan"]);
   });
 });

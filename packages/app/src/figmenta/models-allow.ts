@@ -9,12 +9,13 @@
  * model selector at all: no trigger (so not even the current model's name), no sheet, no model
  * group in the command center, no profile that names a model; effort and permission mode stay.
  * The agent's current model is never changed from here, even when the list leaves it out: the
- * real defence is the daemon's, this is the menu. Without a list, or outside the embed,
+ * real defence is the daemon's, this is the menu. An agent Orchestra never named, and every
+ * draft, take the person's default (agentId "*"). Without a list, or outside the embed,
  * everything passes through untouched.
  */
 import { useMemo } from "react";
 import type { AgentProfilePicker } from "@/agent-profiles";
-import { useEmbedModelsAllow } from "@/figmenta/embed";
+import { EMBED_MODELS_ALLOW_DEFAULT_ID, useEmbedModelsAllow } from "@/figmenta/embed";
 import type { ProviderSelectorProvider } from "@/provider-selection/provider-selection";
 
 const NO_MODELS: readonly string[] = [];
@@ -60,9 +61,9 @@ export function filterProfilesByModelsAllow(
 }
 
 /**
- * The model menu of one agent, narrowed by Orchestra's word for that agent. `hidden` = render
- * no model selector: `providers` is then empty (the command center builds no model group from
- * it) and only the profiles that name no model are left.
+ * The model menu of one agent, narrowed by Orchestra's word for that agent (its own, else the
+ * person's default). `hidden` = render no model selector: `providers` is then empty (the command
+ * center builds no model group from it) and only the profiles that name no model are left.
  */
 export function useEmbedModelsAllowMenu(input: {
   agentId: string;
@@ -87,4 +88,23 @@ export function useEmbedModelsAllowMenu(input: {
     [allowed, profiles],
   );
   return { providers: allowedProviders, profiles: allowedProfiles, hidden };
+}
+
+/**
+ * The model menu of a draft (`/clear`, fork, new agent): it has no agentId Orchestra could name,
+ * so the person's default ("*") narrows or hides it. No default = the menu untouched.
+ */
+export function useEmbedDraftModelsAllowMenu(input: {
+  providers: ProviderSelectorProvider[];
+  profiles: AgentProfilePicker | null;
+}): {
+  providers: ProviderSelectorProvider[];
+  profiles: AgentProfilePicker | null;
+  hidden: boolean;
+} {
+  return useEmbedModelsAllowMenu({
+    agentId: EMBED_MODELS_ALLOW_DEFAULT_ID,
+    providers: input.providers,
+    profiles: input.profiles,
+  });
 }

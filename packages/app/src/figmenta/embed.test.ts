@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_COMPOSER_LOCK_LABEL,
+  EMBED_MODELS_ALLOW_DEFAULT_ID,
   EMBED_READY_TYPE,
   installEmbedBridge,
   lastAgentRoute,
@@ -520,6 +521,117 @@ describe("maestro.models.allow hidden", () => {
 
     expect(readEmbedModelsAllow("a1")).toBe(hidden);
     expect(notified).toEqual(["a1", "a1"]);
+  });
+});
+
+describe('maestro.models.allow default (agentId "*")', () => {
+  const unsubscribes: Array<() => void> = [];
+
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    setLocation("?embed=1");
+    resetEmbedModeCache();
+    installEmbedBridge();
+    while (unsubscribes.length) unsubscribes.pop()?.();
+  });
+
+  function post(data: unknown): void {
+    window.dispatchEvent(new MessageEvent("message", { data, origin: window.location.origin }));
+  }
+
+  function allow(agentId: string, models: string[], hidden?: boolean): void {
+    post({
+      type: "maestro.models.allow",
+      agentId,
+      models,
+      ...(hidden === undefined ? {} : { hidden }),
+    });
+  }
+
+  it('is the "*" agentId', () => {
+    expect(EMBED_MODELS_ALLOW_DEFAULT_ID).toBe("*");
+  });
+
+  it("stores the default and hands it to drafts and to every agent Orchestra never named", () => {
+    allow("*", [], true);
+
+    expect(readEmbedModelsAllow(EMBED_MODELS_ALLOW_DEFAULT_ID)).toEqual({
+      models: [],
+      hidden: true,
+    });
+    // An agent created after /clear or a fork: an id Orchestra has not named.
+    expect(readEmbedModelsAllow("created-after-clear")).toBe(
+      readEmbedModelsAllow(EMBED_MODELS_ALLOW_DEFAULT_ID),
+    );
+  });
+
+  it("an agent's own entry beats the default, whichever arrived first", () => {
+    allow("a1", ["claude-opus-5"]);
+    allow("*", [], true);
+    allow("a2", ["claude-sonnet-5"], false);
+
+    expect(readEmbedModelsAllow("a1")).toEqual({ models: ["claude-opus-5"], hidden: false });
+    expect(readEmbedModelsAllow("a2")).toEqual({ models: ["claude-sonnet-5"], hidden: false });
+    expect(readEmbedModelsAllow("a3")).toEqual({ models: [], hidden: true });
+    expect(readEmbedModelsAllow("*")).toEqual({ models: [], hidden: true });
+  });
+
+  it("a per-agent hidden stays hidden under a shown default", () => {
+    allow("*", ["claude-sonnet-5"]);
+    allow("a1", ["claude-sonnet-5"], true);
+
+    expect(readEmbedModelsAllow("a1")?.hidden).toBe(true);
+    expect(readEmbedModelsAllow("a2")).toEqual({ models: ["claude-sonnet-5"], hidden: false });
+  });
+
+  it("a later default replaces the previous one whole, per-agent entries untouched", () => {
+    allow("a1", ["claude-opus-5"], true);
+    allow("*", ["claude-sonnet-5"], true);
+    allow("*", ["claude-sonnet-5"]);
+
+    expect(readEmbedModelsAllow("a2")).toEqual({ models: ["claude-sonnet-5"], hidden: false });
+    expect(readEmbedModelsAllow("a1")).toEqual({ models: ["claude-opus-5"], hidden: true });
+
+    allow("*", ["claude-opus-5", "claude-sonnet-5"]);
+    expect(readEmbedModelsAllow("a2")).toEqual({
+      models: ["claude-opus-5", "claude-sonnet-5"],
+      hidden: false,
+    });
+  });
+
+  it("is validated like a per-agent message: malformed or empty-while-shown keeps the default", () => {
+    allow("*", ["claude-sonnet-5"]);
+    const before = readEmbedModelsAllow("*");
+
+    allow("*", []);
+    post({ type: "maestro.models.allow", agentId: "*", models: ["claude-opus-5"], hidden: "true" });
+    post({ type: "maestro.models.allow", agentId: "*", models: [7] });
+    post({ type: "maestro.models.allow", agentId: "*" });
+
+    expect(readEmbedModelsAllow("*")).toBe(before);
+    expect(readEmbedModelsAllow("a1")).toBe(before);
+  });
+
+  it('notifies "*" on a new default, nobody on a repeat', () => {
+    const notified: string[] = [];
+    unsubscribes.push(subscribeToEmbedModelsAllow((agentId) => notified.push(agentId)));
+
+    allow("*", [], true);
+    allow("*", [], true);
+    allow("*", ["claude-sonnet-5"]);
+
+    expect(notified).toEqual(["*", "*"]);
+  });
+
+  it("is inert outside the embed", () => {
+    window.sessionStorage.clear();
+    setLocation("");
+    resetEmbedModeCache();
+
+    allow("*", [], true);
+
+    expect(readEmbedModelsAllow("*")).toBeNull();
+    expect(readEmbedModelsAllow("a1")).toBeNull();
   });
 });
 

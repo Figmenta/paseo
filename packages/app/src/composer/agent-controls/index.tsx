@@ -81,7 +81,7 @@ import { ComposerControlLayoutProvider } from "@/composer/agent-controls/layout-
 import { ComposerToolbarGlyph } from "@/composer/agent-controls/glyph";
 import { AgentControlTrigger } from "@/composer/agent-controls/control";
 import { CompactModelSheet } from "@/composer/agent-controls/model-sheet";
-import { useEmbedModelsAllowMenu } from "@/figmenta/models-allow";
+import { useEmbedDraftModelsAllowMenu, useEmbedModelsAllowMenu } from "@/figmenta/models-allow";
 import {
   useAgentProfileEditor,
   useAgentProfilePicker,
@@ -1914,6 +1914,13 @@ export function DraftAgentControls({
   );
   const profileEditor = useAgentProfileEditor(modelSelectorServerId);
   const profileActions = resolveAgentProfileEditorActions(agentProfiles !== null, profileEditor);
+  // Figmenta embed: a draft has no agentId Orchestra could name, so the person's default
+  // (`maestro.models.allow` with agentId "*") narrows its menu or hides it (`hidden`), desktop and
+  // compact; without a default it is untouched (docs/FIGMENTA.md).
+  const embedModelMenu = useEmbedDraftModelsAllowMenu({
+    providers: modelSelectorProviders,
+    profiles: agentProfiles,
+  });
 
   const modeControl = useMemo<AgentModeControlValue | null>(
     () =>
@@ -1935,13 +1942,13 @@ export function DraftAgentControls({
       {profileEditor.element}
       <ControlledAgentControls
         provider={selectedProvider ?? ""}
-        modelSelectorProviders={modelSelectorProviders}
+        modelSelectorProviders={embedModelMenu.providers}
         modelOptions={modelOptions}
         selectedModelId={selectedModel}
         onSelectModel={onSelectModel}
         onSelectProviderAndModel={onSelectProviderAndModel}
         isModelLoading={isAllModelsLoading}
-        agentProfiles={agentProfiles}
+        agentProfiles={embedModelMenu.profiles}
         onApplyAgentProfile={agentProfiles?.applyProfile}
         onEditAgentProfiles={handleEditAgentProfiles}
         onCreateAgentProfile={profileActions.create}
@@ -1959,6 +1966,7 @@ export function DraftAgentControls({
         modeControl={modeControl}
         modelSelectorServerId={modelSelectorServerId}
         isCompactLayout={isCompactLayout}
+        hideModelSelector={embedModelMenu.hidden}
       />
     </>
   );

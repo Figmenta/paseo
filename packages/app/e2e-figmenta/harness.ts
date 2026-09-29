@@ -11,7 +11,8 @@
  *   home: it answers `--version` and refuses everything else. The catalog is therefore the real
  *   Claude manifest (what production shows) with no Claude Code install, no credential and no token
  *   involved. CLAUDE_CONFIG_DIR points into the same home, so no operator setting is read either.
- * - The agent is a Claude agent created WITHOUT an initial prompt and never prompted.
+ * - The agent is a Claude agent created WITHOUT an initial prompt and never prompted; `/clear` turns
+ *   it into a draft that is never submitted.
  * - The operator's daemon (127.0.0.1:6767) is refused at the network layer, HTTP and WebSocket.
  */
 import { execFileSync } from "node:child_process";
@@ -204,6 +205,12 @@ export async function seedClaudeAgent(): Promise<SeededAgent> {
   }
 }
 
+/** Orchestra's person-level default: `maestro.models.allow` with agentId "*". */
+export interface DefaultAllow {
+  models: string[];
+  hidden?: boolean;
+}
+
 /** How the simulated Orchestra page behaves. */
 export interface ParentTiming {
   /** Re-post after this many ms from the frame's load (Orchestra: the 60 s state poll). */
@@ -212,12 +219,18 @@ export interface ParentTiming {
   answerReady: boolean;
 }
 
-function parentHtml(input: {
+interface ParentInput {
   serverId: string;
   agentId: string;
   models: string[];
+  /** The agent's `hidden` at load; absent = not sent. */
+  hidden?: boolean;
+  /** The person's default at load; absent = no "*" message, as before the default existed. */
+  defaultAllow?: DefaultAllow;
   timing: ParentTiming;
-}): string {
+}
+
+function parentHtml(input: ParentInput): string {
   const src = `/agents-ui/h/${encodeURIComponent(input.serverId)}/agent/${encodeURIComponent(input.agentId)}?embed=1&theme=dark`;
   const boot = JSON.stringify({ ...input, src });
   return `<!doctype html>
@@ -231,14 +244,26 @@ function parentHtml(input: {
   const boot = ${boot};
   const frame = document.getElementById("chat");
   const log = [];
-  // What the page would send for this agent now: tests change it to play the checkbox.
-  const state = { models: boot.models, hidden: undefined };
+  // What the page would send now, for this agent and as the person's default ("*"): tests
+  // change it to play the checkbox. defaultAllow null = no "*" message.
+  const state = {
+    models: boot.models,
+    hidden: boot.hidden,
+    defaultAllow: boot.defaultAllow ?? null,
+  };
+  function send(msg, reason) {
+    frame.contentWindow.postMessage(msg, window.location.origin);
+    log.push({ at: Date.now(), kind: "post", reason, msg });
+  }
   function post(reason) {
     if (!frame.contentWindow) return;
     const msg = { type: "maestro.models.allow", agentId: boot.agentId, models: state.models };
     if (state.hidden !== undefined) msg.hidden = state.hidden;
-    frame.contentWindow.postMessage(msg, window.location.origin);
-    log.push({ at: Date.now(), kind: "post", reason, msg });
+    send(msg, reason);
+    if (!state.defaultAllow) return;
+    const fallback = { type: "maestro.models.allow", agentId: "*", models: state.defaultAllow.models };
+    if (state.defaultAllow.hidden !== undefined) fallback.hidden = state.defaultAllow.hidden;
+    send(fallback, reason);
   }
   window.addEventListener("message", (event) => {
     if (event.origin !== window.location.origin) return;
@@ -257,6 +282,12 @@ function parentHtml(input: {
     state,
     post,
     set(next) { Object.assign(state, next); },
+    // Load another agent in the frame, as a session switch would, WITHOUT naming it: the
+    // per-agent message keeps naming boot.agentId, so this one only has the "*" default.
+    openUnnamed(agentId) {
+      frame.src = "/agents-ui/h/" + encodeURIComponent(boot.serverId) + "/agent/" +
+        encodeURIComponent(agentId) + "?embed=1&theme=dark";
+    },
   };
   frame.src = boot.src;
 })();
@@ -325,10 +356,7 @@ function serveExport(route: Route, pathname: string): Promise<void> {
 }
 
 /** Wires a fresh browser context: Orchestra simulated, the operator's daemon unreachable. */
-export async function prepareContext(
-  context: BrowserContext,
-  input: { serverId: string; agentId: string; models: string[]; timing: ParentTiming },
-): Promise<void> {
+export async function prepareContext(context: BrowserContext, input: ParentInput): Promise<void> {
   if (!existsSync(path.join(EMBED_DIST, "index.html"))) {
     throw new Error(`No export at ${EMBED_DIST}: build it first (see the spec header).`);
   }

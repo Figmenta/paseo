@@ -12,12 +12,14 @@
  * measure an older build), FIGMENTA_E2E_REPOST_MS (default 60000, Orchestra's state poll),
  * FIGMENTA_E2E_HOME (default /tmp/ph-model-switch), FIGMENTA_E2E_LISTEN (default 127.0.0.1:6869),
  * FIGMENTA_E2E_SHOTS (screenshots and measurement JSON, default packages/app/test-results/e2e-figmenta),
- * FIGMENTA_E2E_ONLY=timing|contract to run one of the two tests.
+ * FIGMENTA_E2E_ONLY=timing|contract|draft to run one of the three tests.
  *
  * The daemon is started with `paseo daemon start --home <home>` and stopped with
  * `paseo daemon stop --home <home>` in afterAll, pass or fail. The agent is a Claude agent whose
  * binary is a stub that only answers `--version` (see harness.ts): the menu is the real Claude
- * manifest, no Claude Code runs, no credential is read, and the agent is never prompted.
+ * manifest, no Claude Code runs, no credential is read, and the agent is never prompted. The
+ * "draft" test seeds its own two agents: `/clear` archives the first one, and its draft is never
+ * submitted.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -30,6 +32,7 @@ import {
   prepareContext,
   seedClaudeAgent,
   startIsolatedDaemon,
+  type DefaultAllow,
   type IsolatedDaemon,
   type SeededAgent,
 } from "./harness";
@@ -98,7 +101,7 @@ async function embedProbe(page: Page): Promise<EmbedProbe> {
 
 async function simSetAndPost(
   page: Page,
-  next: { models?: string[]; hidden?: boolean },
+  next: { models?: string[]; hidden?: boolean; defaultAllow?: DefaultAllow | null },
   reason: string,
 ): Promise<void> {
   await page.evaluate(
@@ -147,7 +150,7 @@ async function openParent(page: Page): Promise<void> {
 test("timing: Orchestra posting at the frame load and on the 60 s poll only (no handshake)", async ({
   browser,
 }) => {
-  test.skip(ONLY === "contract", "FIGMENTA_E2E_ONLY=contract");
+  test.skip(ONLY !== "" && ONLY !== "timing", `FIGMENTA_E2E_ONLY=${ONLY}`);
   test.setTimeout(REPOST_MS + 180_000);
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   await prepareContext(context, {
@@ -206,7 +209,7 @@ test("timing: Orchestra posting at the frame load and on the 60 s poll only (no 
 });
 
 test("contract: embed.ready handshake, allow list, hidden, shown again", async ({ browser }) => {
-  test.skip(ONLY === "timing", "FIGMENTA_E2E_ONLY=timing");
+  test.skip(ONLY !== "" && ONLY !== "contract", `FIGMENTA_E2E_ONLY=${ONLY}`);
   test.setTimeout(240_000);
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   await prepareContext(context, {
@@ -285,5 +288,130 @@ test("contract: embed.ready handshake, allow list, hidden, shown again", async (
     );
   } finally {
     await context.close();
+  }
+});
+
+/**
+ * The command center's model rows for the query "model", by model id; the panel is closed again
+ * after. The model group is query-only, and "model" is in its keywords: an empty result means the
+ * group has no rows, not that the query missed it (the shown case below proves the same query).
+ */
+async function commandCenterModelRows(page: Page, screenshot: string): Promise<string[]> {
+  const frame = chat(page);
+  await frame.getByRole("textbox", { name: "Message agent..." }).first().click();
+  await page.keyboard.press("ControlOrMeta+K");
+  const input = frame.getByTestId("command-center-input").first();
+  await expect(input).toBeVisible();
+  await input.fill("model");
+  await expect(frame.getByTestId("command-center-results").first()).toBeVisible();
+  const rows = frame.locator('[data-testid^="command-center-model-"]');
+  const ids = await rows.evaluateAll((nodes) =>
+    nodes.map((node) => (node.getAttribute("data-testid") ?? "").split(":").pop() ?? ""),
+  );
+  await page.screenshot({ path: path.join(SHOTS_DIR, screenshot) });
+  await page.keyboard.press("Escape");
+  await expect(input).toHaveCount(0);
+  return ids;
+}
+
+test('draft: /clear and unnamed agents follow the person\'s default (agentId "*")', async ({
+  browser,
+}) => {
+  test.skip(ONLY !== "" && ONLY !== "draft", `FIGMENTA_E2E_ONLY=${ONLY}`);
+  test.setTimeout(300_000);
+  // Its own agents: /clear archives the first, the second is one Orchestra never names.
+  const cleared = await seedClaudeAgent();
+  const unnamed = await seedClaudeAgent();
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  await prepareContext(context, {
+    serverId: daemon!.serverId,
+    agentId: cleared.agentId,
+    models: SONNET_ONLY,
+    // A fleet person with the switch off: the agent hidden, and the person's default hidden.
+    hidden: true,
+    defaultAllow: { models: [], hidden: true },
+    timing: { repostAfterMs: 30 * 60_000, answerReady: true },
+  });
+  const page = await context.newPage();
+  const frame = chat(page);
+  const trigger = frame.getByTestId("combined-model-selector");
+  const input = frame.getByRole("textbox", { name: "Message agent..." }).first();
+  try {
+    await page.goto(`${ORCHESTRA_ORIGIN}${PARENT_PATH}`);
+    await expect(frame.getByTestId("agent-thinking-selector")).toBeVisible({ timeout: 90_000 });
+    await expect
+      .poll(async () => (await simLog(page)).filter((entry) => entry.kind === "ready").length)
+      .toBe(1);
+    await expect(trigger).toHaveCount(0);
+    expect(await frame.locator("body").innerText()).not.toMatch(MODEL_NAMES);
+    await shot(page, "draft-1-agent-hidden.png");
+
+    // /clear: the agent is archived, its tab becomes a draft (agent-panel.tsx, the path B1 found).
+    await expect(input).toBeEditable({ timeout: 30_000 });
+    await input.fill("/clear");
+    await expect(input).toHaveValue("/clear");
+    await input.press("Enter");
+    // The draft marker: the import pill lives only on a draft composer.
+    await expect(frame.getByTestId("composer-import-agent-pill")).toBeVisible({ timeout: 30_000 });
+    const draftUrl = chatFrame(page).url();
+    await expect(input).toBeVisible();
+    await expect(input).toHaveValue("");
+    await expect(frame.getByTestId("agent-thinking-selector")).toBeVisible();
+    await expect(frame.getByTestId("mode-control")).toBeVisible();
+    await expect(trigger).toHaveCount(0);
+    expect(await frame.locator("body").innerText()).not.toMatch(MODEL_NAMES);
+    await shot(page, "draft-2-cleared-hidden-desktop.png");
+    expect(await commandCenterModelRows(page, "draft-3-cleared-hidden-command-center.png")).toEqual(
+      [],
+    );
+
+    // Compact form factor: the draft's model sheet trigger carried the model name.
+    await page.setViewportSize({ width: 420, height: 820 });
+    await expect(frame.getByTestId("agent-thinking-selector")).toBeVisible();
+    await expect(trigger).toHaveCount(0);
+    expect(await frame.locator("body").innerText()).not.toMatch(MODEL_NAMES);
+    await shot(page, "draft-4-cleared-hidden-compact.png");
+    await page.setViewportSize({ width: 1280, height: 800 });
+
+    // The default, shown and narrowed: the draft menu and its command center list Sonnet 5 only.
+    await simSetAndPost(page, { defaultAllow: { models: SONNET_ONLY } }, "default-sonnet");
+    await expect(trigger).toBeVisible();
+    expect(await openMenuRows(page, "draft-5-default-sonnet-menu.png")).toEqual(SONNET_ONLY);
+    expect(await commandCenterModelRows(page, "draft-6-default-sonnet-command-center.png")).toEqual(
+      SONNET_ONLY,
+    );
+
+    // An agent Orchestra never names (what the draft creates, or a session switch) takes it too.
+    await page.evaluate(
+      (agentId) =>
+        (
+          window as unknown as { __orchestraSim: { openUnnamed(id: string): void } }
+        ).__orchestraSim.openUnnamed(agentId),
+      unnamed.agentId,
+    );
+    await expect
+      .poll(async () => (await simLog(page)).filter((entry) => entry.kind === "ready").length, {
+        timeout: 90_000,
+      })
+      .toBe(2);
+    await expect(trigger).toBeVisible({ timeout: 90_000 });
+    // The agent route resolves to that agent's own workspace: not the draft, not its workspace.
+    await expect(frame.getByTestId("composer-import-agent-pill")).toHaveCount(0);
+    expect(chatFrame(page).url()).not.toBe(draftUrl);
+    expect(await openMenuRows(page, "draft-7-unnamed-agent-sonnet.png")).toEqual(SONNET_ONLY);
+    await simSetAndPost(page, { defaultAllow: { models: [], hidden: true } }, "default-hidden");
+    await expect(trigger).toHaveCount(0);
+    await expect(frame.getByTestId("agent-thinking-selector")).toBeVisible();
+    expect(await frame.locator("body").innerText()).not.toMatch(MODEL_NAMES);
+    await shot(page, "draft-8-unnamed-agent-hidden.png");
+
+    writeFileSync(
+      path.join(SHOTS_DIR, "draft-log.json"),
+      `${JSON.stringify({ parentLog: await simLog(page), probe: await embedProbe(page) }, null, 2)}\n`,
+    );
+  } finally {
+    await context.close();
+    await cleared.cleanup();
+    await unnamed.cleanup();
   }
 });

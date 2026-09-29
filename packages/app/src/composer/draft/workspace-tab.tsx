@@ -23,6 +23,7 @@ import type { Agent } from "@/stores/session-store";
 import { useWorkspaceFields } from "@/stores/session-store-hooks";
 import { useWorkspaceDraftSubmissionStore } from "@/stores/workspace-draft-submission-store";
 import { useAgentControlCommandCenterActions } from "@/command-center/agent-control-registration";
+import { useEmbedDraftModelsAllowMenu } from "@/figmenta/models-allow";
 import { encodeImages } from "@/utils/encode-images";
 import type { WorkspaceFileOpenRequest } from "@/workspace/file-open";
 import { shouldAutoFocusWorkspaceDraftComposer } from "@/screens/workspace/workspace-draft-pane-focus";
@@ -518,6 +519,12 @@ export function WorkspaceDraftAgentTab({
     () => resolveTurnPresentation(TURN_LIVENESS_IDLE, pendingMessageSubmissions.length > 0),
     [pendingMessageSubmissions],
   );
+  // Figmenta embed: the command center's model group of a draft follows the person's default
+  // (`maestro.models.allow` with agentId "*"), like the draft's composer (docs/FIGMENTA.md).
+  const embedDraftModelMenu = useEmbedDraftModelsAllowMenu({
+    providers: composerState.modelSelectorProviders,
+    profiles: null,
+  });
   useAgentControlCommandCenterActions({
     sourceId: `draft:${serverId}:${tabId}`,
     enabled: isPaneFocused && !isSubmitting,
@@ -527,7 +534,7 @@ export function WorkspaceDraftAgentTab({
       provider: draftProvider,
       providerDefinitions: draftProviderDefinitions,
       models: {
-        providers: composerState.modelSelectorProviders,
+        providers: embedDraftModelMenu.providers,
         selectedProvider: draftProvider,
         selectedModelId: composerState.effectiveModelId,
         select: composerState.setProviderAndModelFromUser,

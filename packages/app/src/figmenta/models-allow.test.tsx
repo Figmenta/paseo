@@ -11,6 +11,7 @@ import { installEmbedBridge, resetEmbedModeCache } from "./embed";
 import {
   filterProfilesByModelsAllow,
   filterProvidersByModelsAllow,
+  useEmbedDraftModelsAllowMenu,
   useEmbedModelsAllowMenu,
 } from "./models-allow";
 
@@ -288,5 +289,84 @@ describe("useEmbedModelsAllowMenu", () => {
 
     expect(hook.result.current.hidden).toBe(false);
     expect(hook.result.current.providers).toBe(providers);
+  });
+});
+
+describe('the person\'s default (agentId "*")', () => {
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    window.history.replaceState({}, "", "/agents-ui/?embed=1");
+    resetEmbedModeCache();
+    installEmbedBridge();
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  function post(data: unknown): void {
+    act(() => {
+      window.dispatchEvent(new MessageEvent("message", { data, origin: window.location.origin }));
+    });
+  }
+
+  function renderDraftMenu() {
+    const providers = [claude(...CLAUDE_ROWS)];
+    const profiles = profilePicker();
+    const hook = renderHook(() => useEmbedDraftModelsAllowMenu({ providers, profiles }));
+    return { hook, providers, profiles };
+  }
+
+  function renderAgentMenu(agentId: string) {
+    const providers = [claude(...CLAUDE_ROWS)];
+    const profiles = profilePicker();
+    return renderHook(() => useEmbedModelsAllowMenu({ agentId, providers, profiles }));
+  }
+
+  it("a draft's menu is untouched while there is no default, whatever the agents got", () => {
+    const { hook, providers, profiles } = renderDraftMenu();
+
+    post({ type: "maestro.models.allow", agentId: "a1", models: [], hidden: true });
+
+    expect(hook.result.current.hidden).toBe(false);
+    expect(hook.result.current.providers).toBe(providers);
+    expect(hook.result.current.profiles).toBe(profiles);
+  });
+
+  it("a draft is hidden by a hidden default", () => {
+    const { hook } = renderDraftMenu();
+
+    post({ type: "maestro.models.allow", agentId: "*", models: [], hidden: true });
+
+    expect(hook.result.current.hidden).toBe(true);
+    expect(hook.result.current.providers).toEqual([]);
+    expect(hook.result.current.profiles?.rows.map((entry) => entry.id)).toEqual(["p-plan"]);
+  });
+
+  it("a draft is narrowed by a shown default, and follows its replacement", () => {
+    const { hook } = renderDraftMenu();
+    post({ type: "maestro.models.allow", agentId: "*", models: [], hidden: true });
+
+    post({ type: "maestro.models.allow", agentId: "*", models: ["claude-sonnet-5"] });
+
+    expect(hook.result.current.hidden).toBe(false);
+    expect(rowIds(hook.result.current.providers)).toEqual([["claude-sonnet-5"]]);
+    expect(hook.result.current.profiles?.rows.map((entry) => entry.id)).toEqual([
+      "p-sonnet",
+      "p-plan",
+    ]);
+  });
+
+  it("an agent Orchestra never named takes the default; a named one keeps its own", () => {
+    const unnamed = renderAgentMenu("created-after-clear");
+    const named = renderAgentMenu("a1");
+    post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-opus-5"] });
+
+    post({ type: "maestro.models.allow", agentId: "*", models: [], hidden: true });
+
+    expect(unnamed.result.current.hidden).toBe(true);
+    expect(unnamed.result.current.providers).toEqual([]);
+    expect(named.result.current.hidden).toBe(false);
+    expect(rowIds(named.result.current.providers)).toEqual([["claude-opus-5"]]);
   });
 });

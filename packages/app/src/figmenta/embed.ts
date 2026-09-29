@@ -76,7 +76,8 @@ export function resetEmbedModeCache(): void {
 // same-origin only:
 //   { type: "maestro.composer.insert", text, agentId }  append, that agent only
 //   { type: "maestro.composer.lock", agentId, locked, label }  read-only bar
-//   { type: "maestro.models.allow", agentId, models, hidden? }  that agent's model menu
+//   { type: "maestro.models.allow", agentId, models, hidden? }  that agent's model menu;
+//                                  agentId "*" = the person's default: drafts, unnamed agents
 //   { type: "maestro.theme", theme }           hot dark/light switch
 // One goes back out, to the parent, same origin: `{ type: "maestro.embed.ready" }`, once per
 // document, as soon as the listener is up. The listener is installed by a React effect, after the
@@ -306,23 +307,39 @@ export interface EmbedModelsAllow {
 }
 
 /**
- * agentId → Orchestra's word on that agent's model selector. Absent = no filter, the
- * menu Paseo would show anyway. There is no message that removes it: a new one
- * replaces it whole (`hidden` included), a reload of the frame forgets it.
+ * The agentId of the person-level default. Orchestra names only the agents it knows; a draft
+ * (`/clear`, fork, new agent) has no agentId yet, and the agent it then creates has one Orchestra
+ * never named. Both take this entry. Real agent ids are never "*".
+ */
+export const EMBED_MODELS_ALLOW_DEFAULT_ID = "*";
+
+/**
+ * agentId → Orchestra's word on that agent's model selector, plus the default under "*".
+ * Absent = no filter, the menu Paseo would show anyway. There is no message that removes an
+ * entry: a new one replaces it whole (`hidden` included), a reload of the frame forgets it.
  */
 const modelAllowLists = new Map<string, EmbedModelsAllow>();
 const modelAllowListeners = new Set<(agentId: string) => void>();
 
+/** Its own entry, else the person's default, else nothing: an agent's own word always wins. */
+function resolveModelsAllow(agentId: string): EmbedModelsAllow | null {
+  return modelAllowLists.get(agentId) ?? modelAllowLists.get(EMBED_MODELS_ALLOW_DEFAULT_ID) ?? null;
+}
+
 /**
- * Orchestra's word on this agent's model selector, or null when it sent nothing for it.
- * Always null outside the embed. Same object until a different state arrives.
+ * Orchestra's word on this agent's model selector: its own, else the default ("*"), else null
+ * (no filter). Pass `EMBED_MODELS_ALLOW_DEFAULT_ID` for a draft. Always null outside the embed.
+ * Same object until a different state arrives.
  */
 export function readEmbedModelsAllow(agentId: string): EmbedModelsAllow | null {
   if (!isEmbedMode()) return null;
-  return modelAllowLists.get(agentId) ?? null;
+  return resolveModelsAllow(agentId);
 }
 
-/** Called with the agentId whose list changed; read it with `readEmbedModelsAllow`. */
+/**
+ * Called with the agentId whose entry changed ("*" = the default: every draft and every agent
+ * without its own entry); read the result with `readEmbedModelsAllow`.
+ */
 export function subscribeToEmbedModelsAllow(listener: (agentId: string) => void): () => void {
   modelAllowListeners.add(listener);
   return () => {
@@ -357,7 +374,8 @@ function sameModelsAllow(
  * the previous state (or no filter) stays: no usable agentId; `hidden` present but not a
  * boolean; `models` not an array, or with an entry that is not a non-empty string; an empty
  * array while the selector is shown, since a menu with no rows helps nobody. With
- * `hidden: true` the list plays no part, so an empty one is accepted.
+ * `hidden: true` the list plays no part, so an empty one is accepted. agentId "*" is stored
+ * the same way, as the default: same checks, same whole replacement.
  */
 function applyEmbedModelsAllow(data: {
   agentId?: unknown;
