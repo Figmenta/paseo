@@ -22,7 +22,7 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
-import type { BrowserContext, Route } from "@playwright/test";
+import type { BrowserContext, Frame, FrameLocator, Page, Route } from "@playwright/test";
 import { createNodeWebSocketFactory } from "../e2e/support/helpers/node-ws-factory";
 
 export const ORCHESTRA_ORIGIN = "https://orchestra.figmenta.site";
@@ -170,9 +170,12 @@ export interface SeededAgent {
 
 /**
  * A Claude agent on Sonnet 5, as a fleet session of class `normal` runs, created without an
- * initial prompt: it never runs a turn.
+ * initial prompt: it never runs a turn. `modeId` / `thinkingOptionId` seed an agent created before
+ * the owner narrowed its modes and efforts.
  */
-export async function seedClaudeAgent(): Promise<SeededAgent> {
+export async function seedClaudeAgent(
+  initial: { modeId?: string; thinkingOptionId?: string } = {},
+): Promise<SeededAgent> {
   const dir = await mkdtemp(path.join(tmpdir(), "figmenta-model-switch-"));
   await writeFile(path.join(dir, "README.md"), "# model switch e2e\n");
   const client = await connectClient();
@@ -189,6 +192,7 @@ export async function seedClaudeAgent(): Promise<SeededAgent> {
       workspaceId: workspace.id,
       title: "Embed e2e",
       model: "claude-sonnet-5",
+      ...initial,
     });
     return {
       agentId: agent.id,
@@ -209,6 +213,10 @@ export async function seedClaudeAgent(): Promise<SeededAgent> {
 export interface DefaultAllow {
   models: string[];
   hidden?: boolean;
+  /** Allowed permission-mode ids; absent = not sent (no filter). */
+  modes?: string[];
+  /** Allowed effort ids; absent = not sent (no filter). */
+  efforts?: string[];
 }
 
 /** How the simulated Orchestra page behaves. */
@@ -225,6 +233,10 @@ interface ParentInput {
   models: string[];
   /** The agent's `hidden` at load; absent = not sent. */
   hidden?: boolean;
+  /** The agent's allowed permission modes at load; absent = not sent. */
+  modes?: string[];
+  /** The agent's allowed efforts at load; absent = not sent. */
+  efforts?: string[];
   /** The person's default at load; absent = no "*" message, as before the default existed. */
   defaultAllow?: DefaultAllow;
   timing: ParentTiming;
@@ -249,8 +261,17 @@ function parentHtml(input: ParentInput): string {
   const state = {
     models: boot.models,
     hidden: boot.hidden,
+    modes: boot.modes,
+    efforts: boot.efforts,
     defaultAllow: boot.defaultAllow ?? null,
   };
+  // hidden, modes and efforts go out only when set, as Orchestra omits what it does not decide.
+  function withOptional(msg, source) {
+    for (const key of ["hidden", "modes", "efforts"]) {
+      if (source[key] !== undefined) msg[key] = source[key];
+    }
+    return msg;
+  }
   function send(msg, reason) {
     frame.contentWindow.postMessage(msg, window.location.origin);
     log.push({ at: Date.now(), kind: "post", reason, msg });
@@ -258,12 +279,10 @@ function parentHtml(input: ParentInput): string {
   function post(reason) {
     if (!frame.contentWindow) return;
     const msg = { type: "maestro.models.allow", agentId: boot.agentId, models: state.models };
-    if (state.hidden !== undefined) msg.hidden = state.hidden;
-    send(msg, reason);
+    send(withOptional(msg, state), reason);
     if (!state.defaultAllow) return;
     const fallback = { type: "maestro.models.allow", agentId: "*", models: state.defaultAllow.models };
-    if (state.defaultAllow.hidden !== undefined) fallback.hidden = state.defaultAllow.hidden;
-    send(fallback, reason);
+    send(withOptional(fallback, state.defaultAllow), reason);
   }
   window.addEventListener("message", (event) => {
     if (event.origin !== window.location.origin) return;
@@ -398,4 +417,65 @@ export async function prepareContext(context: BrowserContext, input: ParentInput
     JSON.stringify([host]),
   );
   await context.addInitScript(frameProbe);
+}
+
+export interface SimLogEntry {
+  at: number;
+  kind: "load" | "post" | "ready";
+  reason?: string;
+  fromFrame?: boolean;
+  msg?: Record<string, unknown>;
+}
+
+/** The embed frame, for locators. */
+export function chat(page: Page): FrameLocator {
+  return page.frameLocator("#chat");
+}
+
+/** The embed frame, for evaluation and its URL. */
+export function chatFrame(page: Page): Frame {
+  const frame = page
+    .frames()
+    .find((entry) => new URL(entry.url()).pathname.startsWith("/agents-ui"));
+  if (!frame) throw new Error("The embed frame is not attached");
+  return frame;
+}
+
+/** What the simulated Orchestra page did, in order. */
+export async function simLog(page: Page): Promise<SimLogEntry[]> {
+  return page.evaluate(
+    () => (window as unknown as { __orchestraSim: { log: SimLogEntry[] } }).__orchestraSim.log,
+  );
+}
+
+/** Plays Orchestra's checkboxes: change what the page sends, then post it now. */
+export async function simSetAndPost(
+  page: Page,
+  next: {
+    models?: string[];
+    hidden?: boolean;
+    modes?: string[];
+    efforts?: string[];
+    defaultAllow?: DefaultAllow | null;
+  },
+  reason: string,
+): Promise<void> {
+  await page.evaluate(
+    ({ state, why }) => {
+      const sim = (
+        window as unknown as {
+          __orchestraSim: { set(next: unknown): void; post(reason: string): void };
+        }
+      ).__orchestraSim;
+      sim.set(state);
+      sim.post(why);
+    },
+    { state: next, why: reason },
+  );
+}
+
+/** Parks the pointer off the composer, so no hover tooltip sits in the screenshot. */
+export async function shot(page: Page, name: string): Promise<void> {
+  await page.mouse.move(2, 2);
+  await page.screenshot({ path: path.join(SHOTS_DIR, name) });
 }

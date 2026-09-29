@@ -12,7 +12,8 @@
  * measure an older build), FIGMENTA_E2E_REPOST_MS (default 60000, Orchestra's state poll),
  * FIGMENTA_E2E_HOME (default /tmp/ph-model-switch), FIGMENTA_E2E_LISTEN (default 127.0.0.1:6869),
  * FIGMENTA_E2E_SHOTS (screenshots and measurement JSON, default packages/app/test-results/e2e-figmenta),
- * FIGMENTA_E2E_ONLY=timing|contract|draft|schedule to run one of the four tests.
+ * FIGMENTA_E2E_ONLY=timing|contract|draft|schedule to run one of the four tests (modes-efforts.spec.ts,
+ * same harness, adds modes|modes-schedule).
  *
  * The daemon is started with `paseo daemon start --home <home>` and stopped with
  * `paseo daemon stop --home <home>` in afterAll, pass or fail. The agent is a Claude agent whose
@@ -23,16 +24,20 @@
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { expect, test, type Frame, type FrameLocator, type Page } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import {
   ORCHESTRA_ORIGIN,
   PARENT_PATH,
   SHOTS_DIR,
   EMBED_DIST,
+  chat,
+  chatFrame,
   prepareContext,
   seedClaudeAgent,
+  shot,
+  simLog,
+  simSetAndPost,
   startIsolatedDaemon,
-  type DefaultAllow,
   type IsolatedDaemon,
   type SeededAgent,
 } from "./harness";
@@ -62,59 +67,14 @@ test.afterAll(async () => {
   }
 });
 
-interface SimLogEntry {
-  at: number;
-  kind: "load" | "post" | "ready";
-  reason?: string;
-  fromFrame?: boolean;
-  msg?: Record<string, unknown>;
-}
-
 interface EmbedProbe {
   bridgeInstalledAt: number | null;
   received: Array<{ at: number; data: { type?: string } | null; bridgeListening: boolean }>;
 }
 
-function chat(page: Page): FrameLocator {
-  return page.frameLocator("#chat");
-}
-
-function chatFrame(page: Page): Frame {
-  const frame = page
-    .frames()
-    .find((entry) => new URL(entry.url()).pathname.startsWith("/agents-ui"));
-  if (!frame) throw new Error("The embed frame is not attached");
-  return frame;
-}
-
-async function simLog(page: Page): Promise<SimLogEntry[]> {
-  return page.evaluate(
-    () => (window as unknown as { __orchestraSim: { log: SimLogEntry[] } }).__orchestraSim.log,
-  );
-}
-
 async function embedProbe(page: Page): Promise<EmbedProbe> {
   return chatFrame(page).evaluate(
     () => (window as unknown as { __embedProbe: EmbedProbe }).__embedProbe,
-  );
-}
-
-async function simSetAndPost(
-  page: Page,
-  next: { models?: string[]; hidden?: boolean; defaultAllow?: DefaultAllow | null },
-  reason: string,
-): Promise<void> {
-  await page.evaluate(
-    ({ state, why }) => {
-      const sim = (
-        window as unknown as {
-          __orchestraSim: { set(next: unknown): void; post(reason: string): void };
-        }
-      ).__orchestraSim;
-      sim.set(state);
-      sim.post(why);
-    },
-    { state: next, why: reason },
   );
 }
 
@@ -131,12 +91,6 @@ async function openMenuRows(page: Page, screenshot: string): Promise<string[]> {
   await page.keyboard.press("Escape");
   await expect(rows).toHaveCount(0);
   return ids;
-}
-
-/** Parks the pointer off the composer, so no hover tooltip sits in the screenshot. */
-async function shot(page: Page, name: string): Promise<void> {
-  await page.mouse.move(2, 2);
-  await page.screenshot({ path: path.join(SHOTS_DIR, name) });
 }
 
 async function openParent(page: Page): Promise<void> {
