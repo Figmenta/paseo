@@ -231,7 +231,62 @@ describe("useEmbedModelsAllowMenu", () => {
     const { hook, providers } = renderMenu("a1");
 
     post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-sonnet-5"] });
+    post({ type: "maestro.models.allow", agentId: "a1", models: [], hidden: true });
 
+    expect(hook.result.current.providers).toBe(providers);
+    expect(hook.result.current.hidden).toBe(false);
+  });
+
+  it("is not hidden while Orchestra sent nothing, nor with a plain list", () => {
+    const { hook } = renderMenu("a1");
+    expect(hook.result.current.hidden).toBe(false);
+
+    post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-sonnet-5"] });
+
+    expect(hook.result.current.hidden).toBe(false);
+  });
+
+  it("hidden: no providers, only the profiles that name no model", () => {
+    const { hook } = renderMenu("a1");
+
+    post({
+      type: "maestro.models.allow",
+      agentId: "a1",
+      models: ["claude-sonnet-5"],
+      hidden: true,
+    });
+
+    expect(hook.result.current.hidden).toBe(true);
+    expect(hook.result.current.providers).toEqual([]);
+    expect(hook.result.current.profiles?.rows.map((entry) => entry.id)).toEqual(["p-plan"]);
+  });
+
+  it("hidden, then shown again: the menu comes back narrowed by the new list", () => {
+    const { hook } = renderMenu("a1");
+    post({ type: "maestro.models.allow", agentId: "a1", models: [], hidden: true });
+    expect(hook.result.current.hidden).toBe(true);
+
+    post({
+      type: "maestro.models.allow",
+      agentId: "a1",
+      models: ["claude-sonnet-5"],
+      hidden: false,
+    });
+
+    expect(hook.result.current.hidden).toBe(false);
+    expect(rowIds(hook.result.current.providers)).toEqual([["claude-sonnet-5"]]);
+    expect(hook.result.current.profiles?.rows.map((entry) => entry.id)).toEqual([
+      "p-sonnet",
+      "p-plan",
+    ]);
+  });
+
+  it("hides another agent's selector only for that agent", () => {
+    const { hook, providers } = renderMenu("a2");
+
+    post({ type: "maestro.models.allow", agentId: "a1", models: [], hidden: true });
+
+    expect(hook.result.current.hidden).toBe(false);
     expect(hook.result.current.providers).toBe(providers);
   });
 });

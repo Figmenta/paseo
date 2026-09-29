@@ -131,6 +131,12 @@ interface ControlledAgentControlsProps {
   modeControl?: AgentModeControlValue | null;
   modelSelectorServerId?: string | null;
   isCompactLayout?: boolean;
+  /**
+   * Figmenta embed (`maestro.models.allow` with `hidden: true`, docs/FIGMENTA.md): no model
+   * selector, desktop or compact; the compact form factor falls back to the toolbar so effort
+   * and permission mode, which live inside the model sheet there, stay reachable.
+   */
+  hideModelSelector?: boolean;
 }
 
 export interface DraftAgentControlsProps {
@@ -328,6 +334,23 @@ function buildFallbackModelSelectorProviders(
   ];
 }
 
+/**
+ * The compact form factor puts the model, effort and mode in one sheet opened from the model
+ * trigger. Figmenta embed: without a model selector (`hideModelSelector`, docs/FIGMENTA.md) there
+ * is no such trigger, so the toolbar layout is used, where effort and mode have their own.
+ */
+function resolveModelSelectorLayout(input: {
+  canPickModel: boolean;
+  hideModelSelector: boolean | undefined;
+  isCompact: boolean;
+}): { canSelectModel: boolean; modelSheetLayout: boolean } {
+  const hidden = input.hideModelSelector === true;
+  return {
+    canSelectModel: input.canPickModel && !hidden,
+    modelSheetLayout: input.isCompact && !hidden,
+  };
+}
+
 function makeBadgePressableStyle(
   baseStyle: StyleProp<ViewStyle>,
   disabledStyle: StyleProp<ViewStyle>,
@@ -501,6 +524,7 @@ function ControlledAgentControls({
   modeControl,
   modelSelectorServerId = null,
   isCompactLayout,
+  hideModelSelector,
 }: ControlledAgentControlsProps) {
   const { theme } = useUnistyles();
   const { t } = useTranslation();
@@ -521,7 +545,11 @@ function ControlledAgentControls({
   const canSelectProvider = Boolean(
     onSelectProvider && providerOptions && providerOptions.length > 0,
   );
-  const canSelectModel = Boolean(onSelectModel);
+  const { canSelectModel, modelSheetLayout } = resolveModelSelectorLayout({
+    canPickModel: Boolean(onSelectModel),
+    hideModelSelector,
+    isCompact,
+  });
   const canSelectThinking = Boolean(
     onSelectThinkingOption && thinkingOptions && thinkingOptions.length > 0,
   );
@@ -733,7 +761,7 @@ function ControlledAgentControls({
   return (
     <ComposerControlLayoutProvider value={layoutContextValue}>
       <View style={styles.container} onLayout={handleLayout}>
-        {!isCompact ? (
+        {!modelSheetLayout ? (
           <DesktopAgentControlsContent
             provider={provider}
             providerOptions={providerOptions}
@@ -1650,7 +1678,8 @@ export const AgentControls = memo(function AgentControls({
     target: profileTarget,
   });
   // Figmenta embed: Orchestra's `maestro.models.allow` narrows this agent's menu and the
-  // command center's model group; without a list both are untouched (docs/FIGMENTA.md).
+  // command center's model group, or hides both (`hidden`); without a message both are
+  // untouched (docs/FIGMENTA.md).
   const embedModelMenu = useEmbedModelsAllowMenu({
     agentId,
     providers: agentModelSelectorProviders,
@@ -1810,6 +1839,7 @@ export const AgentControls = memo(function AgentControls({
         modeControl={modeControl}
         modelSelectorServerId={serverId}
         isCompactLayout={isCompactLayout}
+        hideModelSelector={embedModelMenu.hidden}
       />
     </>
   );

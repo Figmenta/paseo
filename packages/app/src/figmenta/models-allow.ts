@@ -5,15 +5,20 @@
  * Not part of upstream Paseo. While Orchestra holds a list for an agent, every surface that
  * picks a model for it (the composer's model menu, desktop and compact, and the command
  * center's model group) shows only the rows whose model id is in the list, and the menu's
- * profile rows that would switch to another model are hidden. The agent's current model is
- * never changed from here, even when the list leaves it out: the real defence is the
- * daemon's, this is the menu. Without a list, or outside the embed, everything passes through
- * untouched.
+ * profile rows that would switch to another model are hidden. With `hidden: true` there is no
+ * model selector at all: no trigger (so not even the current model's name), no sheet, no model
+ * group in the command center, no profile that names a model; effort and permission mode stay.
+ * The agent's current model is never changed from here, even when the list leaves it out: the
+ * real defence is the daemon's, this is the menu. Without a list, or outside the embed,
+ * everything passes through untouched.
  */
 import { useMemo } from "react";
 import type { AgentProfilePicker } from "@/agent-profiles";
 import { useEmbedModelsAllow } from "@/figmenta/embed";
 import type { ProviderSelectorProvider } from "@/provider-selection/provider-selection";
+
+const NO_MODELS: readonly string[] = [];
+const NO_PROVIDERS: ProviderSelectorProvider[] = [];
 
 /**
  * Keeps, in every provider that lists models, only the rows whose `modelId` is allowed.
@@ -54,21 +59,32 @@ export function filterProfilesByModelsAllow(
   };
 }
 
-/** The model menu of one agent, narrowed by Orchestra's list for that agent. */
+/**
+ * The model menu of one agent, narrowed by Orchestra's word for that agent. `hidden` = render
+ * no model selector: `providers` is then empty (the command center builds no model group from
+ * it) and only the profiles that name no model are left.
+ */
 export function useEmbedModelsAllowMenu(input: {
   agentId: string;
   providers: ProviderSelectorProvider[];
   profiles: AgentProfilePicker | null;
-}): { providers: ProviderSelectorProvider[]; profiles: AgentProfilePicker | null } {
+}): {
+  providers: ProviderSelectorProvider[];
+  profiles: AgentProfilePicker | null;
+  hidden: boolean;
+} {
   const { agentId, providers, profiles } = input;
-  const allowed = useEmbedModelsAllow(agentId);
+  const allow = useEmbedModelsAllow(agentId);
+  const hidden = allow?.hidden === true;
+  // While hidden no model is allowed: the list Orchestra sent alongside plays no part.
+  const allowed = hidden ? NO_MODELS : (allow?.models ?? null);
   const allowedProviders = useMemo(
-    () => filterProvidersByModelsAllow(providers, allowed),
-    [allowed, providers],
+    () => (hidden ? NO_PROVIDERS : filterProvidersByModelsAllow(providers, allowed)),
+    [allowed, hidden, providers],
   );
   const allowedProfiles = useMemo(
     () => filterProfilesByModelsAllow(profiles, allowed),
     [allowed, profiles],
   );
-  return { providers: allowedProviders, profiles: allowedProfiles };
+  return { providers: allowedProviders, profiles: allowedProfiles, hidden };
 }

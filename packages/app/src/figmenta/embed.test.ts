@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_COMPOSER_LOCK_LABEL,
+  EMBED_READY_TYPE,
   installEmbedBridge,
   lastAgentRoute,
   readEmbedComposerLock,
@@ -279,10 +280,12 @@ describe("maestro.models.allow routing", () => {
     window.dispatchEvent(new MessageEvent("message", { data, origin }));
   }
 
+  const shown = (models: string[]) => ({ models, hidden: false });
+
   it("stores the list for the agent it names and no other", () => {
     post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-sonnet-5"] });
 
-    expect(readEmbedModelsAllow("a1")).toEqual(["claude-sonnet-5"]);
+    expect(readEmbedModelsAllow("a1")).toEqual(shown(["claude-sonnet-5"]));
     expect(readEmbedModelsAllow("a2")).toBeNull();
   });
 
@@ -296,8 +299,8 @@ describe("maestro.models.allow routing", () => {
       models: ["claude-opus-5", "claude-sonnet-5"],
     });
 
-    expect(readEmbedModelsAllow("a1")).toEqual(["claude-opus-5", "claude-sonnet-5"]);
-    expect(readEmbedModelsAllow("a2")).toEqual(["claude-sonnet-5"]);
+    expect(readEmbedModelsAllow("a1")).toEqual(shown(["claude-opus-5", "claude-sonnet-5"]));
+    expect(readEmbedModelsAllow("a2")).toEqual(shown(["claude-sonnet-5"]));
   });
 
   it("ignores a list without a usable agentId", () => {
@@ -307,6 +310,7 @@ describe("maestro.models.allow routing", () => {
     post({ type: "maestro.models.allow", models: ["claude-sonnet-5"] });
     post({ type: "maestro.models.allow", agentId: "", models: ["claude-sonnet-5"] });
     post({ type: "maestro.models.allow", agentId: 7, models: ["claude-sonnet-5"] });
+    post({ type: "maestro.models.allow", agentId: "", models: [], hidden: true });
 
     expect(readEmbedModelsAllow("")).toBeNull();
     expect(readEmbedModelsAllow("7")).toBeNull();
@@ -325,21 +329,24 @@ describe("maestro.models.allow routing", () => {
       ["claude-opus-5", null],
       ["claude-opus-5", ""],
     ]) {
-      post({ type: "maestro.models.allow", agentId: "a1", models });
-      post({ type: "maestro.models.allow", agentId: "a2", models });
+      for (const hidden of [undefined, false, true]) {
+        post({ type: "maestro.models.allow", agentId: "a1", models, hidden });
+        post({ type: "maestro.models.allow", agentId: "a2", models, hidden });
+      }
     }
 
-    expect(readEmbedModelsAllow("a1")).toEqual(["claude-sonnet-5"]);
+    expect(readEmbedModelsAllow("a1")).toEqual(shown(["claude-sonnet-5"]));
     expect(readEmbedModelsAllow("a2")).toBeNull();
   });
 
-  it("ignores an empty list: it neither empties the menu nor lifts the filter", () => {
+  it("ignores an empty list while shown: it neither empties the menu nor lifts the filter", () => {
     post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-sonnet-5"] });
 
     post({ type: "maestro.models.allow", agentId: "a1", models: [] });
+    post({ type: "maestro.models.allow", agentId: "a1", models: [], hidden: false });
     post({ type: "maestro.models.allow", agentId: "a2", models: [] });
 
-    expect(readEmbedModelsAllow("a1")).toEqual(["claude-sonnet-5"]);
+    expect(readEmbedModelsAllow("a1")).toEqual(shown(["claude-sonnet-5"]));
     expect(readEmbedModelsAllow("a2")).toBeNull();
   });
 
@@ -348,23 +355,35 @@ describe("maestro.models.allow routing", () => {
       { type: "maestro.models.allow", agentId: "a1", models: ["claude-sonnet-5"] },
       "https://elsewhere.example",
     );
+    post(
+      { type: "maestro.models.allow", agentId: "a2", models: [], hidden: true },
+      "https://elsewhere.example",
+    );
 
     expect(readEmbedModelsAllow("a1")).toBeNull();
+    expect(readEmbedModelsAllow("a2")).toBeNull();
   });
 
-  it("notifies on a new list, not on a repeat, and keeps the same array for a repeat", () => {
+  it("notifies on a new list, not on a repeat, and keeps the same object for a repeat", () => {
     const notified: string[] = [];
     unsubscribes.push(subscribeToEmbedModelsAllow((agentId) => notified.push(agentId)));
 
     post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-sonnet-5"] });
     const first = readEmbedModelsAllow("a1");
     post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-sonnet-5"] });
+    // An explicit `hidden: false` is the same state as no `hidden`.
+    post({
+      type: "maestro.models.allow",
+      agentId: "a1",
+      models: ["claude-sonnet-5"],
+      hidden: false,
+    });
     expect(readEmbedModelsAllow("a1")).toBe(first);
 
     post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-opus-5"] });
 
     expect(notified).toEqual(["a1", "a1"]);
-    expect(readEmbedModelsAllow("a1")).toEqual(["claude-opus-5"]);
+    expect(readEmbedModelsAllow("a1")).toEqual(shown(["claude-opus-5"]));
   });
 
   it("keeps its own copy: mutating the posted array changes nothing", () => {
@@ -373,7 +392,7 @@ describe("maestro.models.allow routing", () => {
 
     models.push("claude-opus-5");
 
-    expect(readEmbedModelsAllow("a1")).toEqual(["claude-sonnet-5"]);
+    expect(readEmbedModelsAllow("a1")).toEqual(shown(["claude-sonnet-5"]));
   });
 
   it("is inert outside the embed, even if a message reaches the document", () => {
@@ -383,8 +402,209 @@ describe("maestro.models.allow routing", () => {
 
     // The listener installed by an earlier test is still on the window.
     post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-sonnet-5"] });
+    post({ type: "maestro.models.allow", agentId: "a2", models: [], hidden: true });
 
     expect(readEmbedModelsAllow("a1")).toBeNull();
+    expect(readEmbedModelsAllow("a2")).toBeNull();
+  });
+});
+
+describe("maestro.models.allow hidden", () => {
+  const unsubscribes: Array<() => void> = [];
+
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    setLocation("?embed=1");
+    resetEmbedModeCache();
+    installEmbedBridge();
+    while (unsubscribes.length) unsubscribes.pop()?.();
+  });
+
+  function post(data: unknown): void {
+    window.dispatchEvent(new MessageEvent("message", { data, origin: window.location.origin }));
+  }
+
+  it("stores hidden:true for the agent it names and no other", () => {
+    post({
+      type: "maestro.models.allow",
+      agentId: "a1",
+      models: ["claude-sonnet-5"],
+      hidden: true,
+    });
+
+    expect(readEmbedModelsAllow("a1")).toEqual({ models: ["claude-sonnet-5"], hidden: true });
+    expect(readEmbedModelsAllow("a2")).toBeNull();
+  });
+
+  it("reads an absent or false hidden as a shown selector", () => {
+    post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-sonnet-5"] });
+    post({
+      type: "maestro.models.allow",
+      agentId: "a2",
+      models: ["claude-sonnet-5"],
+      hidden: false,
+    });
+
+    expect(readEmbedModelsAllow("a1")?.hidden).toBe(false);
+    expect(readEmbedModelsAllow("a2")?.hidden).toBe(false);
+  });
+
+  it("accepts an empty list with hidden:true: the list plays no part while hidden", () => {
+    post({ type: "maestro.models.allow", agentId: "a1", models: [], hidden: true });
+
+    expect(readEmbedModelsAllow("a1")).toEqual({ models: [], hidden: true });
+  });
+
+  it("ignores a hidden that is not a boolean, keeping the previous state", () => {
+    post({
+      type: "maestro.models.allow",
+      agentId: "a1",
+      models: ["claude-sonnet-5"],
+      hidden: true,
+    });
+    const before = readEmbedModelsAllow("a1");
+
+    for (const hidden of ["true", "false", 1, 0, null, {}]) {
+      post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-opus-5"], hidden });
+      post({ type: "maestro.models.allow", agentId: "a2", models: ["claude-opus-5"], hidden });
+    }
+
+    expect(readEmbedModelsAllow("a1")).toBe(before);
+    expect(readEmbedModelsAllow("a2")).toBeNull();
+  });
+
+  it("a later message replaces the state whole: hidden true, then false, shows it again", () => {
+    const notified: string[] = [];
+    unsubscribes.push(subscribeToEmbedModelsAllow((agentId) => notified.push(agentId)));
+
+    post({
+      type: "maestro.models.allow",
+      agentId: "a1",
+      models: ["claude-sonnet-5"],
+      hidden: true,
+    });
+    post({
+      type: "maestro.models.allow",
+      agentId: "a1",
+      models: ["claude-sonnet-5"],
+      hidden: false,
+    });
+    expect(readEmbedModelsAllow("a1")).toEqual({ models: ["claude-sonnet-5"], hidden: false });
+
+    post({ type: "maestro.models.allow", agentId: "a1", models: [], hidden: true });
+    // No `hidden` at all is shown too: the previous hidden:true does not carry over.
+    post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-opus-5"] });
+    expect(readEmbedModelsAllow("a1")).toEqual({ models: ["claude-opus-5"], hidden: false });
+
+    expect(notified).toEqual(["a1", "a1", "a1", "a1"]);
+  });
+
+  it("notifies when only hidden changes, not on a repeat of the same hidden state", () => {
+    const notified: string[] = [];
+    unsubscribes.push(subscribeToEmbedModelsAllow((agentId) => notified.push(agentId)));
+
+    post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-sonnet-5"] });
+    post({
+      type: "maestro.models.allow",
+      agentId: "a1",
+      models: ["claude-sonnet-5"],
+      hidden: true,
+    });
+    const hidden = readEmbedModelsAllow("a1");
+    post({
+      type: "maestro.models.allow",
+      agentId: "a1",
+      models: ["claude-sonnet-5"],
+      hidden: true,
+    });
+
+    expect(readEmbedModelsAllow("a1")).toBe(hidden);
+    expect(notified).toEqual(["a1", "a1"]);
+  });
+});
+
+describe("maestro.embed.ready", () => {
+  const BRIDGE_FLAG = "__figmentaEmbedBridgeInstalled";
+  let parentPost: ReturnType<typeof vi.fn>;
+  let order: string[];
+
+  /** A new document: the bridge flag lives on the window, a reload starts without it. */
+  function freshDocument(search: string): void {
+    delete (window as unknown as Record<string, unknown>)[BRIDGE_FLAG];
+    window.sessionStorage.clear();
+    setLocation(search);
+    resetEmbedModeCache();
+  }
+
+  beforeEach(() => {
+    order = [];
+    parentPost = vi.fn(() => order.push("ready"));
+    vi.spyOn(window, "parent", "get").mockReturnValue({
+      postMessage: parentPost,
+    } as unknown as Window);
+    const addEventListener = window.addEventListener.bind(window);
+    vi.spyOn(window, "addEventListener").mockImplementation((type, listener, options) => {
+      if (type === "message") order.push("listener");
+      addEventListener(type, listener, options);
+    });
+    freshDocument("?embed=1");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("posts ready to the parent, same origin, never '*', after the listener is up", () => {
+    installEmbedBridge();
+
+    expect(parentPost).toHaveBeenCalledTimes(1);
+    expect(parentPost).toHaveBeenCalledWith({ type: EMBED_READY_TYPE }, window.location.origin);
+    expect(EMBED_READY_TYPE).toBe("maestro.embed.ready");
+    expect(parentPost.mock.calls[0][1]).not.toBe("*");
+    expect(order).toEqual(["listener", "ready"]);
+  });
+
+  it("posts once per install: a second call in the same document posts nothing", () => {
+    installEmbedBridge();
+    installEmbedBridge();
+    installEmbedBridge();
+
+    expect(parentPost).toHaveBeenCalledTimes(1);
+  });
+
+  it("posts again on every fresh install, one per document load", () => {
+    installEmbedBridge();
+    freshDocument("?embed=1");
+    installEmbedBridge();
+    installEmbedBridge();
+
+    expect(parentPost).toHaveBeenCalledTimes(2);
+  });
+
+  it("posts nothing outside the embed", () => {
+    freshDocument("");
+
+    installEmbedBridge();
+
+    expect(parentPost).not.toHaveBeenCalled();
+  });
+
+  it("a post that throws (opaque origin) leaves the listener installed", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    parentPost.mockImplementation(() => {
+      throw new DOMException("Invalid target origin 'null'", "SyntaxError");
+    });
+
+    installEmbedBridge();
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        data: { type: "maestro.models.allow", agentId: "r1", models: [], hidden: true },
+        origin: window.location.origin,
+      }),
+    );
+
+    expect(readEmbedModelsAllow("r1")).toEqual({ models: [], hidden: true });
+    expect(warn).toHaveBeenCalled();
   });
 });
 

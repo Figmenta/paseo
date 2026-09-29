@@ -73,11 +73,14 @@ export function resetEmbedModeCache(): void {
 // Embed bridge v2 — Orchestra → iframe (docs/FIGMENTA.md, «Embed bridge v2»).
 //
 // Orchestra owns the chrome AND the theme. Messages come in over postMessage,
-// same-origin only, and nothing goes back out:
+// same-origin only:
 //   { type: "maestro.composer.insert", text, agentId }  append, that agent only
 //   { type: "maestro.composer.lock", agentId, locked, label }  read-only bar
-//   { type: "maestro.models.allow", agentId, models }  that agent's model menu
+//   { type: "maestro.models.allow", agentId, models, hidden? }  that agent's model menu
 //   { type: "maestro.theme", theme }           hot dark/light switch
+// One goes back out, to the parent, same origin: `{ type: "maestro.embed.ready" }`, once per
+// document, as soon as the listener is up. The listener is installed by a React effect, after the
+// frame's `load`, so what Orchestra posts at `load` is lost: the ready is its cue to post again.
 // The theme also arrives as `?theme=dark|light` on the first URL, latched like
 // `?embed=1` because the router rewrites the query away.
 // ---------------------------------------------------------------------------
@@ -294,19 +297,27 @@ export function applyEmbedComposerLock(data: {
   else if (data.locked === false) setComposerLock(data.agentId, null);
 }
 
+/** What Orchestra's last `maestro.models.allow` said about one agent's model selector. */
+export interface EmbedModelsAllow {
+  /** The model ids the menu may show. Plays no part while `hidden`. */
+  models: readonly string[];
+  /** No model selector at all for this agent: the person may not switch, nor see the model. */
+  hidden: boolean;
+}
+
 /**
- * agentId → the model ids Orchestra allows in that agent's menu. Absent = no filter, the
- * menu Paseo would show anyway. There is no message that removes a list: a new one
- * replaces it, a reload of the frame forgets it.
+ * agentId → Orchestra's word on that agent's model selector. Absent = no filter, the
+ * menu Paseo would show anyway. There is no message that removes it: a new one
+ * replaces it whole (`hidden` included), a reload of the frame forgets it.
  */
-const modelAllowLists = new Map<string, readonly string[]>();
+const modelAllowLists = new Map<string, EmbedModelsAllow>();
 const modelAllowListeners = new Set<(agentId: string) => void>();
 
 /**
- * The model ids this agent's menu may show, or null when Orchestra sent no list for it.
- * Always null outside the embed. Same array until a different list arrives.
+ * Orchestra's word on this agent's model selector, or null when it sent nothing for it.
+ * Always null outside the embed. Same object until a different state arrives.
  */
-export function readEmbedModelsAllow(agentId: string): readonly string[] | null {
+export function readEmbedModelsAllow(agentId: string): EmbedModelsAllow | null {
   if (!isEmbedMode()) return null;
   return modelAllowLists.get(agentId) ?? null;
 }
@@ -319,8 +330,8 @@ export function subscribeToEmbedModelsAllow(listener: (agentId: string) => void)
   };
 }
 
-/** Re-renders the caller when Orchestra changes the models allowed for this agent. */
-export function useEmbedModelsAllow(agentId: string): readonly string[] | null {
+/** Re-renders the caller when Orchestra changes what this agent's model selector may show. */
+export function useEmbedModelsAllow(agentId: string): EmbedModelsAllow | null {
   return useSyncExternalStore(
     subscribeToEmbedModelsAllow,
     () => readEmbedModelsAllow(agentId),
@@ -328,23 +339,40 @@ export function useEmbedModelsAllow(agentId: string): readonly string[] | null {
   );
 }
 
-function sameModelList(a: readonly string[] | undefined, b: readonly string[]): boolean {
-  return a !== undefined && a.length === b.length && a.every((id, index) => id === b[index]);
+function sameModelsAllow(
+  a: EmbedModelsAllow | undefined,
+  models: readonly string[],
+  hidden: boolean,
+): boolean {
+  return (
+    a !== undefined &&
+    a.hidden === hidden &&
+    a.models.length === models.length &&
+    a.models.every((id, index) => id === models[index])
+  );
 }
 
 /**
  * The `maestro.models.allow` case of the bridge, past the origin check. Malformed = ignored,
- * the previous list (or no filter) stays: no usable agentId; `models` not an array, or with an
- * entry that is not a non-empty string; an empty array, since a menu with no rows helps nobody.
+ * the previous state (or no filter) stays: no usable agentId; `hidden` present but not a
+ * boolean; `models` not an array, or with an entry that is not a non-empty string; an empty
+ * array while the selector is shown, since a menu with no rows helps nobody. With
+ * `hidden: true` the list plays no part, so an empty one is accepted.
  */
-function applyEmbedModelsAllow(data: { agentId?: unknown; models?: unknown }): void {
+function applyEmbedModelsAllow(data: {
+  agentId?: unknown;
+  models?: unknown;
+  hidden?: unknown;
+}): void {
   if (typeof data.agentId !== "string" || data.agentId.length === 0) return;
+  if (data.hidden !== undefined && typeof data.hidden !== "boolean") return;
+  const hidden = data.hidden === true;
   const models = data.models;
-  if (!Array.isArray(models) || models.length === 0) return;
+  if (!Array.isArray(models) || (models.length === 0 && !hidden)) return;
   if (!models.every((id): id is string => typeof id === "string" && id.length > 0)) return;
-  // Orchestra re-sends on every frame load and session change: a repeat notifies nobody.
-  if (sameModelList(modelAllowLists.get(data.agentId), models)) return;
-  modelAllowLists.set(data.agentId, Object.freeze([...models]));
+  // Orchestra re-sends on every frame load, poll and session change: a repeat notifies nobody.
+  if (sameModelsAllow(modelAllowLists.get(data.agentId), models, hidden)) return;
+  modelAllowLists.set(data.agentId, Object.freeze({ models: Object.freeze([...models]), hidden }));
   for (const listener of Array.from(modelAllowListeners)) {
     try {
       listener(data.agentId);
@@ -364,6 +392,7 @@ function handleEmbedMessage(event: MessageEvent): void {
     locked?: unknown;
     label?: unknown;
     models?: unknown;
+    hidden?: unknown;
   } | null;
   if (typeof data?.type !== "string") return;
 
@@ -398,7 +427,23 @@ function handleEmbedMessage(event: MessageEvent): void {
   }
 }
 
-/** Install the Orchestra→iframe listener. No-op off web, off embed, or twice. */
+/** The one message the frame sends: "my listener is up, post your per-document state now". */
+export const EMBED_READY_TYPE = "maestro.embed.ready";
+
+/** To the parent, same origin, never "*". Outside a frame the parent is this window: ignored. */
+function announceEmbedReady(): void {
+  try {
+    window.parent.postMessage({ type: EMBED_READY_TYPE }, window.location.origin);
+  } catch (error) {
+    // An opaque origin ("null") is not a valid target: nobody to tell, the load post stays.
+    console.warn("[Figmenta] maestro.embed.ready not posted", error);
+  }
+}
+
+/**
+ * Install the Orchestra→iframe listener, then tell the parent it is listening. No-op off web,
+ * off embed, or twice in the same document: a reload is a new document, so a new ready.
+ */
 export function installEmbedBridge(): void {
   if (!isWeb || typeof window === "undefined") return;
   if (!isEmbedMode()) return;
@@ -409,4 +454,5 @@ export function installEmbedBridge(): void {
   const theme = readEmbedTheme();
   if (theme) applyEmbedTheme(theme);
   window.addEventListener("message", handleEmbedMessage);
+  announceEmbedReady();
 }

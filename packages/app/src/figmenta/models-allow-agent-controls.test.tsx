@@ -6,7 +6,7 @@
  * are fixtures.
  */
 import React from "react";
-import { act, cleanup, render } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentModelDefinition, ProviderSnapshotEntry } from "@getpaseo/protocol/agent-types";
 import type { AgentProfilePicker } from "@/agent-profiles";
@@ -21,19 +21,26 @@ const seen = vi.hoisted(() => ({
   state: null as unknown,
 }));
 
-vi.mock("@/components/combined-model-selector", () => ({
-  CombinedModelSelector: (props: { providers: unknown; profiles: unknown }) => {
-    seen.desktop = { providers: props.providers, profiles: props.profiles };
-    return null;
-  },
-}));
+// The stand-ins leave a marker in the DOM, so a test can tell "not rendered" from "rendered empty".
+vi.mock("@/components/combined-model-selector", async () => {
+  const { createElement } = await import("react");
+  return {
+    CombinedModelSelector: (props: { providers: unknown; profiles: unknown }) => {
+      seen.desktop = { providers: props.providers, profiles: props.profiles };
+      return createElement("div", { "data-testid": "stand-in-desktop-model-selector" });
+    },
+  };
+});
 
-vi.mock("@/composer/agent-controls/model-sheet", () => ({
-  CompactModelSheet: (props: { providers: unknown; profiles: unknown }) => {
-    seen.compact = { providers: props.providers, profiles: props.profiles };
-    return null;
-  },
-}));
+vi.mock("@/composer/agent-controls/model-sheet", async () => {
+  const { createElement } = await import("react");
+  return {
+    CompactModelSheet: (props: { providers: unknown; profiles: unknown }) => {
+      seen.compact = { providers: props.providers, profiles: props.profiles };
+      return createElement("div", { "data-testid": "stand-in-compact-model-sheet" });
+    },
+  };
+});
 
 // The real combobox does not load in the unit project («SyntaxError: Unexpected token 'typeof'»).
 vi.mock("@/components/ui/combobox", () => ({
@@ -58,10 +65,20 @@ vi.mock("@/stores/session-store", () => ({
 }));
 
 vi.mock("@/hooks/use-providers-snapshot", () => {
+  const thinkingOptions = [
+    { id: "low", label: "Low" },
+    { id: "high", label: "High", isDefault: true },
+  ];
   const models: AgentModelDefinition[] = [
-    { provider: "claude", id: "claude-opus-5", label: "Opus 5" },
-    { provider: "claude", id: "claude-sonnet-5", label: "Sonnet 5", isDefault: true },
-    { provider: "claude", id: "claude-sonnet-5[1m]", label: "Sonnet 5 1M" },
+    { provider: "claude", id: "claude-opus-5", label: "Opus 5", thinkingOptions },
+    {
+      provider: "claude",
+      id: "claude-sonnet-5",
+      label: "Sonnet 5",
+      isDefault: true,
+      thinkingOptions,
+    },
+    { provider: "claude", id: "claude-sonnet-5[1m]", label: "Sonnet 5 1M", thinkingOptions },
   ];
   const entries: ProviderSnapshotEntry[] = [
     { provider: "claude", status: "ready", enabled: true, label: "Claude", models, modes: [] },
@@ -85,10 +102,20 @@ vi.mock("@/contexts/toast-context", () => ({
   useToast: () => ({ error: () => {}, show: () => {} }),
 }));
 
-vi.mock("@/composer/agent-controls/mode-control", () => ({
-  AgentModeControl: () => null,
-  useLiveAgentModeControl: () => null,
-}));
+vi.mock("@/composer/agent-controls/mode-control", async () => {
+  const { createElement } = await import("react");
+  const modeControl = {
+    provider: "claude",
+    providerDefinitions: [],
+    modeOptions: [{ id: "default", label: "Default" }],
+    selectedModeId: "default",
+    onSelectMode: () => {},
+  };
+  return {
+    AgentModeControl: () => createElement("div", { "data-testid": "stand-in-mode-control" }),
+    useLiveAgentModeControl: () => modeControl,
+  };
+});
 
 vi.mock("@/agent-profiles", () => ({
   AgentProfileGlyph: () => null,
@@ -216,5 +243,120 @@ describe("AgentControls under maestro.models.allow", () => {
 
     expect(rowIds(seen.desktop?.providers)).toEqual(ALL);
     expect(rowIds(seen.commandCenter?.models.providers)).toEqual(ALL);
+  });
+});
+
+describe("AgentControls under maestro.models.allow hidden", () => {
+  const DESKTOP = "stand-in-desktop-model-selector";
+  const COMPACT = "stand-in-compact-model-sheet";
+
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    window.history.replaceState({}, "", "/agents-ui/?embed=1");
+    resetEmbedModeCache();
+    installEmbedBridge();
+    seen.desktop = null;
+    seen.compact = null;
+    seen.commandCenter = null;
+    seen.profiles = PROFILES;
+    seen.state = {
+      sessions: {
+        s1: {
+          agents: new Map([
+            [
+              "a1",
+              {
+                provider: "claude",
+                cwd: "/tmp",
+                runtimeInfo: { model: "claude-opus-5" },
+                model: "claude-opus-5",
+                features: [],
+                thinkingOptionId: "high",
+                lastUsage: null,
+              },
+            ],
+          ]),
+          client: {},
+        },
+      },
+    };
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  function hide(hidden: boolean, agentId = "a1"): void {
+    post({ type: "maestro.models.allow", agentId, models: ["claude-sonnet-5"], hidden });
+  }
+
+  it("desktop: no model selector, effort and permission mode stay", () => {
+    renderControls(false);
+    expect(screen.queryByTestId(DESKTOP)).not.toBeNull();
+
+    hide(true);
+
+    expect(screen.queryByTestId(DESKTOP)).toBeNull();
+    expect(screen.queryByTestId("agent-thinking-selector")).not.toBeNull();
+    expect(screen.queryByTestId("stand-in-mode-control")).not.toBeNull();
+  });
+
+  it("compact: no model sheet (its trigger carries the model name), effort and mode stay", () => {
+    renderControls(true);
+    expect(screen.queryByTestId(COMPACT)).not.toBeNull();
+
+    hide(true);
+
+    expect(screen.queryByTestId(COMPACT)).toBeNull();
+    expect(screen.queryByTestId(DESKTOP)).toBeNull();
+    expect(screen.queryByTestId("agent-thinking-selector")).not.toBeNull();
+    expect(screen.queryByTestId("stand-in-mode-control")).not.toBeNull();
+  });
+
+  it("command center: no model group while hidden, the thinking and mode groups stay", () => {
+    renderControls(false);
+
+    hide(true);
+
+    expect(rowIds(seen.commandCenter?.models.providers)).toEqual([]);
+    const controls = seen.commandCenter as unknown as {
+      thinking: { options: Array<{ id: string }> };
+      modes?: { options: Array<{ id: string }> };
+    };
+    expect(controls.thinking.options.map((option) => option.id)).toEqual(["low", "high"]);
+    expect(controls.modes?.options.map((option) => option.id)).toEqual(["default"]);
+  });
+
+  it("hidden:false shows the selector again, narrowed by the list", () => {
+    renderControls(false);
+    hide(true);
+    expect(screen.queryByTestId(DESKTOP)).toBeNull();
+
+    hide(false);
+
+    expect(screen.queryByTestId(DESKTOP)).not.toBeNull();
+    expect(rowIds(seen.desktop?.providers)).toEqual(["claude-sonnet-5"]);
+    expect(profileIds(seen.desktop?.profiles)).toEqual(["p-plan"]);
+    expect(rowIds(seen.commandCenter?.models.providers)).toEqual(["claude-sonnet-5"]);
+  });
+
+  it("compact, shown again: the model sheet comes back", () => {
+    renderControls(true);
+    hide(true);
+    expect(screen.queryByTestId(COMPACT)).toBeNull();
+
+    hide(false);
+
+    expect(screen.queryByTestId(COMPACT)).not.toBeNull();
+    expect(rowIds(seen.compact?.providers)).toEqual(["claude-sonnet-5"]);
+  });
+
+  it("hidden for another agent leaves this one's selector alone", () => {
+    renderControls(false);
+
+    hide(true, "a2");
+
+    expect(screen.queryByTestId(DESKTOP)).not.toBeNull();
+    expect(rowIds(seen.desktop?.providers)).toEqual(ALL);
   });
 });
