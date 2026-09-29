@@ -18,6 +18,12 @@ const updateOverlayPreloadPath = join(
   "figmenta",
   "update-overlay-preload.ts",
 );
+// ... and so has the "Setting up Claude Code" window.
+const claudeCodeSetupPreloadPath = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "figmenta",
+  "claude-code-setup-preload.ts",
+);
 
 // Collect every module specifier that survives to emitted JavaScript as a runtime load.
 // Type-only imports/exports are erased by tsc and are therefore ignored.
@@ -87,6 +93,7 @@ describe("preload sandbox safety", () => {
   it.each([
     ["preload.ts", preloadPath],
     ["figmenta/update-overlay-preload.ts", updateOverlayPreloadPath],
+    ["figmenta/claude-code-setup-preload.ts", claudeCodeSetupPreloadPath],
   ])("%s only loads Electron's sandbox allowlist at runtime", (_name, filePath) => {
     const source = readFileSync(filePath, "utf8");
     const disallowed = runtimeModuleSpecifiers(source).filter(

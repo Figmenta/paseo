@@ -266,6 +266,30 @@ function shouldRestartForVersion(current: DesktopDaemonStatus): boolean {
   });
 }
 
+// Figmenta fork: the environment an engine THIS app launches gets — Claude Code found (or
+// installed) and first on PATH, Git Bash on Windows (figmenta/claude-code-setup-electron.ts).
+// main.ts registers it; it runs only right before a launch of our own, never for a daemon we reuse.
+// A setup that fails hands back the app's own environment: the engine always starts.
+export type EngineEnvironmentPreparer = (baseEnv: NodeJS.ProcessEnv) => Promise<NodeJS.ProcessEnv>;
+
+let engineEnvironmentPreparer: EngineEnvironmentPreparer | null = null;
+
+export function setEngineEnvironmentPreparer(preparer: EngineEnvironmentPreparer | null): void {
+  engineEnvironmentPreparer = preparer;
+}
+
+async function ownEngineEnvironment(): Promise<NodeJS.ProcessEnv> {
+  if (!engineEnvironmentPreparer) return process.env;
+  try {
+    return await engineEnvironmentPreparer(process.env);
+  } catch (error) {
+    logDesktopDaemonLifecycle("engine environment not prepared, launching with the app's own", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return process.env;
+  }
+}
+
 function assertBuiltInDaemonManagementEnabled(settings: DesktopSettings): void {
   if (!settings.daemon.manageBuiltInDaemon) {
     throw new Error("Built-in daemon management is disabled.");
@@ -308,7 +332,8 @@ export async function startDaemon(): Promise<DesktopDaemonStatus> {
   // this machine (its own, or an installed Paseo.app's), see figmenta/daemon-runtime.ts.
   const home = getPaseoHome();
   const bundled = resolveBundledDaemonRuntime(getBundledCliShimPath());
-  await launchWithBundledFallback(home, bundled, pickOrchestraDaemonRuntime(bundled));
+  const engineEnv = await ownEngineEnvironment();
+  await launchWithBundledFallback(home, bundled, pickOrchestraDaemonRuntime(bundled), engineEnv);
   return resolveDesktopDaemonStatus();
 }
 
@@ -316,21 +341,22 @@ export async function startDaemon(): Promise<DesktopDaemonStatus> {
  * Launches `picked`; if it is not the bundled runtime and it fails — an exception, or a
  * supervisor that stays alive without ever becoming ready (DAEMON_NOT_READY) — the process
  * this app launched is stopped and the bundled server is started instead. The bundled
- * runtime itself keeps upstream's behaviour (not-ready is left running).
+ * runtime itself keeps upstream's behaviour (not-ready is left running). Both get `baseEnv`.
  */
 export async function launchWithBundledFallback(
   home: string,
   bundled: DaemonLaunchRuntime,
   picked: DaemonLaunchRuntime,
+  baseEnv: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
   if (picked === bundled) {
-    await launchDaemonRuntime(home, bundled);
+    await launchDaemonRuntime(home, bundled, baseEnv);
     return;
   }
   const abort = new AbortController();
   let reason: string;
   try {
-    const outcome = await launchDaemonRuntime(home, picked, abort.signal);
+    const outcome = await launchDaemonRuntime(home, picked, baseEnv, abort.signal);
     if (outcome === "ready") return;
     reason = "not ready in time";
   } catch (error) {
@@ -342,7 +368,7 @@ export async function launchWithBundledFallback(
     reason,
   });
   await abandonLaunch(home, abort);
-  await launchDaemonRuntime(home, bundled);
+  await launchDaemonRuntime(home, bundled, baseEnv);
 }
 
 const ABANDON_WAIT_MS = 15_000;
@@ -407,12 +433,13 @@ export function pickOrchestraDaemonRuntime(
 async function launchDaemonRuntime(
   home: string,
   runtime: DaemonLaunchRuntime,
+  baseEnv: NodeJS.ProcessEnv,
   signal?: AbortSignal,
 ): Promise<"ready" | "not_ready"> {
   const invocation = runtime.createInvocation({
     argvMode: "node-script",
     args: [],
-    baseEnv: process.env,
+    baseEnv,
   });
   try {
     await startDaemonInstance({

@@ -10,3 +10,6 @@ node_modules/
 
 # Isolated dev environment (PASEO_HOME + Electron userData) created by scripts/dev.sh
 .dev/
+
+# Figmenta fork: pinned downloads made at build time (scripts/figmenta-portable-git.js)
+.cache/

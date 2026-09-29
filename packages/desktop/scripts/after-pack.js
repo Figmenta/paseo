@@ -4,6 +4,7 @@ const path = require("path");
 const { smokePackagedDesktopApp } = require("../e2e/packaged-app-smoke.js");
 
 const { installLinuxLauncher } = require("./linux-sandbox");
+const { bundlePortableGit } = require("./figmenta-portable-git");
 
 const EXECUTABLE_NAME = "Orchestra";
 
@@ -189,6 +190,11 @@ exports.default = async function afterPack(context) {
 
   pruneNativeModules(context.appOutDir, platform, arch);
   setUpdaterCacheDirName(resourcesDirFor(context.appOutDir, platform));
+
+  // Figmenta fork: Git Bash for Claude Code on a Windows without Git (figmenta-portable-git.js).
+  if (platform === "win32") {
+    await bundlePortableGit(resourcesDirFor(context.appOutDir, platform), arch);
+  }
 
   if (platform === "linux") {
     installLinuxLauncher(context.appOutDir);

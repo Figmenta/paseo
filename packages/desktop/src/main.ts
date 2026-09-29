@@ -53,7 +53,7 @@ import { createExternalUrlOpener } from "./features/opener.js";
 import { createBrowserCaptureService } from "./features/browser-capture.js";
 import { registerEditorTargetHandlers } from "./features/editor-targets/ipc.js";
 import { resolveAppIconPath } from "./features/stamped-icon.js";
-import { setupApplicationMenu } from "./features/menu.js";
+import { refreshApplicationMenu, setupApplicationMenu } from "./features/menu.js";
 import {
   BROWSER_NEW_TAB_REQUEST_EVENT,
   decideBrowserWindowOpenRequest,
@@ -89,6 +89,7 @@ import { getDesktopSettingsStore } from "./settings/desktop-settings-electron.js
 import { clampWindowStateToWorkAreas, createWindowStateStore } from "./settings/window-state.js";
 import {
   isDesktopManagedDaemonRunningSync,
+  setEngineEnvironmentPreparer,
   stopDesktopDaemonViaCli,
   wasDaemonSpawnedByThisApp,
 } from "./daemon/daemon-manager.js";
@@ -114,6 +115,13 @@ import {
   offerMoveToApplicationsFolder,
   startMandatoryUpdater,
 } from "./figmenta/mandatory-update-electron.js";
+import {
+  engineSetupStatus,
+  finishEngineSetup,
+  prepareEngineEnvironment,
+  registerEngineSetup,
+  retryEngineSetup,
+} from "./figmenta/claude-code-setup-electron.js";
 import { registerBrowserAutomationIpc } from "./features/browser-automation/ipc.js";
 import { BrowserKeyboard } from "./features/browser-keyboard/index.js";
 import {
@@ -1214,9 +1222,27 @@ async function bootstrap(): Promise<void> {
         log.error("[window] failed to create window from menu", error);
       });
     },
+    claudeCodeSetup: {
+      needed: () => engineSetupStatus() === "failed",
+      open: () => void retryEngineSetup(),
+    },
   });
   ensureNotificationCenterRegistration();
   registerDaemonManager();
+  // Figmenta fork: an engine this app launches finds Claude Code (installed on first run when
+  // missing) and, on Windows, Git Bash. A daemon already running is reused untouched. A setup
+  // that fails never keeps Orchestra closed: the engine starts as before, Maestro waits for a
+  // retry (the setup window, File > Set Up Claude Code…), which restarts the engine it fixed.
+  setEngineEnvironmentPreparer(prepareEngineEnvironment);
+  registerEngineSetup({
+    restartEngine: async () => {
+      if (wasDaemonSpawnedByThisApp() && isDesktopManagedDaemonRunningSync()) {
+        await stopDesktopDaemonViaCli("restart");
+      }
+      await startDaemon();
+    },
+    onStatusChange: refreshApplicationMenu,
+  });
   registerWindowManager({ mode: DESKTOP_WINDOW_CHROME_MODE });
   registerDialogHandlers();
   registerNotificationHandlers();
@@ -1240,6 +1266,20 @@ async function bootstrap(): Promise<void> {
   // Figmenta fork: outside /Applications macOS cannot update Orchestra in place; offer
   // the move before anything else starts (a successful move relaunches the app).
   if ((await offerMoveToApplicationsFolder()) === "moved") return;
+
+  // Figmenta fork: mandatory updater — checks now and every 30 minutes; a newer version
+  // covers every window until it is installed. It starts BEFORE the engine and its setup,
+  // and does not depend on them: a build whose setup cannot finish still receives the fix.
+  // Before relaunching, stop the daemon this app launched (never someone else's), as
+  // upstream does before an update.
+  startMandatoryUpdater({
+    beforeInstall: async () => {
+      if (wasDaemonSpawnedByThisApp() && isDesktopManagedDaemonRunningSync()) {
+        await stopDesktopDaemonViaCli("app_update");
+      }
+    },
+  });
+
   installOrchestraSessionPolicies();
   await seedOrchestraDaemonConfig();
   await startOrchestraDaemon();
@@ -1252,17 +1292,9 @@ async function bootstrap(): Promise<void> {
     pendingProjectPath: pendingOpenProjectPath,
   });
   pendingOpenProjectPath = null;
-
-  // Figmenta fork: mandatory updater — checks now and every 30 minutes; a newer version
-  // covers every window until it is installed. Before relaunching, stop the daemon this
-  // app launched (never someone else's), as upstream does before an update.
-  startMandatoryUpdater({
-    beforeInstall: async () => {
-      if (wasDaemonSpawnedByThisApp() && isDesktopManagedDaemonRunningSync()) {
-        await stopDesktopDaemonViaCli("app_update");
-      }
-    },
-  });
+  // The Orchestra window exists: a setup window that did its job goes; one that says the
+  // setup failed stays in front of it, with "Try again".
+  finishEngineSetup();
 
   // Protocol + IPC handlers and the first window now exist: release any
   // second-instance launches that arrived during cold start.
@@ -1342,6 +1374,10 @@ app.on("before-quit", quitLifecycle.handleBeforeQuit);
 registerExternalQuitSignals({ signals: process, quit: () => app.quit() });
 
 app.on("window-all-closed", () => {
+  // Figmenta fork: before the first Orchestra window exists, the only window is the engine
+  // setup one (figmenta/claude-code-setup-electron.ts). Closing it means "not now", never
+  // "quit": the startup goes on and opens Orchestra.
+  if (!bootstrapIsComplete) return;
   if (process.platform !== "darwin") {
     app.quit();
   }

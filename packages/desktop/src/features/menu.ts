@@ -8,6 +8,9 @@ interface ShowContextMenuInput {
 
 interface ApplicationMenuOptions {
   onNewWindow: () => void;
+  // Figmenta fork: "Set Up Claude Code…" while the engine runs without it
+  // (figmenta/claude-code-setup-electron.ts); refreshApplicationMenu() when that changes.
+  claudeCodeSetup?: { needed: () => boolean; open: () => void };
 }
 
 function withBrowserWindow(
@@ -100,6 +103,15 @@ function buildApplicationMenuTemplate(
             options.onNewWindow();
           },
         },
+        ...(options.claudeCodeSetup?.needed()
+          ? [
+              { type: "separator" as const },
+              {
+                label: "Set Up Claude Code…",
+                click: () => options.claudeCodeSetup?.open(),
+              },
+            ]
+          : []),
       ],
     },
     {
@@ -190,6 +202,11 @@ function rebuildApplicationMenu(): void {
     buildApplicationMenuTemplate(applicationMenuOptions, capturingShortcut),
   );
   Menu.setApplicationMenu(menu);
+}
+
+/** Figmenta fork: rebuilds the menu when something it shows changed (the Claude Code setup). */
+export function refreshApplicationMenu(): void {
+  rebuildApplicationMenu();
 }
 
 export function setupApplicationMenu(options: ApplicationMenuOptions): void {

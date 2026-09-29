@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DaemonLaunchRuntime } from "./runtime-paths.js";
 
 // Figmenta fork: behaviour of the daemon-runtime choice and of the bundled fallback,
@@ -66,8 +66,12 @@ vi.mock("../integrations/cli-install/index.js", () => ({
   installCli: vi.fn(),
 }));
 
-const { createDaemonCommandHandlers, launchWithBundledFallback, pickOrchestraDaemonRuntime } =
-  await import("./daemon-manager.js");
+const {
+  createDaemonCommandHandlers,
+  launchWithBundledFallback,
+  pickOrchestraDaemonRuntime,
+  setEngineEnvironmentPreparer,
+} = await import("./daemon-manager.js");
 
 function runtime(source: "bundled" | "paseo-app", version: string): DaemonLaunchRuntime {
   return {
@@ -181,5 +185,114 @@ describe("start_desktop_daemon", () => {
     await createDaemonCommandHandlers().start_desktop_daemon();
     expect(mocks.startDaemonInstance).not.toHaveBeenCalled();
     expect(mocks.resolvePaseoAppDaemonRuntime).not.toHaveBeenCalled();
+  });
+});
+
+// Figmenta fork: the environment of an engine this app launches (Claude Code on PATH, Git Bash).
+describe("engine environment", () => {
+  const STOPPED = { localDaemon: "stopped", serverId: "" };
+
+  function envRuntime(source: "bundled" | "paseo-app", version: string): DaemonLaunchRuntime {
+    return {
+      ...runtime(source, version),
+      createInvocation: (input) => ({
+        command: `/${source}/node`,
+        args: [],
+        env: { ...input.baseEnv },
+      }),
+    };
+  }
+
+  function launchedEnvs(): NodeJS.ProcessEnv[] {
+    return mocks.startDaemonInstance.mock.calls.map(
+      (call) => (call[0] as { env: NodeJS.ProcessEnv }).env,
+    );
+  }
+
+  afterEach(() => setEngineEnvironmentPreparer(null));
+
+  it("an engine this app launches runs with the prepared environment, the fallback too", async () => {
+    mocks.runExternalCliJsonCommand.mockResolvedValue(STOPPED);
+    mocks.resolveBundledDaemonRuntime.mockReturnValue(envRuntime("bundled", "0.8.0"));
+    mocks.resolvePaseoAppDaemonRuntime.mockReturnValue(envRuntime("paseo-app", "0.9.2"));
+    mocks.startDaemonInstance
+      .mockRejectedValueOnce(new Error("helper crashed"))
+      .mockResolvedValueOnce({ spawned: true });
+    const preparer = vi.fn(async (base: NodeJS.ProcessEnv) => ({
+      ...base,
+      PATH: "/Users/me/.local/bin:/usr/bin",
+      ORCHESTRA_TEST_PREPARED: "1",
+    }));
+    setEngineEnvironmentPreparer(preparer);
+
+    await createDaemonCommandHandlers().start_desktop_daemon();
+
+    expect(preparer).toHaveBeenCalledTimes(1);
+    expect(preparer).toHaveBeenCalledWith(process.env);
+    const envs = launchedEnvs();
+    expect(envs).toHaveLength(2);
+    for (const env of envs) {
+      expect(env).toMatchObject({
+        PATH: "/Users/me/.local/bin:/usr/bin",
+        ORCHESTRA_TEST_PREPARED: "1",
+      });
+    }
+  });
+
+  it("a daemon already listening is reused: nothing is prepared or installed", async () => {
+    mocks.runExternalCliJsonCommand.mockResolvedValue({
+      localDaemon: "running",
+      serverId: "srv",
+      listen: "127.0.0.1:6767",
+      pid: 42,
+      daemonVersion: "0.9.2",
+      desktopManaged: false,
+    });
+    const preparer = vi.fn(async (base: NodeJS.ProcessEnv) => base);
+    setEngineEnvironmentPreparer(preparer);
+
+    await createDaemonCommandHandlers().start_desktop_daemon();
+
+    expect(preparer).not.toHaveBeenCalled();
+    expect(mocks.startDaemonInstance).not.toHaveBeenCalled();
+  });
+
+  it("a setup that failed or was closed hands back the app's env: the engine is launched anyway", async () => {
+    mocks.runExternalCliJsonCommand.mockResolvedValue(STOPPED);
+    mocks.resolveBundledDaemonRuntime.mockReturnValue(envRuntime("bundled", "0.9.2"));
+    mocks.resolvePaseoAppDaemonRuntime.mockReturnValue(null);
+    mocks.startDaemonInstance.mockResolvedValue({ spawned: true });
+    setEngineEnvironmentPreparer(async (base) => base);
+
+    await createDaemonCommandHandlers().start_desktop_daemon();
+
+    expect(launchedEnvs()).toHaveLength(1);
+    expect(launchedEnvs()[0]).toMatchObject({ PATH: process.env.PATH });
+  });
+
+  it("a preparer that throws does not keep the engine down: it starts with the app's env", async () => {
+    mocks.runExternalCliJsonCommand.mockResolvedValue(STOPPED);
+    mocks.resolveBundledDaemonRuntime.mockReturnValue(envRuntime("bundled", "0.9.2"));
+    mocks.resolvePaseoAppDaemonRuntime.mockReturnValue(null);
+    mocks.startDaemonInstance.mockResolvedValue({ spawned: true });
+    setEngineEnvironmentPreparer(async () => {
+      throw new Error("statSync exploded");
+    });
+
+    await createDaemonCommandHandlers().start_desktop_daemon();
+
+    expect(launchedEnvs()).toHaveLength(1);
+    expect(launchedEnvs()[0]).toMatchObject({ PATH: process.env.PATH });
+  });
+
+  it("without a preparer (upstream behaviour) the engine gets the app's environment", async () => {
+    mocks.runExternalCliJsonCommand.mockResolvedValue(STOPPED);
+    mocks.resolveBundledDaemonRuntime.mockReturnValue(envRuntime("bundled", "0.9.2"));
+    mocks.resolvePaseoAppDaemonRuntime.mockReturnValue(null);
+    mocks.startDaemonInstance.mockResolvedValue({ spawned: true });
+
+    await createDaemonCommandHandlers().start_desktop_daemon();
+
+    expect(launchedEnvs()[0]).toMatchObject({ PATH: process.env.PATH });
   });
 });
