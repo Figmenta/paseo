@@ -300,6 +300,23 @@ describe("plugin runtime entries", () => {
     );
   });
 
+  // Figmenta fork: the figmenta-sessions plugin ships in the desktop app without a
+  // node_modules/@getpaseo/client, and its server opens its own daemon client. The host
+  // supplies that module, so the bundle must leave it external instead of failing to build.
+  it("leaves the daemon client to the host in server bundles", async () => {
+    const entries = await createSplitPlugin();
+    await writeFile(
+      entries.server,
+      `export default function contribute() {
+  void import("@getpaseo/client/internal/daemon-client");
+  return () => undefined;
+}`,
+    );
+    await expect(compilePlugin({ client: null, server: entries.server })).resolves.toMatchObject({
+      serverBundle: expect.stringContaining('import("@getpaseo/client/internal/daemon-client")'),
+    });
+  });
+
   it.each(["path", "types"])(
     "checks declaration reference %s directives",
     async (referenceKind) => {

@@ -403,7 +403,12 @@ async function compileTarget(entryPath: string, target: PluginBuildTarget): Prom
             "react-native",
             "zod",
           ]
-        : [...PLUGIN_SDK_SPECIFIERS, "zod"],
+        : // Figmenta fork: the daemon client is supplied by the host too, so a server bundle
+          // uses the SAME client version as the daemon it talks to. The packaged plugin ships
+          // no node_modules of its own beyond zod (electron-builder.yml): bundling the client
+          // from the plugin directory fails the whole build there ("Could not resolve"), and
+          // the plugin never loads. runtimeRequire / import() resolve it from the host.
+          [...PLUGIN_SDK_SPECIFIERS, "zod", "@getpaseo/client", "@getpaseo/client/*"],
     plugins: [createRuntimeBoundaryPlugin(target, pluginDirectory)],
     metafile: true,
     logLevel: "silent",
