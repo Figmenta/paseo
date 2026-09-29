@@ -47,6 +47,7 @@ import { useSessionStore } from "@/stores/session-store";
 import { buildScheduleProjectTargets } from "@/schedules/schedule-project-targets";
 import { useScheduleFormModel } from "@/schedules/use-schedule-form-model";
 import { useScheduleFormProviderSnapshot } from "@/schedules/use-schedule-form-provider-snapshot";
+import { useEmbedDraftModelsAllowMenu } from "@/figmenta/models-allow";
 import type {
   ScheduleFormDisplay,
   ScheduleFormHost,
@@ -590,6 +591,13 @@ function ScheduleTargetFields({
     return null;
   }, [selectedHost, state.selectedServerId]);
   const projectOptions = state.projectOptions;
+  // Figmenta embed: a schedule creates a new agent, so its model menu follows Orchestra's
+  // person-level default ("*"), like a draft; hidden = no model field at all (docs/FIGMENTA.md).
+  const embedModelMenu = useEmbedDraftModelsAllowMenu({
+    providers: state.modelSelectorProviders,
+    profiles: null,
+  });
+  const showModelField = state.disclosure.showModelField && !embedModelMenu.hidden;
   const modeOptions = useMemo<SelectFieldOption<string>[]>(
     () =>
       state.modeOptions.map((option) => ({
@@ -740,10 +748,10 @@ function ScheduleTargetFields({
         />
       ) : null}
 
-      {state.disclosure.showModelField ? (
+      {showModelField ? (
         <Field label="Model">
           <CombinedModelSelector
-            providers={state.modelSelectorProviders}
+            providers={embedModelMenu.providers}
             selectedProvider={state.selectedProvider ?? ""}
             selectedModel={state.selectedModel}
             onSelect={handleSelectModel}

@@ -12,7 +12,7 @@
  * measure an older build), FIGMENTA_E2E_REPOST_MS (default 60000, Orchestra's state poll),
  * FIGMENTA_E2E_HOME (default /tmp/ph-model-switch), FIGMENTA_E2E_LISTEN (default 127.0.0.1:6869),
  * FIGMENTA_E2E_SHOTS (screenshots and measurement JSON, default packages/app/test-results/e2e-figmenta),
- * FIGMENTA_E2E_ONLY=timing|contract|draft to run one of the three tests.
+ * FIGMENTA_E2E_ONLY=timing|contract|draft|schedule to run one of the four tests.
  *
  * The daemon is started with `paseo daemon start --home <home>` and stopped with
  * `paseo daemon stop --home <home>` in afterAll, pass or fail. The agent is a Claude agent whose
@@ -413,5 +413,68 @@ test('draft: /clear and unnamed agents follow the person\'s default (agentId "*"
     await context.close();
     await cleared.cleanup();
     await unnamed.cleanup();
+  }
+});
+
+test("schedule: a new schedule's model field follows the person's default (agentId \"*\")", async ({
+  browser,
+}) => {
+  test.skip(ONLY !== "" && ONLY !== "schedule", `FIGMENTA_E2E_ONLY=${ONLY}`);
+  test.setTimeout(300_000);
+  const seeded = await seedClaudeAgent();
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  await prepareContext(context, {
+    serverId: daemon!.serverId,
+    agentId: seeded.agentId,
+    models: SONNET_ONLY,
+    hidden: true,
+    defaultAllow: { models: [], hidden: true },
+    timing: { repostAfterMs: 30 * 60_000, answerReady: true },
+  });
+  const page = await context.newPage();
+  const frame = chat(page);
+  try {
+    await page.goto(`${ORCHESTRA_ORIGIN}${PARENT_PATH}`);
+    await expect(frame.getByTestId("agent-thinking-selector")).toBeVisible({ timeout: 90_000 });
+    // The route the review found: command center -> schedules -> New schedule -> a project.
+    await frame.getByRole("textbox", { name: "Message agent..." }).first().click();
+    await page.keyboard.press("ControlOrMeta+K");
+    const input = frame.getByTestId("command-center-input").first();
+    await expect(input).toBeVisible();
+    await input.fill("schedules");
+    await input.press("Enter");
+    await expect.poll(() => chatFrame(page).url(), { timeout: 30_000 }).toContain("/schedules");
+    await frame.getByText("New schedule").first().click();
+    await expect(frame.getByTestId("schedule-form-sheet").first()).toBeVisible({ timeout: 30_000 });
+    await frame.getByTestId("schedule-project-trigger").first().click();
+    await frame.locator('[data-testid^="schedule-project-option-"]').first().click();
+    // Hidden default: the form has a project, and still no model field, no model name.
+    await expect(frame.getByTestId("schedule-archive-on-finish-switch").first()).toBeVisible({
+      timeout: 30_000,
+    });
+    await expect(frame.getByTestId("schedule-model-trigger")).toHaveCount(0);
+    expect(await frame.getByTestId("schedule-form-sheet").first().innerText()).not.toMatch(
+      MODEL_NAMES,
+    );
+    await shot(page, "schedule-1-hidden.png");
+
+    // Shown and narrowed: the model field lists Sonnet 5 only.
+    await simSetAndPost(page, { defaultAllow: { models: SONNET_ONLY } }, "default-sonnet");
+    const modelTrigger = frame.getByTestId("schedule-model-trigger").first();
+    await expect(modelTrigger).toBeVisible({ timeout: 30_000 });
+    await modelTrigger.click();
+    const rows = frame.locator('[data-testid^="model-row-claude-"]');
+    await expect(rows.first()).toBeVisible();
+    const ids = await rows.evaluateAll((nodes) =>
+      nodes.map((node) =>
+        (node.getAttribute("data-testid") ?? "").replace("model-row-claude-", ""),
+      ),
+    );
+    await page.screenshot({ path: path.join(SHOTS_DIR, "schedule-2-default-sonnet-menu.png") });
+    expect(ids).toEqual(SONNET_ONLY);
+    await page.keyboard.press("Escape");
+  } finally {
+    await context.close();
+    await seeded.cleanup();
   }
 });
