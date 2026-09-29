@@ -761,3 +761,144 @@ describe("rememberAgentRoute / lastAgentRoute", () => {
     expect(lastAgentRoute()).toBeNull();
   });
 });
+
+describe("maestro.models.allow modes and efforts", () => {
+  const unsubscribes: Array<() => void> = [];
+  const MODELS = ["claude-sonnet-5"];
+
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    setLocation("?embed=1");
+    resetEmbedModeCache();
+    installEmbedBridge();
+    while (unsubscribes.length) unsubscribes.pop()?.();
+  });
+
+  function post(data: unknown): void {
+    window.dispatchEvent(new MessageEvent("message", { data, origin: window.location.origin }));
+  }
+
+  function allow(agentId: string, extra: Record<string, unknown>): void {
+    post({ type: "maestro.models.allow", agentId, models: MODELS, ...extra });
+  }
+
+  it("stores modes and efforts with the models of the agent it names", () => {
+    allow("a1", { modes: ["auto", "plan"], efforts: ["low"] });
+
+    expect(readEmbedModelsAllow("a1")).toEqual({
+      models: MODELS,
+      hidden: false,
+      modes: ["auto", "plan"],
+      efforts: ["low"],
+    });
+    expect(readEmbedModelsAllow("a2")).toBeNull();
+  });
+
+  it("absent = no filter: the entry carries no modes and no efforts", () => {
+    allow("a1", {});
+
+    const entry = readEmbedModelsAllow("a1");
+    expect(entry).not.toBeNull();
+    expect("modes" in entry!).toBe(false);
+    expect("efforts" in entry!).toBe(false);
+  });
+
+  it("keeps modes and efforts under hidden: they are not model settings", () => {
+    post({
+      type: "maestro.models.allow",
+      agentId: "a1",
+      models: [],
+      hidden: true,
+      modes: ["plan"],
+      efforts: ["medium", "high"],
+    });
+
+    expect(readEmbedModelsAllow("a1")).toEqual({
+      models: [],
+      hidden: true,
+      modes: ["plan"],
+      efforts: ["medium", "high"],
+    });
+  });
+
+  it("accepts an empty list: nothing of that kind is offered", () => {
+    allow("a1", { modes: [], efforts: [] });
+
+    expect(readEmbedModelsAllow("a1")?.modes).toEqual([]);
+    expect(readEmbedModelsAllow("a1")?.efforts).toEqual([]);
+  });
+
+  it("the next message replaces the entry whole: modes absent there lifts the mode filter", () => {
+    allow("a1", { modes: ["auto", "plan"], efforts: ["low"] });
+
+    allow("a1", { efforts: ["high"] });
+
+    expect(readEmbedModelsAllow("a1")?.modes).toBeUndefined();
+    expect(readEmbedModelsAllow("a1")?.efforts).toEqual(["high"]);
+  });
+
+  it("the default ('*') carries them to drafts and unnamed agents; an agent's own entry wins whole", () => {
+    allow("*", { modes: ["auto", "plan"], efforts: ["low"] });
+    allow("a1", {});
+
+    expect(readEmbedModelsAllow("unnamed")?.modes).toEqual(["auto", "plan"]);
+    expect(readEmbedModelsAllow("unnamed")?.efforts).toEqual(["low"]);
+    // Its own entry sent no modes and no efforts: no filter for a1, the default does not leak in.
+    expect(readEmbedModelsAllow("a1")?.modes).toBeUndefined();
+    expect(readEmbedModelsAllow("a1")?.efforts).toBeUndefined();
+  });
+
+  it("a malformed modes or efforts voids the whole message, the previous state stays", () => {
+    allow("a1", { modes: ["auto"], efforts: ["low"] });
+    const before = readEmbedModelsAllow("a1");
+
+    for (const bad of [null, "auto", 7, { 0: "auto" }, ["auto", 7], ["auto", ""], [null]]) {
+      post({
+        type: "maestro.models.allow",
+        agentId: "a1",
+        models: ["claude-opus-5"],
+        modes: bad,
+      });
+      post({
+        type: "maestro.models.allow",
+        agentId: "a1",
+        models: ["claude-opus-5"],
+        efforts: bad,
+      });
+      post({ type: "maestro.models.allow", agentId: "a2", models: MODELS, modes: bad });
+      post({ type: "maestro.models.allow", agentId: "a2", models: MODELS, efforts: bad });
+    }
+
+    // Not even the models of the malformed messages were taken.
+    expect(readEmbedModelsAllow("a1")).toBe(before);
+    expect(readEmbedModelsAllow("a2")).toBeNull();
+  });
+
+  it("notifies on a change of modes or efforts, not on a repeat", () => {
+    const notified: string[] = [];
+    unsubscribes.push(subscribeToEmbedModelsAllow((agentId) => notified.push(agentId)));
+
+    allow("a1", { modes: ["auto", "plan"] });
+    const first = readEmbedModelsAllow("a1");
+    allow("a1", { modes: ["auto", "plan"] });
+    expect(readEmbedModelsAllow("a1")).toBe(first);
+
+    allow("a1", { modes: ["plan", "auto"] });
+    allow("a1", { modes: ["plan", "auto"], efforts: ["low"] });
+    allow("a1", { modes: ["plan", "auto"], efforts: [] });
+
+    expect(notified).toEqual(["a1", "a1", "a1", "a1"]);
+  });
+
+  it("keeps its own copies: mutating the posted arrays changes nothing", () => {
+    const modes = ["auto"];
+    const efforts = ["low"];
+    allow("a1", { modes, efforts });
+
+    modes.push("bypassPermissions");
+    efforts.push("max");
+
+    expect(readEmbedModelsAllow("a1")?.modes).toEqual(["auto"]);
+    expect(readEmbedModelsAllow("a1")?.efforts).toEqual(["low"]);
+  });
+});

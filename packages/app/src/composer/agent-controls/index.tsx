@@ -82,6 +82,7 @@ import { ComposerToolbarGlyph } from "@/composer/agent-controls/glyph";
 import { AgentControlTrigger } from "@/composer/agent-controls/control";
 import { CompactModelSheet } from "@/composer/agent-controls/model-sheet";
 import { useEmbedDraftModelsAllowMenu, useEmbedModelsAllowMenu } from "@/figmenta/models-allow";
+import { narrowModeIds, useEmbedAgentModesEfforts } from "@/figmenta/modes-efforts";
 import {
   useAgentProfileEditor,
   useAgentProfilePicker,
@@ -137,6 +138,11 @@ interface ControlledAgentControlsProps {
    * and permission mode, which live inside the model sheet there, stay reachable.
    */
   hideModelSelector?: boolean;
+  /**
+   * Figmenta embed (`maestro.models.allow` `efforts`, docs/FIGMENTA.md): the label of the agent's
+   * current effort when `thinkingOptions` leaves it out, so the trigger names it.
+   */
+  thinkingFallbackLabel?: string;
 }
 
 export interface DraftAgentControlsProps {
@@ -525,6 +531,7 @@ function ControlledAgentControls({
   modelSelectorServerId = null,
   isCompactLayout,
   hideModelSelector,
+  thinkingFallbackLabel,
 }: ControlledAgentControlsProps) {
   const { theme } = useUnistyles();
   const { t } = useTranslation();
@@ -566,7 +573,9 @@ function ControlledAgentControls({
   const displayThinking = findOptionLabel(
     formattedThinkingOptions,
     selectedThinkingOptionId,
-    formattedThinkingOptions[0]?.label ?? t("agentControls.thinking.unknown"),
+    thinkingFallbackLabel ??
+      formattedThinkingOptions[0]?.label ??
+      t("agentControls.thinking.unknown"),
   );
 
   const hasAnyControl = resolveHasAnyControl({
@@ -1575,9 +1584,7 @@ export const AgentControls = memo(function AgentControls({
   );
   const client = useSessionStore((state) => state.sessions[serverId]?.client ?? null);
   const toast = useToast();
-  const modeControl = useLiveAgentModeControl(serverId, agentId);
-  const commandCenterModes = toCommandCenterModes(modeControl);
-  const modeProviderDefinitions = getModeProviderDefinitions(modeControl);
+  const liveModeControl = useLiveAgentModeControl(serverId, agentId);
 
   const {
     entries: snapshotEntries,
@@ -1620,17 +1627,29 @@ export const AgentControls = memo(function AgentControls({
     configuredModelId: agent?.model,
     explicitThinkingOptionId: agent?.thinkingOptionId,
   });
+  // Figmenta embed: Orchestra's `modes` and `efforts` narrow this agent's mode and effort menus,
+  // the command center's mode, plan-mode and thinking groups, and the modes a profile may apply;
+  // without a list all of them are untouched (docs/FIGMENTA.md).
+  const embedModesEfforts = useEmbedAgentModesEfforts({
+    agentId,
+    modeControl: liveModeControl,
+    thinkingOptions: modelSelection.thinkingOptions,
+    selectedThinkingId: modelSelection.selectedThinkingId,
+  });
+  const modeControl = embedModesEfforts.modeControl;
+  const commandCenterModes = toCommandCenterModes(modeControl);
+  const modeProviderDefinitions = getModeProviderDefinitions(modeControl);
 
   const modelOptions = useMemo<AgentControlOption[]>(() => {
     return (models ?? []).map((model) => ({ id: model.id, label: model.label }));
   }, [models]);
 
   const thinkingOptions = useMemo<AgentControlOption[]>(() => {
-    return (modelSelection.thinkingOptions ?? []).map((option) => ({
+    return (embedModesEfforts.thinkingOptions ?? []).map((option) => ({
       id: option.id,
       label: formatThinkingOptionLabel(option),
     }));
-  }, [modelSelection.thinkingOptions]);
+  }, [embedModesEfforts.thinkingOptions]);
 
   const agentProvider = agent?.provider;
   const activeModelId = modelSelection.activeModelId;
@@ -1665,8 +1684,8 @@ export const AgentControls = memo(function AgentControls({
   // can apply to it.
   const profileProviders = useMemo(() => (agentProvider ? [agentProvider] : []), [agentProvider]);
   const profileModeIds = useMemo(
-    () => resolveSnapshotModeIds(snapshotSelectedEntry),
-    [snapshotSelectedEntry],
+    () => narrowModeIds(resolveSnapshotModeIds(snapshotSelectedEntry), embedModesEfforts.modes),
+    [embedModesEfforts.modes, snapshotSelectedEntry],
   );
   const profileTarget = useMemo<AgentProfileApplyTarget>(
     () => ({ kind: "agent", agentId, availableModeIds: profileModeIds }),
@@ -1760,7 +1779,7 @@ export const AgentControls = memo(function AgentControls({
         select: handleSelectCommandCenterModel,
       },
       thinking: {
-        options: modelSelection.thinkingOptions,
+        options: embedModesEfforts.thinkingOptions,
         selectedId: modelSelection.selectedThinkingId,
         select: handleSelectThinkingOption,
       },
@@ -1777,12 +1796,12 @@ export const AgentControls = memo(function AgentControls({
       agentProvider,
       commandCenterModes,
       embedModelMenu.providers,
+      embedModesEfforts.thinkingOptions,
       handleSelectCommandCenterModel,
       handleSelectThinkingOption,
       handleSetFeature,
       modeProviderDefinitions,
       modelSelection.selectedThinkingId,
-      modelSelection.thinkingOptions,
       serverId,
     ],
   );
@@ -1840,6 +1859,7 @@ export const AgentControls = memo(function AgentControls({
         modelSelectorServerId={serverId}
         isCompactLayout={isCompactLayout}
         hideModelSelector={embedModelMenu.hidden}
+        thinkingFallbackLabel={embedModesEfforts.thinkingFallbackLabel}
       />
     </>
   );

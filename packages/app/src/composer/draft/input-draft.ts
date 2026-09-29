@@ -31,6 +31,7 @@ import {
   reduceComposerInsert,
   subscribeToEmbedComposerInsert,
 } from "@/figmenta/embed";
+import { useEmbedDraftModesEfforts } from "@/figmenta/modes-efforts";
 
 type AttachmentUpdater =
   | UserComposerAttachment[]
@@ -79,13 +80,17 @@ export interface AgentInputDraft {
 export function useAgentInputDraft(input: UseAgentInputDraftInput): AgentInputDraft {
   const composerOptions = input.composer ?? null;
   const workingDir = composerOptions?.lockedWorkingDir?.trim() || "";
-  const formState = useAgentFormState({
+  const rawFormState = useAgentFormState({
     workingDir,
     serverId: composerOptions?.initialServerId ?? null,
     initialValues: composerOptions?.initialValues,
     isVisible: composerOptions?.isVisible ?? false,
     isCreateFlow: true,
   });
+  // Figmenta embed: the person's default (`maestro.models.allow` "*" `modes` / `efforts`) narrows
+  // the draft's modes and efforts and moves its selection into them, so the composer, the command
+  // center and the submitted config all start the new session valid (docs/FIGMENTA.md).
+  const formState = useEmbedDraftModesEfforts(rawFormState);
   const draftKey = useMemo(
     () =>
       resolveDraftKey({

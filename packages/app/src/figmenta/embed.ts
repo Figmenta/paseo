@@ -76,7 +76,8 @@ export function resetEmbedModeCache(): void {
 // same-origin only:
 //   { type: "maestro.composer.insert", text, agentId }  append, that agent only
 //   { type: "maestro.composer.lock", agentId, locked, label }  read-only bar
-//   { type: "maestro.models.allow", agentId, models, hidden? }  that agent's model menu;
+//   { type: "maestro.models.allow", agentId, models, hidden?, modes?, efforts? }  that agent's
+//                                  model menu, permission modes and effort levels;
 //                                  agentId "*" = the person's default: drafts, unnamed agents
 //   { type: "maestro.theme", theme }           hot dark/light switch
 // One goes back out, to the parent, same origin: `{ type: "maestro.embed.ready" }`, once per
@@ -304,6 +305,18 @@ export interface EmbedModelsAllow {
   models: readonly string[];
   /** No model selector at all for this agent: the person may not switch, nor see the model. */
   hidden: boolean;
+  /**
+   * The permission-mode ids every mode selector of this agent may list (Claude: "plan",
+   * "default", "acceptEdits", "auto", "bypassPermissions"). Absent = no mode filter; empty = no
+   * mode is offered, so no mode selector. Not touched by `hidden`.
+   */
+  modes?: readonly string[];
+  /**
+   * The effort (thinking) option ids every effort selector of this agent may list (Claude: "off",
+   * "low", "medium", "high", "xhigh", "max", "ultracode"). Absent = no effort filter; empty = no
+   * effort is offered, so no effort selector. Not touched by `hidden`.
+   */
+  efforts?: readonly string[];
 }
 
 /**
@@ -356,44 +369,79 @@ export function useEmbedModelsAllow(agentId: string): EmbedModelsAllow | null {
   );
 }
 
-function sameModelsAllow(
-  a: EmbedModelsAllow | undefined,
-  models: readonly string[],
-  hidden: boolean,
-): boolean {
+function sameIds(a: readonly string[] | undefined, b: readonly string[] | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.length === b.length && a.every((id, index) => id === b[index]);
+}
+
+function sameModelsAllow(a: EmbedModelsAllow | undefined, b: EmbedModelsAllow): boolean {
   return (
     a !== undefined &&
-    a.hidden === hidden &&
-    a.models.length === models.length &&
-    a.models.every((id, index) => id === models[index])
+    a.hidden === b.hidden &&
+    sameIds(a.models, b.models) &&
+    sameIds(a.modes, b.modes) &&
+    sameIds(a.efforts, b.efforts)
   );
+}
+
+function isIdList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((id) => typeof id === "string" && id.length > 0);
+}
+
+/** `modes` / `efforts`: absent, or a list of non-empty strings (empty allowed). Else malformed. */
+function isOptionalIdList(value: unknown): value is string[] | undefined {
+  return value === undefined || isIdList(value);
+}
+
+/**
+ * The state a `maestro.models.allow` asks for, or null when it is malformed: no usable agentId;
+ * `hidden` present but not a boolean; `models` not a list of non-empty strings; an empty `models`
+ * while the selector is shown, since a menu with no rows helps nobody (with `hidden: true` the list
+ * plays no part, so an empty one is accepted); `modes` or `efforts` present but not a list of
+ * non-empty strings (`null` included). A malformed field voids the WHOLE message, as for `models`.
+ */
+function parseEmbedModelsAllow(data: {
+  agentId?: unknown;
+  models?: unknown;
+  hidden?: unknown;
+  modes?: unknown;
+  efforts?: unknown;
+}): { agentId: string; allow: EmbedModelsAllow } | null {
+  const { agentId, models, hidden, modes, efforts } = data;
+  if (typeof agentId !== "string" || agentId.length === 0) return null;
+  if (hidden !== undefined && typeof hidden !== "boolean") return null;
+  if (!isIdList(models) || (models.length === 0 && hidden !== true)) return null;
+  if (!isOptionalIdList(modes) || !isOptionalIdList(efforts)) return null;
+  const allow: EmbedModelsAllow = {
+    models: Object.freeze([...models]),
+    hidden: hidden === true,
+    ...(modes ? { modes: Object.freeze([...modes]) } : {}),
+    ...(efforts ? { efforts: Object.freeze([...efforts]) } : {}),
+  };
+  return { agentId, allow: Object.freeze(allow) };
 }
 
 /**
  * The `maestro.models.allow` case of the bridge, past the origin check. Malformed = ignored,
- * the previous state (or no filter) stays: no usable agentId; `hidden` present but not a
- * boolean; `models` not an array, or with an entry that is not a non-empty string; an empty
- * array while the selector is shown, since a menu with no rows helps nobody. With
- * `hidden: true` the list plays no part, so an empty one is accepted. agentId "*" is stored
- * the same way, as the default: same checks, same whole replacement.
+ * the previous state (or no filter) stays (`parseEmbedModelsAllow` says what is malformed).
+ * agentId "*" is stored the same way, as the default: same checks, same whole replacement,
+ * `modes` and `efforts` included (absent in the new message = no filter from now on).
  */
 function applyEmbedModelsAllow(data: {
   agentId?: unknown;
   models?: unknown;
   hidden?: unknown;
+  modes?: unknown;
+  efforts?: unknown;
 }): void {
-  if (typeof data.agentId !== "string" || data.agentId.length === 0) return;
-  if (data.hidden !== undefined && typeof data.hidden !== "boolean") return;
-  const hidden = data.hidden === true;
-  const models = data.models;
-  if (!Array.isArray(models) || (models.length === 0 && !hidden)) return;
-  if (!models.every((id): id is string => typeof id === "string" && id.length > 0)) return;
+  const parsed = parseEmbedModelsAllow(data);
+  if (parsed === null) return;
   // Orchestra re-sends on every frame load, poll and session change: a repeat notifies nobody.
-  if (sameModelsAllow(modelAllowLists.get(data.agentId), models, hidden)) return;
-  modelAllowLists.set(data.agentId, Object.freeze({ models: Object.freeze([...models]), hidden }));
+  if (sameModelsAllow(modelAllowLists.get(parsed.agentId), parsed.allow)) return;
+  modelAllowLists.set(parsed.agentId, parsed.allow);
   for (const listener of Array.from(modelAllowListeners)) {
     try {
-      listener(data.agentId);
+      listener(parsed.agentId);
     } catch (error) {
       console.warn("[Figmenta] models allow listener failed", error);
     }
@@ -411,6 +459,8 @@ function handleEmbedMessage(event: MessageEvent): void {
     label?: unknown;
     models?: unknown;
     hidden?: unknown;
+    modes?: unknown;
+    efforts?: unknown;
   } | null;
   if (typeof data?.type !== "string") return;
 
