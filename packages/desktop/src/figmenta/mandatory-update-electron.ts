@@ -182,7 +182,11 @@ class UpdateOverlayView implements MandatoryUpdateView {
     });
     void view.webContents.loadURL(updateOverlayPageUrl());
 
+    // On "Install and restart" the window is destroyed before the overlay's webContents: calling
+    // off() on it then throws "Object has been destroyed" in the main process (the dialog
+    // Federico saw on 2026-09-29, and the quit stops until it is dismissed).
     const cleanup = () => {
+      if (win.isDestroyed()) return;
       win.off("resize", fit);
       win.off("focus", refocus);
       if (!win.webContents.isDestroyed()) {
