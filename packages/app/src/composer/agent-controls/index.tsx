@@ -81,6 +81,7 @@ import { ComposerControlLayoutProvider } from "@/composer/agent-controls/layout-
 import { ComposerToolbarGlyph } from "@/composer/agent-controls/glyph";
 import { AgentControlTrigger } from "@/composer/agent-controls/control";
 import { CompactModelSheet } from "@/composer/agent-controls/model-sheet";
+import { useEmbedModelsAllowMenu } from "@/figmenta/models-allow";
 import {
   useAgentProfileEditor,
   useAgentProfilePicker,
@@ -1648,6 +1649,13 @@ export const AgentControls = memo(function AgentControls({
     availableProviders: profileProviders,
     target: profileTarget,
   });
+  // Figmenta embed: Orchestra's `maestro.models.allow` narrows this agent's menu and the
+  // command center's model group; without a list both are untouched (docs/FIGMENTA.md).
+  const embedModelMenu = useEmbedModelsAllowMenu({
+    agentId,
+    providers: agentModelSelectorProviders,
+    profiles: agentProfiles,
+  });
   const handleEditAgentProfiles = useEditAgentProfilesNavigation(serverId, agentProfiles !== null);
   const profileEditor = useAgentProfileEditor(serverId);
   const profileActions = resolveAgentProfileEditorActions(agentProfiles !== null, profileEditor);
@@ -1717,7 +1725,7 @@ export const AgentControls = memo(function AgentControls({
       provider: agentProvider,
       providerDefinitions: modeProviderDefinitions,
       models: {
-        providers: agentModelSelectorProviders,
+        providers: embedModelMenu.providers,
         selectedProvider: agentProvider,
         selectedModelId: activeModelId,
         select: handleSelectCommandCenterModel,
@@ -1737,9 +1745,9 @@ export const AgentControls = memo(function AgentControls({
       activeModelId,
       agent?.features,
       agentId,
-      agentModelSelectorProviders,
       agentProvider,
       commandCenterModes,
+      embedModelMenu.providers,
       handleSelectCommandCenterModel,
       handleSelectThinkingOption,
       handleSetFeature,
@@ -1779,11 +1787,11 @@ export const AgentControls = memo(function AgentControls({
       {profileEditor.element}
       <ControlledAgentControls
         provider={agent.provider}
-        modelSelectorProviders={agentModelSelectorProviders}
+        modelSelectorProviders={embedModelMenu.providers}
         modelOptions={modelOptions}
         selectedModelId={modelSelection.activeModelId ?? undefined}
         onSelectModel={handleSelectModel}
-        agentProfiles={agentProfiles}
+        agentProfiles={embedModelMenu.profiles}
         onApplyAgentProfile={agentProfiles?.applyProfile}
         onEditAgentProfiles={handleEditAgentProfiles}
         onCreateAgentProfile={profileActions.create}

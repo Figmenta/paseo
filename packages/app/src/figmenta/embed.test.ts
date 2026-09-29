@@ -5,6 +5,7 @@ import {
   installEmbedBridge,
   lastAgentRoute,
   readEmbedComposerLock,
+  readEmbedModelsAllow,
   readEmbedTheme,
   reduceComposerInsert,
   rememberAgentRoute,
@@ -12,6 +13,7 @@ import {
   shouldBlockEmbedRoute,
   subscribeToEmbedComposerInsert,
   subscribeToEmbedComposerLock,
+  subscribeToEmbedModelsAllow,
 } from "./embed";
 
 function setLocation(search: string): void {
@@ -259,6 +261,130 @@ describe("maestro.composer.lock routing", () => {
     post({ type: "maestro.composer.insert", text: "/again", agentId: "a1" });
 
     expect(applied).toEqual(["/again"]);
+  });
+});
+
+describe("maestro.models.allow routing", () => {
+  const unsubscribes: Array<() => void> = [];
+
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    setLocation("?embed=1");
+    resetEmbedModeCache();
+    installEmbedBridge();
+    while (unsubscribes.length) unsubscribes.pop()?.();
+  });
+
+  function post(data: unknown, origin = window.location.origin): void {
+    window.dispatchEvent(new MessageEvent("message", { data, origin }));
+  }
+
+  it("stores the list for the agent it names and no other", () => {
+    post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-sonnet-5"] });
+
+    expect(readEmbedModelsAllow("a1")).toEqual(["claude-sonnet-5"]);
+    expect(readEmbedModelsAllow("a2")).toBeNull();
+  });
+
+  it("replaces an agent's list with the next one, leaving the other agents alone", () => {
+    post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-sonnet-5"] });
+    post({ type: "maestro.models.allow", agentId: "a2", models: ["claude-sonnet-5"] });
+
+    post({
+      type: "maestro.models.allow",
+      agentId: "a1",
+      models: ["claude-opus-5", "claude-sonnet-5"],
+    });
+
+    expect(readEmbedModelsAllow("a1")).toEqual(["claude-opus-5", "claude-sonnet-5"]);
+    expect(readEmbedModelsAllow("a2")).toEqual(["claude-sonnet-5"]);
+  });
+
+  it("ignores a list without a usable agentId", () => {
+    const notified: string[] = [];
+    unsubscribes.push(subscribeToEmbedModelsAllow((agentId) => notified.push(agentId)));
+
+    post({ type: "maestro.models.allow", models: ["claude-sonnet-5"] });
+    post({ type: "maestro.models.allow", agentId: "", models: ["claude-sonnet-5"] });
+    post({ type: "maestro.models.allow", agentId: 7, models: ["claude-sonnet-5"] });
+
+    expect(readEmbedModelsAllow("")).toBeNull();
+    expect(readEmbedModelsAllow("7")).toBeNull();
+    expect(notified).toEqual([]);
+  });
+
+  it("ignores models that are not a list of non-empty strings, keeping the previous list", () => {
+    post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-sonnet-5"] });
+
+    for (const models of [
+      undefined,
+      null,
+      "claude-opus-5",
+      { 0: "claude-opus-5" },
+      ["claude-opus-5", 7],
+      ["claude-opus-5", null],
+      ["claude-opus-5", ""],
+    ]) {
+      post({ type: "maestro.models.allow", agentId: "a1", models });
+      post({ type: "maestro.models.allow", agentId: "a2", models });
+    }
+
+    expect(readEmbedModelsAllow("a1")).toEqual(["claude-sonnet-5"]);
+    expect(readEmbedModelsAllow("a2")).toBeNull();
+  });
+
+  it("ignores an empty list: it neither empties the menu nor lifts the filter", () => {
+    post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-sonnet-5"] });
+
+    post({ type: "maestro.models.allow", agentId: "a1", models: [] });
+    post({ type: "maestro.models.allow", agentId: "a2", models: [] });
+
+    expect(readEmbedModelsAllow("a1")).toEqual(["claude-sonnet-5"]);
+    expect(readEmbedModelsAllow("a2")).toBeNull();
+  });
+
+  it("ignores a list from another origin", () => {
+    post(
+      { type: "maestro.models.allow", agentId: "a1", models: ["claude-sonnet-5"] },
+      "https://elsewhere.example",
+    );
+
+    expect(readEmbedModelsAllow("a1")).toBeNull();
+  });
+
+  it("notifies on a new list, not on a repeat, and keeps the same array for a repeat", () => {
+    const notified: string[] = [];
+    unsubscribes.push(subscribeToEmbedModelsAllow((agentId) => notified.push(agentId)));
+
+    post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-sonnet-5"] });
+    const first = readEmbedModelsAllow("a1");
+    post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-sonnet-5"] });
+    expect(readEmbedModelsAllow("a1")).toBe(first);
+
+    post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-opus-5"] });
+
+    expect(notified).toEqual(["a1", "a1"]);
+    expect(readEmbedModelsAllow("a1")).toEqual(["claude-opus-5"]);
+  });
+
+  it("keeps its own copy: mutating the posted array changes nothing", () => {
+    const models = ["claude-sonnet-5"];
+    post({ type: "maestro.models.allow", agentId: "a1", models });
+
+    models.push("claude-opus-5");
+
+    expect(readEmbedModelsAllow("a1")).toEqual(["claude-sonnet-5"]);
+  });
+
+  it("is inert outside the embed, even if a message reaches the document", () => {
+    window.sessionStorage.clear();
+    setLocation("");
+    resetEmbedModeCache();
+
+    // The listener installed by an earlier test is still on the window.
+    post({ type: "maestro.models.allow", agentId: "a1", models: ["claude-sonnet-5"] });
+
+    expect(readEmbedModelsAllow("a1")).toBeNull();
   });
 });
 

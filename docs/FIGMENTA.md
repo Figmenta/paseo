@@ -91,14 +91,16 @@ Removing the flag needs a new tab (the latch lives in `sessionStorage`).
 ## Embed bridge v2
 
 Orchestra drives the embedded client over `postMessage`, same origin, no answer back.
-Three messages in, plus a `theme=` query on the first URL. Schema frozen in
-`DMS/OS/Orchestra/PASEO/2026-09-17-maestro-v2-build-contracts.md` §4; `maestro.composer.lock` in
-`DMS/OS/Orchestra/PASEO/2026-09-28-maestro-disciplina-consumo-contratto.md` §12.2.
+Four messages in, plus a `theme=` query on the first URL. Schema frozen in
+`DMS/OS/Orchestra/PASEO/2026-09-17-maestro-v2-build-contracts.md` §4; `maestro.composer.lock` and
+`maestro.models.allow` in `DMS/OS/Orchestra/PASEO/2026-09-28-maestro-disciplina-consumo-contratto.md`
+§12.2.
 
 ```ts
 { type: "maestro.composer.insert", text: string, agentId: string } // append to that agent, never submit
 { type: "maestro.theme", theme: "dark" | "light" }  // hot switch
 { type: "maestro.composer.lock", agentId: string, locked: boolean, label: string | null } // read-only bar for that agent; null label = "Session expired"
+{ type: "maestro.models.allow", agentId: string, models: string[] } // that agent's model menu shows only these ids; [] = ignored
 // first URL: /agents-ui/h/{serverId}/agent/{agentId}?embed=1&theme=dark|light
 ```
 
@@ -115,10 +117,17 @@ The hunks, so a rebase can be re-stitched:
 |                                                                      | `subscribeToEmbedComposerInsert`                                                  | the seam the composer hook uses; delivers `{ text, agentId }` to every mounted composer, the bridge lives outside React and does not know the draft key                                                                                                                          |
 |                                                                      | `readEmbedComposerLock` / `subscribeToEmbedComposerLock` / `useEmbedComposerLock` | the `maestro.composer.lock` state per `agentId` (memory only, Orchestra re-sends it on frame load and every 60 s); subscribers get the `agentId` that changed; a `composer.insert` for a locked agent is dropped                                                                 |
 |                                                                      | `applyEmbedComposerLock`                                                          | the `maestro.composer.lock` case of the bridge past the origin check: `locked` must be a boolean, a blank `label` falls back to «Session expired»; exported so the host runtime tests lock an agent without a window                                                             |
+|                                                                      | `readEmbedModelsAllow` / `subscribeToEmbedModelsAllow` / `useEmbedModelsAllow`    | the `maestro.models.allow` list per `agentId` (memory only; a new list replaces the old one, a repeat keeps the same array and notifies nobody); null = no filter, always null outside the embed                                                                                 |
+|                                                                      | `applyEmbedModelsAllow` (module-private)                                          | the `maestro.models.allow` case past the origin check: ignored, the previous list (or no filter) staying, without a usable `agentId` or when `models` is not a non-empty array of non-empty strings                                                                              |
+| `packages/app/src/figmenta/models-allow.ts`                          | `filterProvidersByModelsAllow`                                                    | keeps the rows whose `modelId` is in the list, exact match (`claude-sonnet-5[1m]` is its own id); a provider left with no rows stays, so the trigger still shows the current model; loading/error pass                                                                           |
+|                                                                      | `filterProfilesByModelsAllow`                                                     | hides the profile rows that name a model outside the list; a profile with no model stays (applying it leaves the model alone)                                                                                                                                                    |
+|                                                                      | `useEmbedModelsAllowMenu`                                                         | `{ providers, profiles }` of one agent, narrowed by its list; the very same inputs when there is no list                                                                                                                                                                         |
 | `packages/app/src/figmenta/composer-lock.tsx`                        | `EmbedComposerLockGate`                                                           | renders the read-only bar with the label in place of `MessageInput` while the agent is locked                                                                                                                                                                                    |
 |                                                                      | `isEmbedComposerLocked` / `assertEmbedComposerUnlocked`                           | call-time guards, read the live lock: submit and queue return; every send (`submitMessage`, «send now» on a queued row included) throws with the label, so the text comes back                                                                                                   |
 |                                                                      | `useEmbedComposerLockGuard`                                                       | the render's flag while locked, and stops voice mode on that agent (not mid-switch, not on another agent or host)                                                                                                                                                                |
 | `packages/app/src/composer/index.tsx`                                | `EmbedComposerLockGate`, `useEmbedComposerLockGuard`, the call-time guards        | one call per site at the top of `submitMessage`, `handleSubmit`, `handleQueue`, the decisions live in `composer-lock.tsx`; the gate replaces `<RenderProfile id="MessageInput">`; the flag hides `queueList`, turns off autocomplete and disables `useFileDrop`                  |
+| `packages/app/src/composer/agent-controls/index.tsx`                 | `AgentControls`, after `useAgentProfilePicker`                                    | `const embedModelMenu = useEmbedModelsAllowMenu({ agentId, providers: agentModelSelectorProviders, profiles: agentProfiles })`                                                                                                                                                   |
+|                                                                      | `<ControlledAgentControls>`, `commandCenterControls`                              | `modelSelectorProviders={embedModelMenu.providers}` (desktop `CombinedModelSelector`, compact `CompactModelSheet`), `agentProfiles={embedModelMenu.profiles}`, `models.providers: embedModelMenu.providers`                                                                      |
 | `packages/app/src/runtime/host-runtime.ts`                           | `drainQueuedAgentMessage`, `drainQueuedAgentMessageAfterEmbedUnlock`              | the drain (turn end, timeline sync) returns while the agent is locked, the row stays queued; the constructor subscribes to lock changes and, on unlock, drains where the agent sits idle (running: at turn end). Inert outside the embed                                         |
 | `packages/app/src/appearance/provider.tsx`                           | `applyTheme`                                                                      | returns early when `isEmbedMode() && readEmbedTheme()`, so the persisted Paseo preference cannot overwrite the imposed theme                                                                                                                                                     |
 | `packages/app/src/composer/draft/input-draft.ts`                     | `useAgentInputDraft`                                                              | subscribes to the bridge, applies only when `agentId` matches the `agentId` option passed by `agent-panel.tsx`, then calls `replaceText(reduceComposerInsert(current, text))`. Skipped when `composer` options are passed (create-agent flow) or when no `agentId` is known      |
@@ -129,6 +138,9 @@ The hunks, so a rebase can be re-stitched:
 
 Tests: `packages/app/src/figmenta/embed.test.ts` (jsdom) covers the pure functions and the bridge;
 `packages/app/src/figmenta/composer-lock.test.tsx` (jsdom) the lock bar and the composer guards;
+`packages/app/src/figmenta/models-allow.test.tsx` (jsdom) the model filters and their hook;
+`packages/app/src/figmenta/models-allow-agent-controls.test.tsx` (jsdom) the `AgentControls` hunk, with
+the menu, the compact sheet and the command center as stand-ins;
 the two «Figmenta embed» cases in `packages/app/src/runtime/host-runtime.test.ts` the queue held under
 a lock and released on unlock; `packages/app/e2e/browser/figmenta-embed-composer-lock.spec.ts`
 (Playwright, `npm run test:e2e`, not part of the unit run) the lock end to end in a browser.

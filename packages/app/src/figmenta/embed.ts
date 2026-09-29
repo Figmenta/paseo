@@ -60,12 +60,13 @@ export function isEmbedMode(): boolean {
 
 /**
  * Test seam: forget what was read, so the next call re-reads the document.
- * Composer locks go too: they are per-document state Orchestra re-sends.
+ * Composer locks and model allow-lists go too: per-document state Orchestra re-sends.
  */
 export function resetEmbedModeCache(): void {
   cached = null;
   cachedTheme = undefined;
   composerLocks.clear();
+  modelAllowLists.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -75,6 +76,7 @@ export function resetEmbedModeCache(): void {
 // same-origin only, and nothing goes back out:
 //   { type: "maestro.composer.insert", text, agentId }  append, that agent only
 //   { type: "maestro.composer.lock", agentId, locked, label }  read-only bar
+//   { type: "maestro.models.allow", agentId, models }  that agent's model menu
 //   { type: "maestro.theme", theme }           hot dark/light switch
 // The theme also arrives as `?theme=dark|light` on the first URL, latched like
 // `?embed=1` because the router rewrites the query away.
@@ -292,6 +294,66 @@ export function applyEmbedComposerLock(data: {
   else if (data.locked === false) setComposerLock(data.agentId, null);
 }
 
+/**
+ * agentId → the model ids Orchestra allows in that agent's menu. Absent = no filter, the
+ * menu Paseo would show anyway. There is no message that removes a list: a new one
+ * replaces it, a reload of the frame forgets it.
+ */
+const modelAllowLists = new Map<string, readonly string[]>();
+const modelAllowListeners = new Set<(agentId: string) => void>();
+
+/**
+ * The model ids this agent's menu may show, or null when Orchestra sent no list for it.
+ * Always null outside the embed. Same array until a different list arrives.
+ */
+export function readEmbedModelsAllow(agentId: string): readonly string[] | null {
+  if (!isEmbedMode()) return null;
+  return modelAllowLists.get(agentId) ?? null;
+}
+
+/** Called with the agentId whose list changed; read it with `readEmbedModelsAllow`. */
+export function subscribeToEmbedModelsAllow(listener: (agentId: string) => void): () => void {
+  modelAllowListeners.add(listener);
+  return () => {
+    modelAllowListeners.delete(listener);
+  };
+}
+
+/** Re-renders the caller when Orchestra changes the models allowed for this agent. */
+export function useEmbedModelsAllow(agentId: string): readonly string[] | null {
+  return useSyncExternalStore(
+    subscribeToEmbedModelsAllow,
+    () => readEmbedModelsAllow(agentId),
+    () => readEmbedModelsAllow(agentId),
+  );
+}
+
+function sameModelList(a: readonly string[] | undefined, b: readonly string[]): boolean {
+  return a !== undefined && a.length === b.length && a.every((id, index) => id === b[index]);
+}
+
+/**
+ * The `maestro.models.allow` case of the bridge, past the origin check. Malformed = ignored,
+ * the previous list (or no filter) stays: no usable agentId; `models` not an array, or with an
+ * entry that is not a non-empty string; an empty array, since a menu with no rows helps nobody.
+ */
+function applyEmbedModelsAllow(data: { agentId?: unknown; models?: unknown }): void {
+  if (typeof data.agentId !== "string" || data.agentId.length === 0) return;
+  const models = data.models;
+  if (!Array.isArray(models) || models.length === 0) return;
+  if (!models.every((id): id is string => typeof id === "string" && id.length > 0)) return;
+  // Orchestra re-sends on every frame load and session change: a repeat notifies nobody.
+  if (sameModelList(modelAllowLists.get(data.agentId), models)) return;
+  modelAllowLists.set(data.agentId, Object.freeze([...models]));
+  for (const listener of Array.from(modelAllowListeners)) {
+    try {
+      listener(data.agentId);
+    } catch (error) {
+      console.warn("[Figmenta] models allow listener failed", error);
+    }
+  }
+}
+
 function handleEmbedMessage(event: MessageEvent): void {
   if (event.origin !== window.location.origin) return;
   const data = event.data as {
@@ -301,6 +363,7 @@ function handleEmbedMessage(event: MessageEvent): void {
     agentId?: unknown;
     locked?: unknown;
     label?: unknown;
+    models?: unknown;
   } | null;
   if (typeof data?.type !== "string") return;
 
@@ -318,6 +381,10 @@ function handleEmbedMessage(event: MessageEvent): void {
     }
     case "maestro.composer.lock": {
       applyEmbedComposerLock(data);
+      return;
+    }
+    case "maestro.models.allow": {
+      applyEmbedModelsAllow(data);
       return;
     }
     case "maestro.theme": {
