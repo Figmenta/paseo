@@ -136,3 +136,43 @@ export function showsResolutionView<R extends { kind: string }>(
 export function skipsNotFoundRedirect(kind: string, locked: boolean): boolean {
   return kind === "notFound" && locked;
 }
+
+/**
+ * Command-palette root actions that `router.push` outside the dispatcher filter (add project,
+ * home = open-project screen, history) or open the import sheet (import session).
+ * `schedules` stays: supported in embed on purpose.
+ */
+export const LAUNCHER_PALETTE_ACTION_IDS: ReadonlySet<string> = new Set([
+  "add-project",
+  "import-session",
+  "home",
+  "history",
+]);
+
+/**
+ * Draft ids generated in this page's lifetime (`generateDraftId`: /clear, fork). A draft tab
+ * restored from the persisted layout carries an id from an earlier page, so it is not here.
+ */
+const sessionDraftIds = new Set<string>();
+
+/** Called by `generateDraftId`; returns the id unchanged. */
+export function noteSessionDraftId(draftId: string): string {
+  sessionDraftIds.add(draftId);
+  return draftId;
+}
+
+/**
+ * A draft tab shows the closed-session notice only in a locked embed AND when it was restored
+ * from the persisted layout; a draft created in this page (e.g. by /clear) renders normally.
+ */
+export function draftGatedByLauncher(draftId: string, locked: boolean): boolean {
+  return locked && !sessionDraftIds.has(draftId);
+}
+
+/** The palette's root actions minus `LAUNCHER_PALETTE_ACTION_IDS` while the gate is shut. */
+export function filterLauncherPaletteActions<T extends { id: string }>(
+  actions: T[],
+  locked: boolean,
+): T[] {
+  return locked ? actions.filter((action) => !LAUNCHER_PALETTE_ACTION_IDS.has(action.id)) : actions;
+}

@@ -265,6 +265,24 @@ outside `src/figmenta/` is marked `// Figmenta: launcher gate`:
 | `packages/app/src/runtime/host-runtime.ts`                        | passes `canCreateTerminal: canCreateEmbedTerminal` to every `DaemonClient`                                            |
 | `packages/client/src/daemon-client.ts`                            | `DaemonClientConfig.canCreateTerminal`; `createTerminal` rejects without a request when it says no (absent = allowed) |
 
+Round 2 (review of 398afa5a): the `maestro.launcher` message is accepted only when
+`event.source === window.parent`, on top of the origin check. Command palette: `add-project`,
+`import-session`, `home` and `history` are dropped (`filterLauncherPaletteActions`, in
+`command-center/root-registration.tsx`), and file search sends no request and opens nothing
+(`command-center/workspace-file-search.ts`). The «Import session» tile is hidden
+(`screens/open-project-screen.tsx`). A `draft` tab restored from the persisted layout renders the
+notice through `EmbedDraftGate` (`panels/agent-panel.tsx`); a draft created in this page keeps
+working (`/clear`, fork): `generateDraftId` (`stores/draft-keys.ts`) records its id with
+`noteSessionDraftId`. `/schedules` and the palette `schedules` action stay available in embed on
+purpose.
+
+Requires https: Orchestra gates the `/agents-ui` build on the browser's `Sec-Fetch-*` headers,
+which browsers send only over https, so the gate is only as good as that serving.
+
+Accepted residual (level A): the block is client-side. A tampered client (devtools) can still
+ask the daemon for a terminal, which runs with the daemon's env. Blocking it in the engine is
+phase 2.
+
 Restored terminal tabs are not closed on mount: the gate starts shut on every frame load, before
 Orchestra's `allowed: true` arrives, so closing them would drop an owner's terminals on each
 reload. The app resolves `@getpaseo/client` from `packages/client/dist`: rebuild it

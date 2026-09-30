@@ -22,6 +22,7 @@ import { TitlebarDragRegion } from "@/components/desktop/titlebar-drag-region";
 import { useLocalDaemonServerId } from "@/hooks/use-is-local-daemon";
 import { PairDeviceModal } from "@/desktop/components/pair-device-modal";
 import { buildSettingsHostSectionRoute } from "@/utils/host-routes";
+import { useEmbedLauncherLocked } from "@/figmenta/launcher-lock"; // Figmenta: launcher gate
 
 export function OpenProjectScreen() {
   const { t } = useTranslation();
@@ -30,6 +31,7 @@ export function OpenProjectScreen() {
   const openDesktopAgentList = usePanelStore((s) => s.openDesktopAgentList);
   const openProjectPicker = useOpenAddProject();
   const importSession = useImportSession();
+  const embedLauncherLocked = useEmbedLauncherLocked(); // Figmenta: launcher gate
   const chooseHost = useHostChooser();
   const localServerId = useLocalDaemonServerId();
   const [isPairDeviceOpen, setIsPairDeviceOpen] = useState(false);
@@ -78,13 +80,16 @@ export function OpenProjectScreen() {
             testID="open-project-submit"
             accent
           />
-          <HomeTile
-            icon={Inbox}
-            title={t("openProject.tiles.importSession.title")}
-            description={t("openProject.tiles.importSession.description")}
-            onPress={importSession.open}
-            testID="open-project-import-session"
-          />
+          {/* Figmenta: launcher gate */}
+          {embedLauncherLocked ? null : (
+            <HomeTile
+              icon={Inbox}
+              title={t("openProject.tiles.importSession.title")}
+              description={t("openProject.tiles.importSession.description")}
+              onPress={importSession.open}
+              testID="open-project-import-session"
+            />
+          )}
           <HomeTile
             icon={Plug}
             title={t("openProject.tiles.setupProviders.title")}

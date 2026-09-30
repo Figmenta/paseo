@@ -7,6 +7,7 @@ import { useWorkspaceDirectory } from "@/stores/session-store-hooks";
 import { useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
 import { clearCommandCenterFocusRestoreElement } from "@/utils/command-center-focus-restore";
 import { buildWorkspaceTabPersistenceKey } from "@/workspace-tabs/model";
+import { launcherLocked, useEmbedLauncherLocked } from "@/figmenta/launcher-lock"; // Figmenta: launcher gate
 import {
   describeWorkspaceFilePath,
   type WorkspaceFileSearchEntry,
@@ -65,9 +66,12 @@ export function useWorkspaceFileSearch(input: { enabled: boolean; query: string 
     () => (serverId && workspaceId && cwd && client ? `${serverId}\0${workspaceId}\0${cwd}` : null),
     [client, cwd, serverId, workspaceId],
   );
+  const embedLauncherLocked = useEmbedLauncherLocked(); // Figmenta: launcher gate
   const requestKey = useMemo(
-    () => (input.enabled && sourceKey ? `${sourceKey}\0${input.query}` : null),
-    [input.enabled, input.query, sourceKey],
+    () =>
+      // Figmenta: launcher gate — no file search (it opens files tabs) in a locked embed.
+      input.enabled && !embedLauncherLocked && sourceKey ? `${sourceKey}\0${input.query}` : null,
+    [embedLauncherLocked, input.enabled, input.query, sourceKey],
   );
 
   useEffect(() => {
@@ -127,6 +131,7 @@ export function useWorkspaceFileSearch(input: { enabled: boolean; query: string 
   const openFile = useCallback(
     (path: string) => {
       if (!serverId || !workspaceId) return;
+      if (launcherLocked()) return; // Figmenta: launcher gate
       clearCommandCenterFocusRestoreElement();
       openWorkspaceFileFromExplorer({
         filePath: path,

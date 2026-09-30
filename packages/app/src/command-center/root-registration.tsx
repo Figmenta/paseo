@@ -36,6 +36,7 @@ import { getShortcutOs } from "@/utils/shortcut-platform";
 import type { CommandCenterContribution, CommandCenterIconProps } from "./contributions";
 import { useCommandCenterActions } from "./provider";
 import { buildGroupingContribution } from "./root-contributions";
+import { filterLauncherPaletteActions, useEmbedLauncherLocked } from "@/figmenta/launcher-lock"; // Figmenta: launcher gate
 
 const ThemedPlus = withUnistyles(Plus, (theme) => ({ color: theme.colors.foregroundMuted }));
 const ThemedFolderPlus = withUnistyles(FolderPlus, (theme) => ({
@@ -131,6 +132,7 @@ export function CommandCenterRootActions() {
     () => ({ isMac: getShortcutOs() === "mac", isDesktop: getIsElectronRuntime() }),
     [],
   );
+  const embedLauncherLocked = useEmbedLauncherLocked(); // Figmenta: launcher gate
   const actions = useMemo<CommandCenterContribution[]>(() => {
     const availableActions: CommandCenterContribution[] = [
       {
@@ -329,8 +331,10 @@ export function CommandCenterRootActions() {
       }),
     );
 
-    return availableActions;
+    // Figmenta: launcher gate
+    return filterLauncherPaletteActions(availableActions, embedLauncherLocked);
   }, [
+    embedLauncherLocked, // Figmenta: launcher gate
     groupMode,
     homeRoute,
     keyboardActionDispatcher,

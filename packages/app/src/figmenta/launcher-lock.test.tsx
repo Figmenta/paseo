@@ -8,6 +8,7 @@ import {
   EMBED_SESSION_CLOSED_MESSAGE,
   EMBED_TERMINAL_REFUSED_MESSAGE,
   LAUNCHER_ACTION_IDS,
+  filterLauncherPaletteActions,
   canCreateEmbedTerminal,
   launcherLocked,
   readEmbedLauncherAllowed,
@@ -41,8 +42,13 @@ function setLocation(search: string): void {
   window.history.replaceState({}, "", `/agents-ui/${search}`);
 }
 
-function post(data: unknown, origin = window.location.origin): void {
-  window.dispatchEvent(new MessageEvent("message", { data, origin }));
+/** From the parent frame by default: in jsdom the top window is its own parent. */
+function post(
+  data: unknown,
+  origin = window.location.origin,
+  source: MessageEventSource | null = window.parent,
+): void {
+  window.dispatchEvent(new MessageEvent("message", { data, origin, source }));
 }
 
 /** A new embedded document: embed flag latched, launcher state forgotten. */
@@ -115,6 +121,21 @@ describe("launcher lock store", () => {
     expect(launcherLocked()).toBe(false);
   });
 
+  it("ignores a launcher message that does not come from the parent frame", () => {
+    const other = document.createElement("iframe");
+    document.body.appendChild(other);
+    const foreign = other.contentWindow;
+    expect(foreign).not.toBeNull();
+    expect(foreign).not.toBe(window.parent);
+    post({ type: "maestro.launcher", allowed: true }, window.location.origin, foreign);
+    post({ type: "maestro.launcher", allowed: true }, window.location.origin, null);
+    expect(launcherLocked()).toBe(true);
+    other.remove();
+
+    post({ type: "maestro.launcher", allowed: true });
+    expect(launcherLocked()).toBe(false);
+  });
+
   it("never locks outside embed mode", () => {
     leaveEmbed();
     expect(launcherLocked()).toBe(false);
@@ -134,6 +155,30 @@ describe("launcher lock store", () => {
     expect(EMBED_SESSION_CLOSED_MESSAGE).toBe(
       "This session is closed. Open another one from the sidebar.",
     );
+  });
+});
+
+describe("command palette root actions under the launcher gate", () => {
+  const ids = [
+    "add-project",
+    "new-workspace",
+    "import-session",
+    "home",
+    "history",
+    "schedules",
+    "settings",
+  ].map((id) => ({ id }));
+
+  it("drops add-project, import-session, home and history in a locked embed", () => {
+    const kept = filterLauncherPaletteActions(ids, launcherLocked()).map((action) => action.id);
+    expect(kept).toEqual(["new-workspace", "schedules", "settings"]);
+  });
+
+  it("keeps every action once Orchestra allows the launcher, and outside embed", () => {
+    post({ type: "maestro.launcher", allowed: true });
+    expect(filterLauncherPaletteActions(ids, launcherLocked())).toEqual(ids);
+    leaveEmbed();
+    expect(filterLauncherPaletteActions(ids, launcherLocked())).toEqual(ids);
   });
 });
 

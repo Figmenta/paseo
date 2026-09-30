@@ -494,6 +494,8 @@ function handleEmbedMessage(event: MessageEvent): void {
       return;
     }
     case EMBED_LAUNCHER_MESSAGE_TYPE: {
+      // The launcher permission comes from Orchestra, the parent frame, and from nobody else.
+      if (event.source !== window.parent) return;
       applyEmbedLauncherMessage(data);
       return;
     }
