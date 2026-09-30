@@ -239,6 +239,56 @@ Run from `packages/app`, not the repo root — the root vitest config has no ali
 `react-native-unistyles`: `npx vitest run --project unit src/figmenta`, and
 `npx vitest run --project unit src/runtime/host-runtime.test.ts -t "Figmenta embed"`.
 
+## Launcher gate
+
+In embed mode the Paseo launcher (new tab, agent, terminal, terminal profiles) and every way to
+open a terminal stay shut until Orchestra posts `{ type: "maestro.launcher", allowed: true }`
+(same origin and validation as the other `maestro.*` messages; a non-boolean `allowed` is
+ignored; `allowed: false` shuts it again). Shut = client-side block only (level A): the daemon
+still runs whatever a tampered client asks. Store, hooks and predicates live in
+`packages/app/src/figmenta/launcher-lock.ts`, the notice «This session is closed. Open another one
+from the sidebar.» in `launcher-closed-notice.tsx`, tests in `launcher-lock.test.tsx`. Every hunk
+outside `src/figmenta/` is marked `// Figmenta: launcher gate`:
+
+| File                                                              | What                                                                                                                  |
+| ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `packages/app/src/figmenta/embed.ts`                              | `maestro.launcher` case in the bridge; `resetEmbedModeCache` resets the gate                                          |
+| `packages/app/src/keyboard/keyboard-action-dispatcher.ts`         | `dispatch` drops `LAUNCHER_ACTION_IDS` (shortcuts and command palette)                                                |
+| `packages/app/src/workspace-tabs/launcher/index.tsx`              | `useWorkspaceTabLaunchCatalog` returns `[]` (new_tab panel, «+» menu, explorer rail)                                  |
+| `packages/app/src/panels/new-tab-panel.tsx`                       | notice instead of the launcher                                                                                        |
+| `packages/app/src/panels/terminal-panel.tsx`                      | open or restored terminal tabs render the notice, never attach (not closed: see below)                                |
+| `packages/app/src/screens/workspace/workspace-header-menu.tsx`    | terminal entries of the compact header menu hidden                                                                    |
+| `packages/app/src/screens/workspace/workspace-scripts-button.tsx` | scripts button not rendered                                                                                           |
+| `packages/app/src/app/new.tsx`                                    | `/new` renders the notice                                                                                             |
+| `packages/app/src/app/h/[serverId]/agent/[agentId].tsx`           | missing agent: no bounce to the last workspace                                                                        |
+| `packages/app/src/navigation/agent-route-resolution-view.tsx`     | renders the notice for `notFound`                                                                                     |
+| `packages/app/src/runtime/host-runtime.ts`                        | passes `canCreateTerminal: canCreateEmbedTerminal` to every `DaemonClient`                                            |
+| `packages/client/src/daemon-client.ts`                            | `DaemonClientConfig.canCreateTerminal`; `createTerminal` rejects without a request when it says no (absent = allowed) |
+
+Round 2 (review of 398afa5a): the `maestro.launcher` message is accepted only when
+`event.source === window.parent`, on top of the origin check. Command palette: `add-project`,
+`import-session`, `home` and `history` are dropped (`filterLauncherPaletteActions`, in
+`command-center/root-registration.tsx`), and file search sends no request and opens nothing
+(`command-center/workspace-file-search.ts`). The «Import session» tile is hidden
+(`screens/open-project-screen.tsx`). A `draft` tab restored from the persisted layout renders the
+notice through `EmbedDraftGate` (`panels/agent-panel.tsx`); a draft created in this page keeps
+working (`/clear`, fork): `generateDraftId` (`stores/draft-keys.ts`) records its id with
+`noteSessionDraftId`. `/schedules` and the palette `schedules` action stay available in embed on
+purpose.
+
+Requires https: Orchestra gates the `/agents-ui` build on the browser's `Sec-Fetch-*` headers,
+which browsers send only over https, so the gate is only as good as that serving.
+
+Accepted residual (level A): the block is client-side. A tampered client (devtools) can still
+ask the daemon for a terminal, which runs with the daemon's env. Blocking it in the engine is
+phase 2.
+
+Restored terminal tabs are not closed on mount: the gate starts shut on every frame load, before
+Orchestra's `allowed: true` arrives, so closing them would drop an owner's terminals on each
+reload. The app resolves `@getpaseo/client` from `packages/client/dist`: rebuild it
+(`cd packages/client && npx tsc -p tsconfig.json --incremental false`) before the app typecheck
+or the web build.
+
 ## Orchestra Desktop
 
 The Figmenta desktop app **is** this Electron shell, renamed, pointed at

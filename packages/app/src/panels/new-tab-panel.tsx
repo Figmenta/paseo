@@ -20,6 +20,8 @@ import type { KeyboardActionDefinition } from "@/keyboard/keyboard-action-dispat
 import { usePaneContext, usePaneFocus } from "@/panels/pane-context";
 import { definePanel, type PanelIconProps } from "@/panels/panel-registry";
 import { ICON_SIZE, SPACING, type Theme } from "@/styles/theme";
+import { useEmbedLauncherLocked } from "@/figmenta/launcher-lock"; // Figmenta: launcher gate
+import { EmbedSessionClosedNotice } from "@/figmenta/launcher-closed-notice"; // Figmenta: launcher gate
 import {
   useWorkspaceTabLaunchCatalog,
   type WorkspaceTabLaunchItem,
@@ -143,6 +145,7 @@ const NewTabPanel = memo(function NewTabPanel(): ReactElement {
     [groups],
   );
   const handlesWorkspaceShortcuts = isInteractive && host === "main";
+  const embedLauncherLocked = useEmbedLauncherLocked(); // Figmenta: launcher gate
 
   useEffect(() => {
     if (!isWeb || !isInteractive) return;
@@ -240,6 +243,9 @@ const NewTabPanel = memo(function NewTabPanel(): ReactElement {
     priority: 250,
     handle: handleKeyboardAction,
   });
+
+  // Figmenta: launcher gate
+  if (embedLauncherLocked) return <EmbedSessionClosedNotice />;
 
   return (
     <View ref={containerRef} style={styles.container} testID="workspace-new-tab-panel">

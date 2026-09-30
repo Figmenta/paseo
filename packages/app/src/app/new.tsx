@@ -1,6 +1,8 @@
 import { useLocalSearchParams } from "expo-router";
 import { HostRouteBootstrapBoundary } from "@/components/host-route-bootstrap-boundary";
 import { NewWorkspaceScreen } from "@/screens/new-workspace-screen";
+import { useEmbedLauncherLocked } from "@/figmenta/launcher-lock"; // Figmenta: launcher gate
+import { EmbedSessionClosedNotice } from "@/figmenta/launcher-closed-notice"; // Figmenta: launcher gate
 
 export default function NewWorkspaceRoute() {
   const params = useLocalSearchParams<{
@@ -22,6 +24,8 @@ export default function NewWorkspaceRoute() {
     projectId ?? null,
     draftId ?? null,
   ]);
+  const embedLauncherLocked = useEmbedLauncherLocked(); // Figmenta: launcher gate
+  if (embedLauncherLocked) return <EmbedSessionClosedNotice />; // Figmenta: launcher gate
 
   return (
     <HostRouteBootstrapBoundary>

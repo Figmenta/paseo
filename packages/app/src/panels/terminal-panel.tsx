@@ -7,6 +7,8 @@ import invariant from "tiny-invariant";
 import type { ListTerminalsResponse } from "@getpaseo/protocol/messages";
 import { deriveTerminalActivityStatusBucket } from "@getpaseo/protocol/terminal-activity";
 import { TerminalPane } from "@/components/terminal-pane";
+import { useEmbedLauncherLocked } from "@/figmenta/launcher-lock"; // Figmenta: launcher gate
+import { EmbedSessionClosedNotice } from "@/figmenta/launcher-closed-notice"; // Figmenta: launcher gate
 import { usePaneContext, usePaneFocus } from "@/panels/pane-context";
 import { definePanel, type PanelDescriptor } from "@/panels/panel-registry";
 import { queryClient } from "@/data/query-client";
@@ -91,7 +93,11 @@ function TerminalPanel() {
     }
     openCompactFileExplorer({ serverId, cwd: workspaceDirectory, isGit: isGitCheckout });
   }, [isGitCheckout, openCompactFileExplorer, serverId, workspaceDirectory]);
+  const embedLauncherLocked = useEmbedLauncherLocked(); // Figmenta: launcher gate
   invariant(target.kind === "terminal", "TerminalPanel requires terminal target");
+
+  // Figmenta: launcher gate — an open or restored terminal tab does not attach in a locked embed.
+  if (embedLauncherLocked) return <EmbedSessionClosedNotice />;
 
   if (!workspaceDirectory) {
     return (

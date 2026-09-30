@@ -15,6 +15,7 @@ import {
 } from "lucide-react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { useTranslation } from "react-i18next";
+import { useEmbedLauncherLocked } from "@/figmenta/launcher-lock"; // Figmenta: launcher gate
 import type { WorkspaceDescriptor } from "@/stores/session-store";
 import { useSessionStore } from "@/stores/session-store";
 import { useHostRuntimeSnapshot } from "@/runtime/host-runtime";
@@ -534,7 +535,13 @@ function ScriptRow({
   );
 }
 
-export function WorkspaceScriptsButton({
+// Figmenta: launcher gate — scripts start terminals: no button in a locked embed.
+export function WorkspaceScriptsButton(props: WorkspaceScriptsButtonProps): ReactElement | null {
+  const embedLauncherLocked = useEmbedLauncherLocked();
+  return embedLauncherLocked ? null : <WorkspaceScriptsButtonContent {...props} />;
+}
+
+function WorkspaceScriptsButtonContent({
   serverId,
   workspaceId,
   scripts,
