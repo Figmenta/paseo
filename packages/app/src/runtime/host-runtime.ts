@@ -1,3 +1,4 @@
+import { canCreateEmbedTerminal } from "@/figmenta/launcher-lock"; // Figmenta: launcher gate
 import { useSyncExternalStore, useMemo } from "react";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import equal from "fast-deep-equal/es6";
@@ -518,6 +519,7 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
         capabilities: appCapabilities,
         trace: nativePerformanceTrace,
         providerSnapshots: "wire",
+        canCreateTerminal: canCreateEmbedTerminal, // Figmenta: launcher gate
       } satisfies Omit<DaemonClientConfig, "url">;
       if (connection.type === "directSocket" || connection.type === "directPipe") {
         return new DaemonClient({

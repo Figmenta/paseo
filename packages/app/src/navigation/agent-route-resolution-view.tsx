@@ -3,6 +3,7 @@ import { ArrowLeftToLine, RotateCw, Settings } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { isEmbedMode } from "@/figmenta/embed";
+import { EmbedSessionClosedNotice } from "@/figmenta/launcher-closed-notice"; // Figmenta: launcher gate
 import { Button } from "@/components/ui/button";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import type { AgentRouteResolution } from "@/navigation/agent-route-resolution";
@@ -11,7 +12,8 @@ import type { Theme } from "@/styles/theme";
 
 type VisibleAgentRouteResolution = Extract<
   AgentRouteResolution,
-  { kind: "waitingForHost" | "fetchingAgent" | "lookupError" }
+  // Figmenta: launcher gate — "notFound" is shown only in a locked embed.
+  { kind: "waitingForHost" | "fetchingAgent" | "lookupError" | "notFound" }
 >;
 
 const ThemedLoadingSpinner = withUnistyles(LoadingSpinner);
@@ -35,6 +37,9 @@ export function AgentRouteResolutionView({
   onBack: () => void;
 }) {
   const { t } = useTranslation();
+
+  // Figmenta: launcher gate
+  if (resolution.kind === "notFound") return <EmbedSessionClosedNotice />;
 
   if (resolution.kind === "fetchingAgent") {
     return (

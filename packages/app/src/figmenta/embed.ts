@@ -15,6 +15,11 @@ import { useSyncExternalStore } from "react";
 import { UnistylesRuntime } from "react-native-unistyles";
 import { isWeb } from "@/constants/platform";
 import { THEME_TO_UNISTYLES } from "@/styles/theme";
+import {
+  applyEmbedLauncherMessage,
+  EMBED_LAUNCHER_MESSAGE_TYPE,
+  resetEmbedLauncherLock,
+} from "@/figmenta/launcher-lock";
 
 const STORAGE_KEY = "figmentaEmbed";
 const QUERY_KEY = "embed";
@@ -67,6 +72,7 @@ export function resetEmbedModeCache(): void {
   cachedTheme = undefined;
   composerLocks.clear();
   modelAllowLists.clear();
+  resetEmbedLauncherLock();
 }
 
 // ---------------------------------------------------------------------------
@@ -80,6 +86,8 @@ export function resetEmbedModeCache(): void {
 //                                  model menu, permission modes and effort levels;
 //                                  agentId "*" = the person's default: drafts, unnamed agents
 //   { type: "maestro.theme", theme }           hot dark/light switch
+//   { type: "maestro.launcher", allowed }      launcher + terminals open (true) or shut (false);
+//                                  shut until the first `allowed: true` (launcher-lock.ts)
 // One goes back out, to the parent, same origin: `{ type: "maestro.embed.ready" }`, once per
 // document, as soon as the listener is up. The listener is installed by a React effect, after the
 // frame's `load`, so what Orchestra posts at `load` is lost: the ready is its cue to post again.
@@ -461,6 +469,7 @@ function handleEmbedMessage(event: MessageEvent): void {
     hidden?: unknown;
     modes?: unknown;
     efforts?: unknown;
+    allowed?: unknown;
   } | null;
   if (typeof data?.type !== "string") return;
 
@@ -482,6 +491,10 @@ function handleEmbedMessage(event: MessageEvent): void {
     }
     case "maestro.models.allow": {
       applyEmbedModelsAllow(data);
+      return;
+    }
+    case EMBED_LAUNCHER_MESSAGE_TYPE: {
+      applyEmbedLauncherMessage(data);
       return;
     }
     case "maestro.theme": {

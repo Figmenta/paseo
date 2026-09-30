@@ -9,6 +9,11 @@ import { getHostRuntimeStore, useHostRuntimeSnapshot, useHosts } from "@/runtime
 import { buildHostRootRoute, buildSettingsHostRoute } from "@/utils/host-routes";
 import { toErrorMessage } from "@/utils/error-messages";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
+import {
+  showsResolutionView,
+  skipsNotFoundRedirect,
+  useEmbedLauncherLocked,
+} from "@/figmenta/launcher-lock"; // Figmenta: launcher gate
 
 export default function HostAgentReadyRoute() {
   return (
@@ -91,7 +96,11 @@ function HostAgentReadyRouteContent() {
     lookup,
   });
 
+  const embedLauncherLocked = useEmbedLauncherLocked(); // Figmenta: launcher gate
+
   useEffect(() => {
+    // Figmenta: launcher gate — a missing agent in a locked embed stays here, no bounce.
+    if (skipsNotFoundRedirect(resolution.kind, embedLauncherLocked)) return;
     let navigationKey: string | null = null;
     if (resolution.kind === "invalid") {
       navigationKey = "invalid";
@@ -110,7 +119,7 @@ function HostAgentReadyRouteContent() {
       return;
     }
     router.replace(resolution.kind === "invalid" ? ("/" as Href) : buildHostRootRoute(serverId));
-  }, [agentId, resolution, router, serverId]);
+  }, [agentId, embedLauncherLocked, resolution, router, serverId]); // Figmenta: launcher gate
 
   const handleRetry = useCallback(() => {
     if (resolution.kind === "lookupError") {
@@ -134,11 +143,8 @@ function HostAgentReadyRouteContent() {
     router.replace(serverId ? buildHostRootRoute(serverId) : ("/" as Href));
   }, [router, serverId]);
 
-  if (
-    resolution.kind === "waitingForHost" ||
-    resolution.kind === "fetchingAgent" ||
-    resolution.kind === "lookupError"
-  ) {
+  // Figmenta: launcher gate — upstream kinds, plus "notFound" in a locked embed.
+  if (showsResolutionView(resolution, embedLauncherLocked)) {
     // Agent URLs intentionally omit workspaceId. Keep this route mounted while the target host
     // reconnects, then resolve the workspace from the authoritative agent record.
     return (

@@ -6899,3 +6899,52 @@ test("reviewed plugin updates gate before requests and preserve exact proposal d
     ]);
   }
 });
+
+// Figmenta: launcher gate
+test("createTerminal is refused without a request when canCreateTerminal says no", async () => {
+  const mock = createMockTransport();
+  let allowed = false;
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "figmenta_launcher_gate_unit_test",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+    canCreateTerminal: () => allowed,
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen();
+  await connecting;
+
+  await expect(client.createTerminal("/tmp")).rejects.toThrow(
+    "Terminals are not available in this session.",
+  );
+  expect(mock.sent).toEqual([]);
+
+  allowed = true;
+  const pending = client.createTerminal("/tmp");
+  pending.catch(() => {});
+  const frames = mock.sent
+    .filter((frame): frame is string => typeof frame === "string")
+    .map((frame) => JSON.stringify(JSON.parse(frame)));
+  expect(frames.some((frame) => frame.includes('"create_terminal_request"'))).toBe(true);
+});
+
+// Figmenta: launcher gate
+test("createTerminal sends the request when no canCreateTerminal is configured", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "figmenta_launcher_gate_default_unit_test",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen();
+  await connecting;
+
+  const pending = client.createTerminal("/tmp");
+  pending.catch(() => {});
+  expect(mock.sent.some((frame) => String(frame).includes("create_terminal_request"))).toBe(true);
+});

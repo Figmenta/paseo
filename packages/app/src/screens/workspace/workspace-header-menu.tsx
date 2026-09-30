@@ -2,6 +2,7 @@ import React, { useCallback, useMemo } from "react";
 import { View } from "react-native";
 import { useRouter, type Href } from "expo-router";
 import { useTranslation } from "react-i18next";
+import { useEmbedLauncherLocked } from "@/figmenta/launcher-lock"; // Figmenta: launcher gate
 import {
   Copy,
   Ellipsis,
@@ -226,6 +227,7 @@ export function WorkspaceHeaderMenuMobile({
   const { t } = useTranslation();
   const router = useRouter();
   const { config } = useDaemonConfig(normalizedServerId);
+  const embedLauncherLocked = useEmbedLauncherLocked(); // Figmenta: launcher gate
   const profiles = useMemo(
     () => resolveTerminalProfiles(config?.terminalProfiles),
     [config?.terminalProfiles],
@@ -269,31 +271,38 @@ export function WorkspaceHeaderMenuMobile({
           </DropdownMenuItem>
         ) : null}
         <WorkspaceHeaderWorkspaceActionItems {...workspaceActions} />
-        <DropdownMenuSeparator />
-        <DropdownMenuLabel>{t("workspace.tabs.actions.terminalProfilesMenu")}</DropdownMenuLabel>
-        <DropdownMenuItem
-          testID="workspace-header-new-terminal"
-          leading={MENU_NEW_TERMINAL_ICON}
-          disabled={createTerminalDisabled}
-          onSelect={onCreateTerminal}
-        >
-          {t("workspace.header.actions.newTerminal")}
-        </DropdownMenuItem>
-        {profiles.map((profile) => (
-          <HeaderMenuProfileItem
-            key={profile.id}
-            profile={profile}
-            disabled={createTerminalDisabled}
-            onCreateTerminalWithProfile={onCreateTerminalWithProfile}
-          />
-        ))}
-        <DropdownMenuSeparator />
-        <DropdownMenuItem
-          testID="workspace-header-edit-terminal-profiles"
-          onSelect={handleEditProfiles}
-        >
-          {t("workspace.tabs.actions.editTerminalProfiles")}
-        </DropdownMenuItem>
+        {/* Figmenta: launcher gate — no terminal entries in a locked embed. */}
+        {embedLauncherLocked ? null : (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuLabel>
+              {t("workspace.tabs.actions.terminalProfilesMenu")}
+            </DropdownMenuLabel>
+            <DropdownMenuItem
+              testID="workspace-header-new-terminal"
+              leading={MENU_NEW_TERMINAL_ICON}
+              disabled={createTerminalDisabled}
+              onSelect={onCreateTerminal}
+            >
+              {t("workspace.header.actions.newTerminal")}
+            </DropdownMenuItem>
+            {profiles.map((profile) => (
+              <HeaderMenuProfileItem
+                key={profile.id}
+                profile={profile}
+                disabled={createTerminalDisabled}
+                onCreateTerminalWithProfile={onCreateTerminalWithProfile}
+              />
+            ))}
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              testID="workspace-header-edit-terminal-profiles"
+              onSelect={handleEditProfiles}
+            >
+              {t("workspace.tabs.actions.editTerminalProfiles")}
+            </DropdownMenuItem>
+          </>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );

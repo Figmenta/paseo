@@ -321,6 +321,11 @@ export type BrowserAutomationExecuteRequestMessage = BrowserAutomationExecuteReq
 export type BrowserAutomationExecuteResponseMessage = BrowserAutomationExecuteResponse;
 
 export interface DaemonClientConfig {
+  /**
+   * Figmenta: launcher gate. Asked before every `createTerminal`; false = rejected without a
+   * request. Absent = always permitted (upstream behavior).
+   */
+  canCreateTerminal?: () => boolean;
   /** Deliver compact bodies/hash references to a caller-owned snapshot cache.
    * The default keeps public SDK snapshot entries expanded. */
   providerSnapshots?: "wire";
@@ -5652,6 +5657,10 @@ export class DaemonClient {
       size?: { rows: number; cols: number };
     },
   ): Promise<CreateTerminalPayload> {
+    // Figmenta: launcher gate
+    if (this.config.canCreateTerminal && !this.config.canCreateTerminal()) {
+      throw new Error("Terminals are not available in this session.");
+    }
     const resolvedRequestId = this.createRequestId(requestId);
     const message = SessionInboundMessageSchema.parse({
       type: "create_terminal_request",
