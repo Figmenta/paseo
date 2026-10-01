@@ -130,8 +130,20 @@ describe("startup splash", () => {
     expect(splash.close).toHaveBeenCalledTimes(1);
     controller.adoptFirstWindow(window);
     controller.firstWindowReady();
-    expect(window.reveal).toHaveBeenCalledWith({ bringToFront: true });
+    // The setup window (or a startup dialog) owns the focus now: no stealing it.
+    expect(window.reveal).toHaveBeenCalledWith({ bringToFront: false });
     expect(splash.fadeOutAndClose).not.toHaveBeenCalled();
+  });
+
+  it("closes the splash even when showing the first window throws", () => {
+    const { controller, splash, window } = harness();
+    controller.start({ gotSingleInstanceLock: true });
+    window.reveal.mockImplementation(() => {
+      throw new Error("focus failed");
+    });
+    controller.adoptFirstWindow(window);
+    expect(() => controller.firstWindowLoaded()).toThrow("focus failed");
+    expect(splash.fadeOutAndClose).toHaveBeenCalledTimes(1);
   });
 
   it("hides and shows the splash around a startup dialog", () => {
@@ -166,6 +178,18 @@ describe("revealWindow", () => {
       "moveTop",
       "setAlwaysOnTop(false)",
     ]);
+  });
+
+  it("on Windows never stays topmost, even when focus or moveTop throw", () => {
+    for (const failing of ["focus", "moveTop"] as const) {
+      const { calls, record } = ops();
+      record[failing] = () => {
+        calls.push(failing);
+        throw new Error(`${failing} failed`);
+      };
+      expect(() => revealWindow(record, { platform: "win32", bringToFront: true })).toThrow();
+      expect(calls.at(-1)).toBe("setAlwaysOnTop(false)");
+    }
   });
 
   it("on macOS activates the app", () => {

@@ -46,6 +46,7 @@ export class StartupSplashController {
   private firstWindow: FirstWindowHandle | null = null;
   private firstWindowReadyToShow = false;
   private revealed = false;
+  private dismissed = false;
   private updateBlocking = false;
   private timer: unknown = null;
 
@@ -114,6 +115,7 @@ export class StartupSplashController {
   /** Another startup window takes the splash's place (the engine setup). */
   dismiss(reason: string): void {
     if (!this.splash) return;
+    this.dismissed = true;
     this.splash.close();
     this.splash = null;
     this.deps.log("splash dismissed", { reason });
@@ -130,11 +132,18 @@ export class StartupSplashController {
       this.deps.clearTimer(this.timer);
       this.timer = null;
     }
-    this.firstWindow.reveal({ bringToFront: true });
     const splash = this.splash;
     this.splash = null;
-    splash?.fadeOutAndClose(this.deps.fadeMs ?? STARTUP_SPLASH_FADE_MS);
-    this.deps.log("first window shown", { reason, splashFaded: splash !== null });
+    // A splash that gave way to a dialog or the engine setup means that window owns the
+    // focus now: the first window shows without stealing it (review of PR #3).
+    const bringToFront = !this.dismissed;
+    try {
+      this.firstWindow.reveal({ bringToFront });
+    } finally {
+      // Whatever reveal throws, the splash (topmost, frameless, not closable) must go.
+      splash?.fadeOutAndClose(this.deps.fadeMs ?? STARTUP_SPLASH_FADE_MS);
+      this.deps.log("first window shown", { reason, splashFaded: splash !== null, bringToFront });
+    }
   }
 }
 
@@ -161,9 +170,13 @@ export function revealWindow(
   if (!input.bringToFront) return;
   if (input.platform === "win32") {
     ops.setAlwaysOnTop(true);
-    ops.focus();
-    ops.moveTop();
-    ops.setAlwaysOnTop(false);
+    try {
+      ops.focus();
+      ops.moveTop();
+    } finally {
+      // Never leave Orchestra topmost for the whole session, whatever focus/moveTop throw.
+      ops.setAlwaysOnTop(false);
+    }
     return;
   }
   if (input.platform === "darwin") ops.stealAppFocus();
