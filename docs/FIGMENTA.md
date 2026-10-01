@@ -389,6 +389,58 @@ bundledVersion, paseoAppVersion}`.
 - The version-mismatch restart compares the daemon with the server version this app
   launched (`ownedLaunch.serverVersion`), not with the app version.
 
+### Startup splash and first show
+
+Observed by Federico on Windows (1.3.6, Michelle's PC): after the one-click installer closed,
+nothing was on screen for 10-15 s, then Orchestra opened behind the other windows. Since the
+next release:
+
+- `showStartupSplash()` runs right after `app.whenReady()` in `bootstrap()`, after the
+  single-instance gate (a second instance quits before it and never opens one). It is a
+  320x300 frameless window, `#08090B`, with the logo (`assets/128x128@2x.png`, shipped as
+  `Resources/splash-logo.png` by an `extraResources` entry), a CSS loading bar and
+  `v<version>`. The page is a `data:` URL with CSP `default-src 'none'; img-src data:;
+style-src 'unsafe-inline'`, JavaScript off, sandboxed, no node integration; popups denied,
+  navigation refused. It is `focusable: false`, `skipTaskbar`, `alwaysOnTop` (floating level
+  on macOS), shown with `showInactive()`: it never takes the focus.
+- The first Orchestra window (`adoptFirstOrchestraWindow`, in `createWindow`) stays hidden
+  until the site has loaded (`did-finish-load`); a main-frame `did-fail-load` (not `-3`) or
+  15 s without a load shows it anyway, so the splash never stays forever. When it shows, the
+  splash fades out in 400 ms (window opacity, driven from the main process) and closes.
+- The first show brings Orchestra to the front, once per process: Windows `show()`,
+  `setAlwaysOnTop(true)`, `focus()`, `moveTop()`, `setAlwaysOnTop(false)` (focus-stealing
+  prevention ignores a plain `focus()` from a process the user did not just click); macOS
+  `app.focus({ steal: true })`. This covers the launch after install (`runAfterFinish`), the
+  `--updated` relaunch and a normal launch, which all go through the same first window.
+  Every later window (second instance, menu, "Open in new window") shows as before and
+  never takes the focus.
+- It gives way, never covers: the mandatory-update screen shows the first window as soon as
+  it can paint, without waiting for the site, and is never attached to the splash; the
+  engine setup window dismisses the splash and never takes it as parent; the
+  move-to-Applications dialog hides it while it is up; the engine warning dismisses it.
+  `desktopWindowOwner` does not count it as an Orchestra window.
+- `main.log` carries the timeline in ms since the process started:
+  `[startup-splash] splash shown / splash on screen / first window created / first window
+shown {reason} / splash closed`, next to `[orchestra] daemon ready`.
+- Code: `src/figmenta/startup-splash.ts` (pure: controller, `revealWindow`, tested),
+  `startup-splash-page.ts` (page, tested), `startup-splash-electron.ts` (windows).
+
+Measured on macOS (Apple Silicon, packaged unsigned build, isolated userData and
+`PASEO_HOME`, daemon on a test port, warm launch), from exec to:
+
+|                                          | 1.3.6              | with splash                 |
+| ---------------------------------------- | ------------------ | --------------------------- |
+| first thing on screen                    | 7.6 s (the window) | 1.7 s (the splash)          |
+| engine ready (`daemon ready`)            | 6.0 s              | 5.4 s                       |
+| Orchestra window on screen and frontmost | 7.6 s              | 6.7 s, splash gone by 7.1 s |
+
+Where the wait goes: Electron and Node boot about 1.2 s, the login shell 0.2-0.4 s (macOS
+only, before Electron is ready, so before the splash can paint), the engine start 3.7-4.2 s,
+the seed check about 1 s (`/api/health` plus `paseo plugin ls --json`, serial, before the
+window is created), the site 0.4 s. On macOS a plain `show()` already activates the app, so
+the forced focus changes nothing measurable there; the Windows path is covered by the unit
+test of the call order and has to be checked on a Windows machine.
+
 ### Version line
 
 Orchestra Desktop has its own version line from **1.0.0** (`packages/desktop/package.json`),

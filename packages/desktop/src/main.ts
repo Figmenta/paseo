@@ -122,6 +122,12 @@ import {
   registerEngineSetup,
   retryEngineSetup,
 } from "./figmenta/claude-code-setup-electron.js";
+import {
+  adoptFirstOrchestraWindow,
+  dismissStartupSplash,
+  isStartupSplashWindow,
+  showStartupSplash,
+} from "./figmenta/startup-splash-electron.js";
 import { registerBrowserAutomationIpc } from "./features/browser-automation/ipc.js";
 import { BrowserKeyboard } from "./features/browser-keyboard/index.js";
 import {
@@ -808,9 +814,14 @@ async function createWindow(
     registerBrowserWebviewNavigationGuards(contents);
   });
 
-  mainWindow.once("ready-to-show", () => {
-    mainWindow.show();
-  });
+  // Figmenta fork: the first window of the process waits for the site behind the startup
+  // splash and comes to the front once (figmenta/startup-splash-electron.ts); later windows
+  // show as before and never take the focus.
+  if (!adoptFirstOrchestraWindow(mainWindow)) {
+    mainWindow.once("ready-to-show", () => {
+      mainWindow.show();
+    });
+  }
 
   installOrchestraWindowGuards(mainWindow);
 
@@ -903,7 +914,10 @@ desktopWindowOwner = createDesktopWindowOwner<AgentDeepLinkTarget>({
     });
     return ownedDesktopWindow(win);
   },
-  windows: () => BrowserWindow.getAllWindows().map(ownedDesktopWindow),
+  windows: () =>
+    BrowserWindow.getAllWindows()
+      .filter((win) => !isStartupSplashWindow(win))
+      .map(ownedDesktopWindow),
   focusedWindow: () => {
     const win = BrowserWindow.getFocusedWindow();
     if (!win) return null;
@@ -1101,6 +1115,8 @@ async function verifyOrchestraDaemonSeed(listen: string | null): Promise<void> {
 
 function showDaemonSeedWarning(): void {
   const ours = wasDaemonSpawnedByThisApp();
+  // Figmenta fork: the startup splash floats above every window; the warning goes first.
+  dismissStartupSplash("engine warning");
   void dialog
     .showMessageBox({
       type: "warning",
@@ -1187,6 +1203,9 @@ async function bootstrap(): Promise<void> {
   }
 
   await app.whenReady();
+  // Figmenta fork: on screen before anything else starts (engine, site), until the first
+  // Orchestra window has loaded. A second instance never gets here: it quit above.
+  showStartupSplash({ gotSingleInstanceLock: true });
 
   const appDistDir = getAppDistDir();
   protocol.handle(APP_SCHEME, (request) => {
