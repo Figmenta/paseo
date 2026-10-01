@@ -20,6 +20,11 @@ import {
 } from "./mandatory-update.js";
 import { ElectronUpdaterRuntime } from "./mandatory-update-runtime.js";
 import { updateOverlayPageUrl } from "./update-overlay-page.js";
+import {
+  isStartupSplashWindow,
+  notifyStartupUpdateBlocking,
+  withStartupSplashHidden,
+} from "./startup-splash-electron.js";
 
 // Figmenta fork: the Electron side of the mandatory updater (policy in mandatory-update.ts).
 //
@@ -53,6 +58,11 @@ export async function offerMoveToApplicationsFolder(): Promise<"moved" | "stayed
   ) {
     return "stayed";
   }
+  // The startup splash floats above every window: out of the way while the dialog is up.
+  return withStartupSplashHidden(offerMove);
+}
+
+async function offerMove(): Promise<"moved" | "stayed"> {
   const { response } = await dialog.showMessageBox({
     type: "question",
     title: "Orchestra",
@@ -103,7 +113,7 @@ class UpdateOverlayView implements MandatoryUpdateView {
 
   constructor() {
     app.on("browser-window-created", (_event, win) => {
-      if (this.isBlocking()) this.attach(win);
+      if (this.isBlocking() && !isStartupSplashWindow(win)) this.attach(win);
     });
   }
 
@@ -128,7 +138,10 @@ class UpdateOverlayView implements MandatoryUpdateView {
       for (const win of Array.from(this.overlays.keys())) this.detach(win);
       return;
     }
+    // The startup splash gives way: the first window shows at once, under this screen.
+    notifyStartupUpdateBlocking();
     for (const win of BrowserWindow.getAllWindows()) {
+      if (isStartupSplashWindow(win)) continue;
       if (!this.overlays.has(win)) this.attach(win);
     }
     for (const view of this.overlays.values()) {

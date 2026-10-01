@@ -34,6 +34,9 @@ extraResources:
     to: app-dist
   - from: assets/editor-targets
     to: editor-target-icons
+  # Figmenta fork: the startup splash logo (figmenta/startup-splash-electron.ts), every platform.
+  - from: assets/128x128@2x.png
+    to: splash-logo.png
   # Figmenta fork: the figmenta-sessions plugin ships inside the app and is seeded into
   # ~/.paseo/config.json at boot. Its source is private, so figmenta-plugin/ is git-ignored
   # and filled before the build by scripts/figmenta-plugin-sync.sh from the private repo

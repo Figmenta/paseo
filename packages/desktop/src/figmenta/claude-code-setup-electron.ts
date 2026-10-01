@@ -17,6 +17,7 @@ import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { app, BrowserWindow, ipcMain, type WebContents } from "electron";
 import log from "electron-log/main";
+import { dismissStartupSplash, isStartupSplashWindow } from "./startup-splash-electron.js";
 import {
   claudeCodeInstallerCommand,
   claudeCodeShim,
@@ -553,7 +554,7 @@ class SetupWindow {
     const win = this.win;
     if (!win || win.isDestroyed()) return;
     const parent = BrowserWindow.getAllWindows().find(
-      (other) => other !== win && !other.isDestroyed(),
+      (other) => other !== win && !other.isDestroyed() && !isStartupSplashWindow(other),
     );
     if (parent) win.setParentWindow(parent);
     win.show();
@@ -579,9 +580,14 @@ class SetupWindow {
   }
 
   private open(): void {
+    // It stands in for Orchestra while something installs: the startup splash gives way to it
+    // (and is never its parent, a child closes with its parent).
+    dismissStartupSplash("engine setup window");
     const parent =
       BrowserWindow.getFocusedWindow() ??
-      BrowserWindow.getAllWindows().find((other) => !other.isDestroyed()) ??
+      BrowserWindow.getAllWindows().find(
+        (other) => !other.isDestroyed() && !isStartupSplashWindow(other),
+      ) ??
       null;
     const win = new BrowserWindow({
       title: "Orchestra",
