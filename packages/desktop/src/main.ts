@@ -1365,7 +1365,11 @@ electronAutoUpdater.on("before-quit-for-update", () => {
 // Figmenta fork: `orchestra_session` is a persistent cookie (Max-Age 7 days), so
 // Chromium keeps it across launches on its own. Chromium's cookie store writes are
 // asynchronous though, so a login seconds before quit could still be in flight: flush it.
+// A second instance that loses the single-instance lock calls app.quit() BEFORE the app is
+// ready, and reading session.defaultSession then throws "Session can only be received when
+// app is ready" as an uncaught exception dialog (Windows, 1.3.5). Nothing to flush there.
 app.on("before-quit", () => {
+  if (!app.isReady()) return;
   void session.defaultSession.cookies.flushStore().catch((error: unknown) => {
     log.error("[orchestra] failed to flush the cookie store on quit", error);
   });
