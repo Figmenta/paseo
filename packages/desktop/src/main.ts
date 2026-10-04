@@ -878,15 +878,21 @@ function installOrchestraWindowGuards(win: BrowserWindow): void {
     installOrchestraWindowGuards(child);
   });
 
-  // Three events, one boundary: a redirect and a subframe navigation leave the origin
-  // just as effectively as a click on a link.
+  // The boundary is the WINDOW: a link, a redirect or a frame navigation of the main frame
+  // that leaves Orchestra goes to the system browser. A subframe is different: an
+  // `<iframe>` that Orchestra itself puts on the page (the external view of a Concerto
+  // update, Figmenta 2026-10-04) must load its own site in place, as in any browser. It
+  // stays inside its HTML sandbox and cannot move the window: a top navigation from it
+  // still reaches `will-navigate`, and a `target=_blank` reaches the window-open handler.
   win.webContents.on("will-navigate", (event, url) => {
     externalizeOrchestraNavigation(event, url);
   });
   win.webContents.on("will-redirect", (event, url) => {
+    if (!event.isMainFrame) return;
     externalizeOrchestraNavigation(event, url);
   });
   win.webContents.on("will-frame-navigate", (event) => {
+    if (!event.isMainFrame) return;
     externalizeOrchestraNavigation(event, event.url);
   });
 }
