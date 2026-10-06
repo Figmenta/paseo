@@ -89,6 +89,7 @@ import {
 } from "@/stores/workspace-layout-store";
 import type { WorkspaceTab } from "@/workspace-tabs/model";
 import { isEmbedMode } from "@/figmenta/embed";
+import { useEmbedLauncherLocked } from "@/figmenta/launcher-lock"; // Figmenta: launcher gate
 import { RenderProfile } from "@/utils/render-profiler";
 import { isNative } from "@/constants/platform";
 import { panelTargetSupportsHost } from "@/plugins/workspace-panels/locations";
@@ -1160,6 +1161,7 @@ function SplitPaneView({
   focusModeEnabled,
   onExitFocusMode,
 }: SplitPaneViewProps) {
+  const embedLauncherLocked = useEmbedLauncherLocked(); // Figmenta: launcher gate
   const paneRef = useRef<View | null>(null);
   const stableOnFocusPane = useStableEvent(onFocusPane);
   const paneState = useMemo(
@@ -1262,10 +1264,14 @@ function SplitPaneView({
         {/* Figmenta embed mode: Orchestra lists the sessions in its own sidebar,
             so the pane's tab strip (and its + / ... actions) is not drawn. The
             strip has no fixed height - styles.paneTabs is position/minWidth only -
-            so the content pane simply takes the room (docs/FIGMENTA.md). */}
-        {isEmbedMode() ? null : (
+            so the content pane simply takes the room (docs/FIGMENTA.md).
+            Figmenta: launcher gate - once Orchestra allows the launcher
+            («Can open terminals and the launcher») the strip comes back, so the
+            person has the + to open a terminal and the tabs to switch back to the
+            chat. No titlebar drag region inside the iframe. */}
+        {embedLauncherLocked ? null : (
           <WindowChromeSafeArea placement="inline" style={styles.paneTabs}>
-            <TitlebarDragRegion />
+            {isEmbedMode() ? null : <TitlebarDragRegion />}
             <WorkspaceDesktopTabsRow
               paneId={pane.id}
               isFocused={isFocused && isWorkspaceFocused}

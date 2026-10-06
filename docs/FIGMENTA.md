@@ -73,6 +73,12 @@ Three call sites, three hunks to reapply after a rebase:
 }
 ```
 
+Since the launcher-gate follow-up (2026-10-06) the guard is `embedLauncherLocked` (from
+`useEmbedLauncherLocked`), not `isEmbedMode()`: once Orchestra posts `maestro.launcher`
+`allowed: true` the strip is drawn again, without the titlebar drag region, so a person with
+«Can open terminals and the launcher» has the `+` and can switch between the chat and a
+terminal tab. Locked, the strip stays hidden as before.
+
 Only the strip goes: the pane content below it is untouched. No height needs zeroing —
 `styles.paneTabs` carries `position` and `minWidth` only, never a height, so the content
 pane takes the room on its own.
@@ -254,6 +260,7 @@ outside `src/figmenta/` is marked `// Figmenta: launcher gate`:
 | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | `packages/app/src/figmenta/embed.ts`                              | `maestro.launcher` case in the bridge; `resetEmbedModeCache` resets the gate                                          |
 | `packages/app/src/keyboard/keyboard-action-dispatcher.ts`         | `dispatch` drops `LAUNCHER_ACTION_IDS` (shortcuts and command palette)                                                |
+| `packages/app/src/components/split-container.tsx`                 | pane tab strip (with its «+») drawn in embed only when the launcher is allowed; no drag region in embed             |
 | `packages/app/src/workspace-tabs/launcher/index.tsx`              | `useWorkspaceTabLaunchCatalog` returns `[]` (new_tab panel, «+» menu, explorer rail)                                  |
 | `packages/app/src/panels/new-tab-panel.tsx`                       | notice instead of the launcher                                                                                        |
 | `packages/app/src/panels/terminal-panel.tsx`                      | open or restored terminal tabs render the notice, never attach (not closed: see below)                                |
