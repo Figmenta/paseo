@@ -197,7 +197,7 @@ exports.default = async function afterPack(context) {
   }
 
   if (platform === "linux") {
-    installLinuxLauncher(context.appOutDir);
+    installLinuxLauncher(context.appOutDir, context.packager.executableName);
   }
 
   if (platform === "linux" || platform === "win32") {

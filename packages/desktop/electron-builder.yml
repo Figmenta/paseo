@@ -86,23 +86,37 @@ linux:
   category: Development
   icon: assets
   artifactName: "Orchestra-${version}-${arch}.${ext}"
-  maintainer: "Mohamed Boudra <hello@moboudra.com>"
+  maintainer: "Figmenta <ivan@figmenta.io>"
   vendor: "Figmenta"
+  desktop:
+    entry:
+      StartupWMClass: Orchestra
   extraResources:
     - from: bin/paseo
       to: bin/paseo
   target:
-    - AppImage
-    - deb
-    - rpm
-    - tar.gz
+    - target: deb
+      arch: [x64]
 deb:
+  packageName: orchestra
   afterInstall: scripts/linux-sandbox/after-install.tpl
+  depends:
+    - libgtk-3-0
+    - libnotify4
+    - libnss3
+    - libxss1
+    - libxtst6
+    - xdg-utils
+    - libatspi2.0-0
+    - libuuid1
+    - libsecret-1-0
+    - "libasound2t64 | libasound2"
+    - "pkexec | policykit-1"
 rpm:
   afterInstall: scripts/linux-sandbox/after-install.tpl
 appImage:
   # A nonempty argument list replaces builder's hardcoded --no-sandbox default.
-  executableArgs: ["--class=Paseo"]
+  executableArgs: ["--class=Orchestra"]
   # Keep the AppImage filename stable across versions (no ${version}) so
   # electron-updater overwrites the file in place instead of renaming it to a new
   # versioned path. A rename orphans the old binary, breaks desktop shortcuts, and

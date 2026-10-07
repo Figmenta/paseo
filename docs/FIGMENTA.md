@@ -646,6 +646,16 @@ FIGMENTA_ASC_ISSUER=<App Store Connect issuer id> packages/desktop/scripts/figme
 
 Windows: in the private plugin repository (see "Plugin injection").
 
+### Linux
+
+- Only `.deb` x64 (`linux.target` in `electron-builder.yml`); package name `orchestra`, with
+  `pkexec | policykit-1` in `depends` so the updater installs without a terminal `sudo`.
+- Built in the private repository `Figmenta/paseo-orchestra-plugin` by the
+  `desktop-linux.yml` workflow, on a `desktop-linux-v<version>` tag.
+- Update feed: `latest-linux.yml`.
+- `after-pack.js` calls `installLinuxLauncher(context.appOutDir, context.packager.executableName)`:
+  `Orchestra` becomes `launcher.sh`, the Electron binary moves to `Orchestra.bin`.
+
 ### Rebase on 0.9.2
 
 On 2026-09-27 the 15 Figmenta commits were rebased from `v0.8.0` onto `v0.9.2` (branch
@@ -657,6 +667,7 @@ On 2026-09-27 the 15 Figmenta commits were rebased from `v0.8.0` onto `v0.9.2` (
   `wasDaemonSpawnedByThisApp()` now reads `ownedLaunch`.
 - `daemon-manager.test.ts`: upstream's rewritten suite kept; the fork's cases targeted the
   old spawn path (the "only our own daemon" rule is covered by `orchestra.test.ts`).
-- `after-pack.js`: upstream's `installLinuxLauncher` kept, `EXECUTABLE_NAME = "Orchestra"`.
+- `after-pack.js`: upstream's `installLinuxLauncher` kept, `EXECUTABLE_NAME = "Orchestra"`;
+  since 1.3.11 it takes the packager's `executableName` instead of the fixed `Paseo`.
 - `screen-header.tsx`: the embed-mode guard kept on upstream's reworked header.
 - Version: `packages/desktop/package.json` took 0.9.2 during the rebase, then 1.0.0.
