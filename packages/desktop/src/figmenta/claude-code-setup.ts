@@ -17,8 +17,44 @@
 import path from "node:path";
 import { compareVersions } from "./semver.js";
 
-/** The oldest Claude Code the figmenta-sessions plugin runs fleet sessions on (its claude-version.ts). */
+/**
+ * The floor: the oldest Claude Code the figmenta-sessions plugin runs fleet sessions on (its
+ * claude-version.ts). What Orchestra asks of the machine is requiredClaudeCodeVersion(): this
+ * floor, or the newest minimum a bundled Claude model needs, whichever is higher.
+ */
 export const MIN_CLAUDE_CODE_VERSION = "2.1.283";
+
+/** What requiredClaudeCodeVersion() reads from each entry of the server's Claude model manifest. */
+export interface ClaudeModelMinimum {
+  id: string;
+  minimumClaudeCodeVersion?: string;
+}
+
+/**
+ * The Claude Code this build of Orchestra needs: the highest of the floor and of every
+ * `minimumClaudeCodeVersion` in the Claude model manifest bundled with it (the daemon hides a
+ * model whose minimum is above the Claude Code it finds, so a lower copy means a model the user
+ * is allowed and cannot pick). Throws on a minimum that is not x.y.z: a typo in the manifest
+ * must fail the build's tests, not lower the requirement in silence.
+ */
+export function requiredClaudeCodeVersion(
+  manifest: readonly ClaudeModelMinimum[],
+  floor: string = MIN_CLAUDE_CODE_VERSION,
+): string {
+  let required = floor;
+  for (const model of manifest) {
+    const minimum = model.minimumClaudeCodeVersion;
+    if (minimum === undefined) continue;
+    const order = compareVersions(minimum, required);
+    if (order === null) {
+      throw new Error(
+        `Claude model ${model.id}: minimumClaudeCodeVersion "${minimum}" is not a version`,
+      );
+    }
+    if (order === 1) required = minimum;
+  }
+  return required;
+}
 
 /**
  * What the installers are asked for. The `stable` channel was 2.1.277 on 2026-09-29, below the
@@ -394,6 +430,8 @@ export interface ClaudeCodeSetupDeps {
   install(): Promise<InstallerRun>;
   /** The n-th attempt to install in this run of the app: 2 and up reads "Trying again". */
   attempt?: number;
+  /** The version resolve() asks for, for the failure message. */
+  minimum?: string;
   screen: SetupScreen;
   log: SetupLog;
 }
@@ -404,7 +442,11 @@ export type ClaudeCodeSetupOutcome =
   | { status: "ready"; resolution: ReadyClaudeCode; installed: boolean }
   | { status: "failed"; failure: SetupFailure };
 
-function claudeCodeFailure(run: InstallerRun, after: ClaudeCodeResolution): string {
+function claudeCodeFailure(
+  run: InstallerRun,
+  after: ClaudeCodeResolution,
+  minimum: string,
+): string {
   if (run.timedOut) {
     return "Claude Code could not be installed: the installer did not finish in time. Check your internet connection and try again.";
   }
@@ -412,7 +454,7 @@ function claudeCodeFailure(run: InstallerRun, after: ClaudeCodeResolution): stri
     return "Claude Code could not be installed. Check your internet connection and try again.";
   }
   if (after.status === "too-old") {
-    return `Claude Code was installed, but the copy Orchestra finds is older than ${MIN_CLAUDE_CODE_VERSION}.`;
+    return `Claude Code was installed, but the copy Orchestra finds is older than ${minimum}.`;
   }
   return "Claude Code was installed, but Orchestra cannot find it.";
 }
@@ -440,11 +482,165 @@ export async function ensureClaudeCode(deps: ClaudeCodeSetupDeps): Promise<Claud
       return {
         result: after.status === "ready" ? after : null,
         run,
-        message: claudeCodeFailure(run, after),
+        message: claudeCodeFailure(run, after, deps.minimum ?? MIN_CLAUDE_CODE_VERSION),
       };
     },
   });
   if (done.status === "failed") return done;
   deps.log("Claude Code installed", { path: done.result.path, version: done.result.version });
   return { status: "ready", resolution: done.result, installed: true };
+}
+
+// ---------------------------------------------------------------------------
+// While Orchestra runs: the re-check, and what the Orchestra page is told
+// ---------------------------------------------------------------------------
+
+/**
+ * `window.orchestraDesktop.claudeCode`: the Claude Code new sessions of the engine get, the
+ * version this build requires, whether it meets it, and when this was measured.
+ */
+export interface ClaudeCodeStatus {
+  version: string | null;
+  required: string;
+  ok: boolean;
+  /** ISO 8601. */
+  checkedAt: string;
+}
+
+export function claudeCodeStatus(
+  version: string | null,
+  required: string,
+  at: Date,
+): ClaudeCodeStatus {
+  return {
+    version,
+    required,
+    ok: meetsClaudeCodeMinimum(version, required),
+    checkedAt: at.toISOString(),
+  };
+}
+
+/** The version a resolution stands for: the copy used, or the newest copy found too old. */
+export function resolutionVersion(resolution: ClaudeCodeResolution): string | null {
+  if (resolution.status === "ready") return resolution.version;
+  if (resolution.status === "missing") return null;
+  let best: string | null = null;
+  for (const { version } of resolution.found) {
+    if (version === null) continue;
+    if (best === null || compareVersions(version, best) === 1) best = version;
+  }
+  return best;
+}
+
+export type ClaudeCodeRecheckAction =
+  /** The engine's copy meets the requirement: nothing to do. */
+  | "current"
+  /** `--version` of the engine's copy was slow or unreadable: never reinstalled over. */
+  | "unreadable"
+  /** Orchestra did not launch this engine, or the check only measures: nothing changed. */
+  | "report-only"
+  /** Another copy already met the requirement: new sessions now get it. */
+  | "repointed"
+  /** The official installer ran and new sessions now get the copy it installed. */
+  | "installed"
+  /** Still below the requirement: the next check tries again. */
+  | "failed";
+
+export interface ClaudeCodeRecheckOutcome {
+  action: ClaudeCodeRecheckAction;
+  status: ClaudeCodeStatus;
+  /** The copy new sessions get, when this check changed it. */
+  path?: string;
+  /** For the log: why a check that had to act could not. */
+  reason?: string;
+}
+
+export interface ClaudeCodeRecheckDeps {
+  required: string;
+  /**
+   * The `claude` new sessions of the engine run, as they would start it (the engine's private
+   * link to it); null when it has none (the setup at launch failed).
+   */
+  engineCopy: string | null;
+  /** Orchestra launched this engine: it may install Claude Code and point the link elsewhere. */
+  manage: boolean;
+  readVersion(file: string): Promise<ClaudeCodeVersionRead>;
+  /** resolveClaudeCode() with `minimum` = `required`. */
+  resolve(): Promise<ClaudeCodeResolution>;
+  /** The official installer, in the background: never a window, never a stop of the engine. */
+  install(): Promise<InstallerRun>;
+  /** Points the engine's link at `file`; false when it could not. */
+  repoint(file: string): boolean;
+  now(): Date;
+  log: SetupLog;
+}
+
+/**
+ * The periodic check: reads the version of the copy new sessions get and, when it is below what
+ * this build requires and Orchestra launched the engine, makes it meet it: first by pointing at
+ * a copy that already does (the native copy next to an old Homebrew or npm one, a Windows link
+ * still on the replaced file), else with the official installer. Running sessions are never
+ * touched: the installer keeps the version they run (measured on macOS, Linux and Windows,
+ * docs/FIGMENTA.md) and only the engine's link changes, never a file a session runs.
+ */
+export async function recheckClaudeCode(
+  deps: ClaudeCodeRecheckDeps,
+): Promise<ClaudeCodeRecheckOutcome> {
+  const { required } = deps;
+  const status = (version: string | null) => claudeCodeStatus(version, required, deps.now());
+
+  let engineVersion: string | null = null;
+  if (deps.engineCopy !== null) {
+    const read = await deps.readVersion(deps.engineCopy);
+    if (read === "unknown") return { action: "unreadable", status: status(null) };
+    engineVersion = read === "broken" ? null : read;
+    if (meetsClaudeCodeMinimum(engineVersion, required)) {
+      return { action: "current", status: status(engineVersion) };
+    }
+  }
+
+  if (!deps.manage) {
+    // What new sessions get is the engine's copy when it has one; otherwise what the machine has.
+    if (deps.engineCopy !== null) return { action: "report-only", status: status(engineVersion) };
+    const resolution = await deps.resolve();
+    return { action: "report-only", status: status(resolutionVersion(resolution)) };
+  }
+
+  const pointAt = (
+    resolution: ClaudeCodeResolution,
+    action: "repointed" | "installed",
+  ): ClaudeCodeRecheckOutcome | null => {
+    if (resolution.status !== "ready" || resolution.version === null) return null;
+    if (!deps.repoint(resolution.path)) {
+      return {
+        action: "failed",
+        status: status(engineVersion),
+        reason: `the engine's link to ${resolution.path} could not be written`,
+      };
+    }
+    deps.log(`Claude Code for new sessions: ${action}`, {
+      path: resolution.path,
+      version: resolution.version,
+      before: engineVersion,
+    });
+    return { action, status: status(resolution.version), path: resolution.path };
+  };
+
+  const before = await deps.resolve();
+  const already = pointAt(before, "repointed");
+  if (already) return already;
+
+  deps.log("Claude Code is below what Orchestra requires: installing in the background", {
+    required,
+    engineVersion,
+    found: before.status === "too-old" ? before.found : [],
+  });
+  const run = await deps.install();
+  const after = await deps.resolve();
+  const installed = pointAt(after, "installed");
+  if (installed) return installed;
+  let reason = "the installer failed";
+  if (run.timedOut) reason = "the installer did not finish in time";
+  else if (run.ok) reason = `after the installer the copy found is ${after.status}`;
+  return { action: "failed", status: status(engineVersion), reason };
 }

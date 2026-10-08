@@ -7,6 +7,7 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -15,17 +16,23 @@ import {
 import { homedir } from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
-import { app, BrowserWindow, ipcMain, type WebContents } from "electron";
+import { app, BrowserWindow, ipcMain, powerMonitor, type WebContents } from "electron";
 import log from "electron-log/main";
+import { CLAUDE_MODEL_MANIFEST } from "@getpaseo/server/claude-model-manifest";
 import { dismissStartupSplash, isStartupSplashWindow } from "./startup-splash-electron.js";
 import {
   claudeCodeInstallerCommand,
   claudeCodeShim,
+  claudeCodeStatus,
   ensureClaudeCode,
   envValue,
+  MIN_CLAUDE_CODE_VERSION,
   parseClaudeCodeVersion,
   prependToPath,
+  recheckClaudeCode,
+  requiredClaudeCodeVersion,
   resolveClaudeCode,
+  type ClaudeCodeStatus,
   type ClaudeCodeVersionRead,
   type Env,
   type InstallerRun,
@@ -34,6 +41,7 @@ import {
   type SetupState,
 } from "./claude-code-setup.js";
 import { claudeCodeSetupPageUrl } from "./claude-code-setup-page.js";
+import { UPDATE_CHECK_INTERVAL_MS, WAKE_CHECK_MIN_INTERVAL_MS } from "./mandatory-update.js";
 import {
   bundledGitLayout,
   ensureGitBash,
@@ -69,6 +77,23 @@ const KILL_WAIT_MS = 15_000;
 const DRAIN_MS = 1_000;
 
 type SetupViewState = SetupState | { phase: "starting"; restart: boolean };
+
+function computeRequiredClaudeCode(): string {
+  try {
+    return requiredClaudeCodeVersion(CLAUDE_MODEL_MANIFEST);
+  } catch (error) {
+    // claude-code-setup.test.ts fails the build first; this only keeps a bad manifest from
+    // keeping Orchestra closed.
+    log.error("[engine-setup] Claude model manifest unreadable: the floor applies", error);
+    return MIN_CLAUDE_CODE_VERSION;
+  }
+}
+
+/**
+ * The Claude Code this build requires: the plugin's floor or the newest minimum of a Claude model
+ * in the manifest bundled with it (@getpaseo/server), whichever is higher.
+ */
+export const REQUIRED_CLAUDE_CODE_VERSION = computeRequiredClaudeCode();
 
 function logSetup(message: string, details?: Record<string, unknown>): void {
   log.info(`[engine-setup] ${message}`, details ?? {});
@@ -380,8 +405,57 @@ function sameFile(a: string, b: string): boolean {
 }
 
 /**
+ * Empties the engine's bin folder but for `keep`. An entry that cannot go (on Windows, a copy a
+ * session still runs from) stays: it is not on any name the engine looks for, and the next
+ * write tries again.
+ */
+function clearShimDir(shimDir: string, keep: string | null): void {
+  for (const entry of readdirSync(shimDir)) {
+    if (entry === keep) continue;
+    try {
+      rmSync(path.join(shimDir, entry), { recursive: true, force: true });
+    } catch {
+      // In use: removed by a later write.
+    }
+  }
+}
+
+/** Makes `dir` exist and hold no `claude`: the setup at launch did not find one to link. */
+export function emptyClaudeCodeShimDir(dir: string): boolean {
+  try {
+    mkdirSync(dir, { recursive: true });
+    clearShimDir(dir, null);
+    return readdirSync(dir).every((entry) => !/^claude(\.exe|\.cmd)?$/i.test(entry));
+  } catch (error) {
+    log.warn("[engine-setup] the engine's bin folder could not be emptied", {
+      dir,
+      error: errorText(error),
+    });
+    return false;
+  }
+}
+
+/**
+ * Removes `file`, or (Windows, a session still running from it) moves it aside so the name is
+ * free: a running program can be renamed there, not removed. The aside copy goes at a later write.
+ */
+function freeName(file: string): void {
+  try {
+    rmSync(file, { force: true });
+  } catch (error) {
+    renameSync(file, `${file}.old.${Date.now()}`);
+    log.info("[engine-setup] previous Claude Code link in use: moved aside", {
+      file,
+      error: errorText(error),
+    });
+  }
+}
+
+/**
  * Makes the engine's bin folder hold exactly one `claude`, pointing at `target`. Returns the
  * folder, or null when it cannot be made (the caller then falls back to Claude Code's own folder).
+ * Called again while the engine runs (the periodic check): what a running session executes is
+ * never changed, only the name new sessions start.
  */
 export function writeClaudeCodeShim(
   target: string,
@@ -391,11 +465,7 @@ export function writeClaudeCodeShim(
   const shim = claudeCodeShim(platform, target, shimDir);
   try {
     mkdirSync(shimDir, { recursive: true });
-    for (const entry of readdirSync(shimDir)) {
-      if (entry !== path.basename(shim.file)) {
-        rmSync(path.join(shimDir, entry), { recursive: true, force: true });
-      }
-    }
+    clearShimDir(shimDir, path.basename(shim.file));
     if (shim.kind === "symlink") {
       let current: string | null = null;
       try {
@@ -408,13 +478,21 @@ export function writeClaudeCodeShim(
         symlinkSync(target, shim.file);
       }
     } else if (shim.kind === "hardlink") {
+      // A hard link stays on the file it was made to: when the installer replaces claude.exe
+      // (moving the running one aside), the link still starts the old version until made again.
       if (!sameFile(shim.file, target)) {
-        // Fails while an engine still runs the old link: then the caller uses the real folder.
-        rmSync(shim.file, { force: true });
+        freeName(shim.file);
         linkSync(target, shim.file);
       }
     } else {
-      writeFileSync(shim.file, shim.content);
+      // cmd.exe reads a running batch file again after each command: never rewritten unchanged.
+      let current: string | null = null;
+      try {
+        current = readFileSync(shim.file, "utf8");
+      } catch {
+        current = null;
+      }
+      if (current !== shim.content) writeFileSync(shim.file, shim.content);
     }
     return shimDir;
   } catch (error) {
@@ -641,6 +719,7 @@ let installAttempts: Record<SetupComponent, number> = { "claude-code": 0, "git-b
 let retrying = false;
 let restartEngine: (() => Promise<void>) | null = null;
 let onStatusChange: (() => void) | null = null;
+let refreshClaudeCatalog: (() => Promise<void>) | null = null;
 
 let ipcRegistered = false;
 
@@ -664,7 +743,34 @@ function setStatus(next: EngineSetupStatus): void {
   onStatusChange?.();
 }
 
-type Prepared = { status: "ready"; env: Env } | { status: "failed"; failure: SetupFailure };
+type Prepared =
+  | { status: "ready"; env: Env }
+  /** `env`: what the engine starts with instead of the app's own environment, if anything. */
+  | { status: "failed"; failure: SetupFailure; env?: Env };
+
+/**
+ * The `claude` an engine Orchestra launched gives new sessions: its private bin folder (null when
+ * that folder could not be made: then nothing here can change it) and the file in it, or the real
+ * copy when the folder could not be used. Null: Orchestra did not launch the engine running now.
+ */
+interface EngineClaudeCode {
+  shimDir: string | null;
+  copy: string | null;
+}
+
+let engineClaudeCode: EngineClaudeCode | null = null;
+
+function claudeCodeResolver(platform: NodeJS.Platform, env: Env) {
+  return () =>
+    resolveClaudeCode({
+      platform,
+      env,
+      homedir: homedir(),
+      exists: isFile,
+      readVersion: (file) => readClaudeCodeVersion(file, env),
+      minimum: REQUIRED_CLAUDE_CODE_VERSION,
+    });
+}
 
 async function prepareOnce(baseEnv: Env, signal: AbortSignal): Promise<Prepared> {
   const platform = process.platform;
@@ -682,32 +788,46 @@ async function prepareOnce(baseEnv: Env, signal: AbortSignal): Promise<Prepared>
     },
   };
 
+  const shimDir = engineBinDir(env);
   const claude = await ensureClaudeCode({
-    resolve: () =>
-      resolveClaudeCode({
-        platform,
-        env,
-        homedir: homedir(),
-        exists: isFile,
-        readVersion: (file) => readClaudeCodeVersion(file, env),
-      }),
+    resolve: claudeCodeResolver(platform, env),
     install: () => {
       const installer = claudeCodeInstallerCommand(platform, env);
       return runInstaller(installer.command, installer.args, installer.env, signal);
     },
+    minimum: REQUIRED_CLAUDE_CODE_VERSION,
     screen,
     log: logSetup,
   });
-  if (claude.status === "failed") return claude;
-  const { resolution } = claude;
-  let binDir: string | null = null;
-  if (!resolution.firstOnPath) {
-    binDir = writeClaudeCodeShim(resolution.path, engineBinDir(env), platform);
-    env = prependToPath(env, binDir ?? path.dirname(resolution.path), platform);
+  if (claude.status === "failed") {
+    // The engine starts with the app's own environment, as before, plus the private folder,
+    // empty: when the periodic check installs Claude Code later, it links it there and new
+    // sessions find it without a restart of the engine.
+    const empty = emptyClaudeCodeShimDir(shimDir);
+    engineClaudeCode = empty ? { shimDir, copy: null } : null;
+    return empty ? { ...claude, env: prependToPath(baseEnv, shimDir, platform) } : claude;
   }
+  const { resolution } = claude;
+  // Always through the private folder, even when PATH already finds this copy first: the
+  // periodic check can then point new sessions at another copy without restarting the engine.
+  const binDir = writeClaudeCodeShim(resolution.path, shimDir, platform);
+  if (binDir !== null) {
+    env = prependToPath(env, binDir, platform);
+  } else if (!resolution.firstOnPath) {
+    env = prependToPath(env, path.dirname(resolution.path), platform);
+  }
+  engineClaudeCode = {
+    shimDir: binDir,
+    copy:
+      binDir !== null ? claudeCodeShim(platform, resolution.path, binDir).file : resolution.path,
+  };
+  publishClaudeCodeStatus(
+    claudeCodeStatus(resolution.version, REQUIRED_CLAUDE_CODE_VERSION, new Date()),
+  );
   logSetup("the engine will run Claude Code", {
     path: resolution.path,
     version: resolution.version,
+    required: REQUIRED_CLAUDE_CODE_VERSION,
     firstOnPath: resolution.firstOnPath,
     binDir,
     installed: claude.installed,
@@ -732,7 +852,10 @@ async function prepareOnce(baseEnv: Env, signal: AbortSignal): Promise<Prepared>
     });
     // Claude Code without Git Bash runs the plugin's hooks through PowerShell, where they fail
     // OPEN: the engine rather goes without the Claude Code this setup found.
-    if (git.status === "failed") return git;
+    if (git.status === "failed") {
+      engineClaudeCode = null;
+      return git;
+    }
     if (git.status === "system" && git.explicit) env = withGitBash(env, git.bashPath, null);
     if (git.status === "bundled") env = withGitBash(env, git.layout.bashPath, git.layout.cmdDir);
   }
@@ -740,6 +863,8 @@ async function prepareOnce(baseEnv: Env, signal: AbortSignal): Promise<Prepared>
 }
 
 async function prepare(baseEnv: NodeJS.ProcessEnv): Promise<NodeJS.ProcessEnv> {
+  // One installer at a time: a background check that is installing finishes first.
+  if (recheckRunning) await recheckRunning;
   const abort = new AbortController();
   active = abort;
   let prepared: Prepared;
@@ -769,7 +894,13 @@ async function prepare(baseEnv: NodeJS.ProcessEnv): Promise<NodeJS.ProcessEnv> {
   });
   // Closed by the user: not reopened. Otherwise the reason and "Try again" stay on screen.
   if (!abort.signal.aborted) getSetupWindow().show({ phase: "failed", ...prepared.failure });
-  return baseEnv;
+  // What the page is told: measured once this setup is over, nothing installed (the setup just
+  // tried; the next periodic check tries again in the background).
+  measureAfterFailure ??= setTimeout(() => {
+    measureAfterFailure = null;
+    void recheckClaudeCodeNow("setup failed", { measureOnly: true });
+  }, 0);
+  return (prepared.env ?? baseEnv) as NodeJS.ProcessEnv;
 }
 
 /**
@@ -834,9 +965,13 @@ export function engineSetupStatus(): EngineSetupStatus {
 export function registerEngineSetup(options: {
   restartEngine: () => Promise<void>;
   onStatusChange?: () => void;
+  /** After the periodic check changed the Claude Code new sessions get: the engine reads its
+   * Claude model catalog again (it hides models the previous version could not run). */
+  refreshClaudeCatalog?: () => Promise<void>;
 }): void {
   restartEngine = options.restartEngine;
   onStatusChange = options.onStatusChange ?? null;
+  refreshClaudeCatalog = options.refreshClaudeCatalog ?? null;
 }
 
 /**
@@ -860,9 +995,165 @@ export function __resetEngineSetup(): void {
   retrying = false;
   restartEngine = null;
   onStatusChange = null;
+  refreshClaudeCatalog = null;
+  engineClaudeCode = null;
+  claudeCodeStatusNow = null;
+  recheckRunning = null;
+  lastRecheckAt = null;
+  if (recheckTimer) clearInterval(recheckTimer);
+  recheckTimer = null;
+  if (measureAfterFailure) clearTimeout(measureAfterFailure);
+  measureAfterFailure = null;
+  watchStarted = false;
 }
 
 app.on("before-quit", () => {
   active?.abort();
+  background?.abort();
   for (const child of running) killProcessTreeNow(child);
 });
+
+// ---------------------------------------------------------------------------
+// While Orchestra runs: the periodic check, and window.orchestraDesktop.claudeCode
+// ---------------------------------------------------------------------------
+
+/** The main window's preload (preload.ts) listens here and asks here for the current status. */
+export const CLAUDE_CODE_STATUS_CHANNEL = "orchestra-desktop:claude-code";
+export const CLAUDE_CODE_STATUS_GET_CHANNEL = "orchestra-desktop:claude-code:get";
+/** Test knob: a shorter period for the check (the local E2E of 1.3.14 uses it). */
+export const CLAUDE_CODE_CHECK_INTERVAL_ENV = "ORCHESTRA_CLAUDE_CODE_CHECK_INTERVAL_MS";
+
+let claudeCodeStatusNow: ClaudeCodeStatus | null = null;
+let recheckRunning: Promise<void> | null = null;
+let lastRecheckAt: number | null = null;
+let recheckTimer: NodeJS.Timeout | null = null;
+let measureAfterFailure: NodeJS.Timeout | null = null;
+let watchStarted = false;
+/** The background install running now: aborted at quit, with every process it started. */
+let background: AbortController | null = null;
+
+export function claudeCodeCheckIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[CLAUDE_CODE_CHECK_INTERVAL_ENV];
+  const value = raw ? Number(raw) : NaN;
+  return Number.isInteger(value) && value > 0 ? value : UPDATE_CHECK_INTERVAL_MS;
+}
+
+function publishClaudeCodeStatus(next: ClaudeCodeStatus): void {
+  claudeCodeStatusNow = next;
+  lastRecheckAt = Date.now();
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed() || win.webContents.isDestroyed()) continue;
+    win.webContents.send(CLAUDE_CODE_STATUS_CHANNEL, next);
+  }
+}
+
+async function runRecheck(reason: string, measureOnly: boolean): Promise<void> {
+  const platform = process.platform;
+  const env: Env = { ...process.env };
+  const engine = engineClaudeCode;
+  const outcome = await recheckClaudeCode({
+    required: REQUIRED_CLAUDE_CODE_VERSION,
+    engineCopy: engine?.copy ?? null,
+    manage: !measureOnly && engine !== null && engine.shimDir !== null,
+    readVersion: (file) => readClaudeCodeVersion(file, env),
+    resolve: claudeCodeResolver(platform, env),
+    install: async () => {
+      const installer = claudeCodeInstallerCommand(platform, env);
+      const abort = new AbortController();
+      background = abort;
+      try {
+        return await runInstaller(installer.command, installer.args, installer.env, abort.signal);
+      } finally {
+        if (background === abort) background = null;
+      }
+    },
+    repoint: (file) => {
+      // An engine launched since this check began has its own link: left alone.
+      if (engine === null || engine.shimDir === null || engine !== engineClaudeCode) return false;
+      const dir = writeClaudeCodeShim(file, engine.shimDir, platform);
+      if (dir === null) return false;
+      engine.copy = claudeCodeShim(platform, file, dir).file;
+      return true;
+    },
+    now: () => new Date(),
+    log: logSetup,
+  });
+  publishClaudeCodeStatus(outcome.status);
+  logSetup("Claude Code check", {
+    reason,
+    action: outcome.action,
+    version: outcome.status.version,
+    required: outcome.status.required,
+    ok: outcome.status.ok,
+    ...(outcome.path ? { path: outcome.path } : {}),
+    ...(outcome.reason ? { why: outcome.reason } : {}),
+  });
+  if (outcome.action !== "repointed" && outcome.action !== "installed") return;
+
+  // The launch had failed on Claude Code and new sessions now find it: the File menu item and a
+  // failure still on screen are out of date.
+  if (status === "failed") {
+    setStatus("ready");
+    const shown = setupWindow?.getState();
+    if (shown?.phase === "failed" && shown.component === "claude-code") setupWindow?.close();
+  }
+  try {
+    await refreshClaudeCatalog?.();
+    logSetup("the engine read its Claude model catalog again");
+  } catch (error) {
+    log.warn("[engine-setup] the engine did not read its Claude model catalog again", {
+      error: errorText(error),
+    });
+  }
+}
+
+/**
+ * One check now, unless one is running (that one is returned) or the setup of an engine launch is
+ * (it measures and publishes by itself). Never rejects.
+ */
+export function recheckClaudeCodeNow(
+  reason: string,
+  options: { measureOnly?: boolean } = {},
+): Promise<void> {
+  if (recheckRunning) return recheckRunning;
+  if (inFlight) return Promise.resolve();
+  lastRecheckAt = Date.now();
+  const run = runRecheck(reason, options.measureOnly === true)
+    .catch((error) => {
+      log.warn("[engine-setup] Claude Code check failed", { reason, error: errorText(error) });
+    })
+    .finally(() => {
+      if (recheckRunning === run) recheckRunning = null;
+    });
+  recheckRunning = run;
+  return run;
+}
+
+/**
+ * main.ts, before the first Orchestra window: answers the page's preload, then checks Claude Code
+ * on the mandatory updater's cadence (every 30 minutes, and on resume, unlock and window focus at
+ * most every 5 minutes). The launch check is the engine setup's own; when Orchestra reused an
+ * engine it did not launch, the first check runs now (the returned promise).
+ */
+export function startClaudeCodeWatch(): Promise<void> {
+  if (watchStarted) return Promise.resolve();
+  watchStarted = true;
+  ipcMain.on(CLAUDE_CODE_STATUS_GET_CHANNEL, (event) => {
+    event.returnValue = claudeCodeStatusNow;
+  });
+  recheckTimer = setInterval(
+    () => void recheckClaudeCodeNow("interval"),
+    claudeCodeCheckIntervalMs(),
+  );
+  const onWake = (reason: string) => {
+    if (lastRecheckAt !== null && Date.now() - lastRecheckAt < WAKE_CHECK_MIN_INTERVAL_MS) return;
+    void recheckClaudeCodeNow(reason);
+  };
+  powerMonitor.on("resume", () => onWake("resume"));
+  powerMonitor.on("unlock-screen", () => onWake("unlock-screen"));
+  app.on("browser-window-focus", () => onWake("focus"));
+  if (claudeCodeStatusNow !== null || recheckRunning) return recheckRunning ?? Promise.resolve();
+  // Measured only: an engine Orchestra launched was just set up (an install that failed is tried
+  // again at the next check, not a second time now), and one it reused is never changed.
+  return recheckClaudeCodeNow("launch", { measureOnly: true });
+}

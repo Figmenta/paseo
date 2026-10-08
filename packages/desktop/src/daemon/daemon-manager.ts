@@ -509,6 +509,22 @@ function getDaemonLogs(): DesktopDaemonLogs {
   };
 }
 
+/**
+ * Figmenta fork: asks the running engine to read a provider's model catalog again (after
+ * Orchestra updated Claude Code under it: the catalog hides models the previous version could
+ * not run). No restart, no running session touched.
+ */
+export async function refreshDaemonProviderCatalog(provider: string): Promise<void> {
+  await runExternalCliJsonCommand([
+    "provider",
+    "refresh",
+    provider,
+    "--home",
+    getPaseoHome(),
+    "--json",
+  ]);
+}
+
 async function getCliDaemonStatus(): Promise<string> {
   return await runExternalCliTextCommand(["daemon", "status", "--home", getPaseoHome()]);
 }

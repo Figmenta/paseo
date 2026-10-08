@@ -260,7 +260,7 @@ outside `src/figmenta/` is marked `// Figmenta: launcher gate`:
 | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | `packages/app/src/figmenta/embed.ts`                              | `maestro.launcher` case in the bridge; `resetEmbedModeCache` resets the gate                                          |
 | `packages/app/src/keyboard/keyboard-action-dispatcher.ts`         | `dispatch` drops `LAUNCHER_ACTION_IDS` (shortcuts and command palette)                                                |
-| `packages/app/src/components/split-container.tsx`                 | pane tab strip (with its «+») drawn in embed only when the launcher is allowed; no drag region in embed             |
+| `packages/app/src/components/split-container.tsx`                 | pane tab strip (with its «+») drawn in embed only when the launcher is allowed; no drag region in embed               |
 | `packages/app/src/workspace-tabs/launcher/index.tsx`              | `useWorkspaceTabLaunchCatalog` returns `[]` (new_tab panel, «+» menu, explorer rail)                                  |
 | `packages/app/src/panels/new-tab-panel.tsx`                       | notice instead of the launcher                                                                                        |
 | `packages/app/src/panels/terminal-panel.tsx`                      | open or restored terminal tabs render the notice, never attach (not closed: see below)                                |
@@ -361,8 +361,14 @@ tested by `orchestra.test.ts` (no Electron needed):
 
 `packages/desktop/src/preload.ts` — rewritten. Upstream exposed `paseoDesktop` (the whole
 `paseo:invoke` surface) to any document; against a remote origin that is a hole. It now exposes
-only `orchestraDesktop = { version, platform }` and no IPC at all. The version arrives through
-`additionalArguments` (`--orchestra-app-version=…`), since the preload can no longer ask.
+only `orchestraDesktop = { version, platform, titleBarInset, claudeCode }` and nothing the page
+can call. The version arrives through `additionalArguments` (`--orchestra-app-version=…`).
+Since 1.3.14 the object is built in the page's own world (`contextBridge.executeInMainWorld`,
+frozen, on a non-writable `window` property) instead of `exposeInMainWorld`, whose copy is frozen
+at copy time: `claudeCode` is a getter on the last status the main process pushed
+(`orchestra-desktop:claude-code`, one way, main to preload); its first value comes from a
+synchronous read in the preload (`orchestra-desktop:claude-code:get`), so it is there before the
+page's first script. The page itself can only fire the update event at itself.
 
 `packages/desktop/src/daemon/daemon-manager.ts`
 
@@ -594,8 +600,8 @@ plugin from that directory and externalizes only `react`, `react-native` and
 `@getpaseo/plugin/*`; `zod` is its one bundled runtime dependency, so `node_modules/zod` is
 copied next to it. No other `node_modules` are shipped.
 
-Claude Code is still not bundled (upstream choice, `after-pack.js`): the app uses the `claude`
-on the user's PATH, inherited from the login shell.
+Claude Code is still not bundled (upstream choice, `after-pack.js`): see "Claude Code for the
+engine".
 
 Unsigned build (development):
 
@@ -608,6 +614,68 @@ CSC_IDENTITY_AUTO_DISCOVERY=false npm run build:desktop -- --publish never \
 
 If `dmg-builder` answers 500 on its bundle download, fetch the bundle by hand and point
 `ELECTRON_BUILDER_BINARIES_DOWNLOAD_OVERRIDE_URL` at it.
+
+### Claude Code for the engine
+
+Claude Code is not bundled (upstream choice, `after-pack.js`). Orchestra makes sure the engine
+it launches has a recent enough one; a daemon it reuses is measured and never touched.
+
+- **What is required.** `REQUIRED_CLAUDE_CODE_VERSION` (`src/figmenta/claude-code-setup-electron.ts`)
+  is `requiredClaudeCodeVersion(CLAUDE_MODEL_MANIFEST)` (`src/figmenta/claude-code-setup.ts`):
+  the highest of the plugin's floor `MIN_CLAUDE_CODE_VERSION` (2.1.283) and every
+  `minimumClaudeCodeVersion` in the server's Claude model manifest
+  (`packages/server/src/server/agent/providers/claude/model-manifest.ts`), read at runtime from
+  the server package the app bundles (`@getpaseo/server/claude-model-manifest`, a subpath export
+  added for this). The daemon hides a manifest model whose minimum is above the Claude Code it
+  finds, so a lower copy is a model the user is allowed and cannot pick. 1.3.14: 2.1.284
+  (Sonnet 5.5). A minimum that is not x.y.z throws; the tests fail on it, and at runtime the floor
+  applies with an error in the log. Tests: `claude-code-setup.test.ts` (no manifest model above
+  the requirement; the built `packages/server/dist` agrees with the source, so rebuild the server
+  before a release) and `claude-code-setup-electron.test.ts` (the app's constant covers every
+  manifest model).
+- **At launch** (`prepareEngineEnvironment`, unchanged in spirit): the first `claude` on PATH or
+  in the known install folders that meets the requirement; none, or only older ones: the official
+  installer (`install.sh` / `install.ps1`, target `latest`, per user) behind the setup window. The
+  engine now ALWAYS gets the private folder `engine-bin` first on PATH, holding only a link to
+  that copy (symlink on macOS/Linux, hard link or `.cmd` on Windows), even when PATH already finds
+  it first: that link is what the periodic check re-points. If the install fails, the engine
+  starts with the app's own environment plus `engine-bin`, empty, so a later background install
+  reaches new sessions without a restart.
+- **While the app runs**: `startClaudeCodeWatch()` (from `main.ts`, after the engine, before the
+  first window) checks on the mandatory updater's cadence: every 30 minutes
+  (`ORCHESTRA_CLAUDE_CODE_CHECK_INTERVAL_MS` shortens it for a test run), and on `resume`,
+  `unlock-screen` and window focus at most every 5 minutes. `recheckClaudeCode()` reads the
+  version of the link (what new sessions start). At or above the requirement: nothing. Below,
+  for an engine Orchestra launched: a copy that already meets it is linked (the native copy next
+  to an old Homebrew/npm one, or a Windows hard link still on the replaced `claude.exe`);
+  otherwise the official installer runs in the background (no window), and the link moves to
+  what it installed. Running sessions are never stopped. Then the engine reads its Claude
+  catalog again (`paseo provider refresh claude`, a CLI command added for this): the daemon
+  caches the catalog, and without it Sonnet 5.5 stays hidden until a restart (measured: a test
+  daemon with Claude Code 2.1.283 does not list `claude-sonnet-5-5`, still does not after the
+  binary becomes 2.1.294, and lists it after the refresh). A launch whose setup failed and that
+  the check fixes turns the File menu item off and closes the failure window.
+- **Installer and running sessions, measured on 2026-10-08** (installed 2.1.283, started long
+  running `claude mcp serve` processes, ran the installer with `latest` = 2.1.294; probe workflow
+  `claude-install-probe.yml` on the private repo's branch `probe/claude-install-1`, macOS in a
+  fake HOME on the Mac):
+  - macOS and Linux: versions side by side in `~/.local/share/claude/versions/`, the launcher
+    `~/.local/bin/claude` is a symlink switched to the new version, the old version is kept while
+    a process holds its lock (`~/.local/state/claude/locks/<version>.lock`), running processes
+    go on, a new start through the engine's symlink gets the new version. Safe while sessions run.
+  - Windows: the installer renames the running `claude.exe` to `claude.exe.old.<ts>.<pid>` and
+    writes the new one (exit 0), running processes go on. The engine's hard link still starts the
+    OLD version until made again; removing the link name while a session runs from it succeeded
+    on windows-latest, and `writeClaudeCodeShim` falls back to renaming it aside when it cannot.
+    Safe while sessions run: no deferral on any platform.
+- **What the Orchestra page sees**: `window.orchestraDesktop.claudeCode =
+{ version: string | null, required: string, ok: boolean, checkedAt: string }` (ISO time),
+  updated after every check, plus an `orchestra-desktop:claude-code` event on `window` with the
+  new value as `detail`. `version` is what new sessions of the engine get (for a reused engine,
+  what the machine has); `null` when none was found or `--version` was unreadable. The property
+  is `null` only before the first measurement, which in practice precedes the window: the
+  launch setup measures before the engine starts, and for a reused engine `main.ts` waits up to
+  5 s for a quick measurement. See the preload below.
 
 ### Signed macOS release
 

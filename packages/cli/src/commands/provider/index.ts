@@ -2,6 +2,7 @@ import { Command } from "commander";
 import { runLsCommand } from "./ls.js";
 import { runModelsCommand } from "./models.js";
 import { runDiagnosticCommand } from "./diagnostic.js";
+import { runRefreshCommand } from "./refresh.js";
 import { withOutput } from "../../output/index.js";
 import { addJsonAndDaemonHostOptions } from "../../utils/command-options.js";
 
@@ -26,6 +27,13 @@ export function createProviderCommand(): Command {
       .description("Show provider installation, environment, and availability diagnostics")
       .argument("<provider>", "Provider name"),
   ).action(withOutput(runDiagnosticCommand));
+
+  addJsonAndDaemonHostOptions(
+    provider
+      .command("refresh")
+      .description("Read the providers' model catalogs again (all providers when none is named)")
+      .argument("[providers...]", "Provider names (claude, codex, opencode)"),
+  ).action(withOutput(runRefreshCommand));
 
   return provider;
 }

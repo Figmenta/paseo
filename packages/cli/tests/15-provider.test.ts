@@ -19,6 +19,7 @@
  * - provider models --json outputs valid JSON
  * - provider diagnostic shows the daemon's provider diagnostic
  * - provider diagnostic --json returns structured output
+ * - provider refresh claude --json: the daemon reads the Claude catalog again (Figmenta fork)
  */
 
 import assert from "node:assert";
@@ -85,7 +86,7 @@ const EXPECTED_CLAUDE_MODELS = [
   {
     id: "claude-sonnet-5",
     model: "Sonnet 5",
-    descriptionFragment: "Best for everyday tasks",
+    descriptionFragment: "Previous release",
   },
   {
     id: "claude-opus-4-7[1m]",
@@ -211,6 +212,7 @@ try {
     assert(result.stdout.includes("ls"), "help should mention ls");
     assert(result.stdout.includes("models"), "help should mention models");
     assert(result.stdout.includes("diagnostic"), "help should mention diagnostic");
+    assert(result.stdout.includes("refresh"), "help should mention refresh");
     console.log("✓ provider --help shows subcommands\n");
   }
 
@@ -467,6 +469,18 @@ try {
     assert(data.diagnostic.includes("Version:"), "JSON should include the provider version");
     assert(data.diagnostic.includes("Status:"), "JSON should include provider status");
     console.log("✓ provider diagnostic --json returns structured output\n");
+  }
+
+  // Test 14 (Figmenta fork): provider refresh asks the daemon to read a catalog again
+  {
+    console.log("Test 14: provider refresh claude --json is acknowledged by the daemon");
+    const result = await ctx.paseo(["provider", "refresh", "claude", "--json"]);
+    assert.strictEqual(result.exitCode, 0, "provider refresh should exit 0");
+    const data = JSON.parse(result.stdout.trim()) as { providers: string; acknowledged: boolean };
+    assert.deepStrictEqual(data, { providers: "claude", acknowledged: true });
+    const models = await ctx.paseo(["provider", "models", "claude", "--json"]);
+    assert.strictEqual(models.exitCode, 0, "the catalog is still served after a refresh");
+    console.log("✓ provider refresh claude --json is acknowledged by the daemon\n");
   }
 } finally {
   await ctx.stop();

@@ -1,6 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
+// The manifest as the source has it (what the next build bundles) and as this checkout's built
+// server package has it (what the desktop app imports at runtime): they must agree.
+import { CLAUDE_MODEL_MANIFEST as SOURCE_MANIFEST } from "../../../server/src/server/agent/providers/claude/model-manifest.js";
+import { CLAUDE_MODEL_MANIFEST as BUILT_MANIFEST } from "@getpaseo/server/claude-model-manifest";
+import { compareVersions } from "./semver.js";
 import {
   CLAUDE_CODE_INSTALL_TARGET,
+  claudeCodeStatus,
+  recheckClaudeCode,
+  requiredClaudeCodeVersion,
+  resolutionVersion,
+  type ClaudeCodeRecheckDeps,
   claudeCodeCandidates,
   claudeCodeInstallerCommand,
   claudeCodeShim,
@@ -568,5 +578,252 @@ describe("ensureClaudeCode", () => {
     if (outcome.status !== "failed") throw new Error("expected a failure");
     expect(outcome.failure.detail.endsWith("THE END")).toBe(true);
     expect(outcome.failure.detail.length).toBeLessThanOrEqual(601);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 1.3.14: the requirement comes from the Claude model manifest
+// ---------------------------------------------------------------------------
+
+describe("requiredClaudeCodeVersion", () => {
+  it("is the floor, or the highest minimum a Claude model asks for", () => {
+    expect(requiredClaudeCodeVersion([])).toBe(MIN_CLAUDE_CODE_VERSION);
+    expect(
+      requiredClaudeCodeVersion([
+        { id: "a", minimumClaudeCodeVersion: "2.1.100" },
+        { id: "b" },
+        { id: "c", minimumClaudeCodeVersion: "2.1.284" },
+        { id: "d", minimumClaudeCodeVersion: "2.1.30" },
+      ]),
+    ).toBe("2.1.284");
+    expect(
+      requiredClaudeCodeVersion([{ id: "a", minimumClaudeCodeVersion: "2.1.9" }], "2.1.10"),
+    ).toBe("2.1.10");
+  });
+
+  it("refuses a minimum that is not a version, rather than ignoring it", () => {
+    expect(() =>
+      requiredClaudeCodeVersion([{ id: "typo", minimumClaudeCodeVersion: "2.1.28x" }]),
+    ).toThrow(/typo/);
+  });
+
+  it("covers every model of the manifest this build bundles: no model hidden by a lower copy", () => {
+    const required = requiredClaudeCodeVersion(SOURCE_MANIFEST);
+    for (const model of SOURCE_MANIFEST) {
+      const minimum =
+        "minimumClaudeCodeVersion" in model ? model.minimumClaudeCodeVersion : undefined;
+      if (minimum === undefined) continue;
+      const order = compareVersions(minimum, required);
+      expect(order, `${model.id} needs ${minimum}, Orchestra requires ${required}`).not.toBe(1);
+      expect(order).not.toBeNull();
+    }
+    expect(compareVersions(required, MIN_CLAUDE_CODE_VERSION)).not.toBe(-1);
+  });
+
+  it("the built server package the app imports agrees with the source manifest", () => {
+    // A stale `packages/server/dist` would ship an older requirement: rebuild the server.
+    expect(requiredClaudeCodeVersion(BUILT_MANIFEST)).toBe(
+      requiredClaudeCodeVersion(SOURCE_MANIFEST),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 1.3.14: the periodic check
+// ---------------------------------------------------------------------------
+
+describe("claudeCodeStatus / resolutionVersion", () => {
+  const at = new Date("2026-10-08T16:00:00.000Z");
+
+  it("is the shape window.orchestraDesktop.claudeCode has", () => {
+    expect(claudeCodeStatus("2.1.294", "2.1.284", at)).toEqual({
+      version: "2.1.294",
+      required: "2.1.284",
+      ok: true,
+      checkedAt: "2026-10-08T16:00:00.000Z",
+    });
+    expect(claudeCodeStatus("2.1.283", "2.1.284", at).ok).toBe(false);
+    expect(claudeCodeStatus(null, "2.1.284", at)).toMatchObject({ version: null, ok: false });
+  });
+
+  it("stands for the copy used, or the newest copy found too old", () => {
+    expect(resolutionVersion({ status: "missing" })).toBeNull();
+    expect(
+      resolutionVersion({
+        status: "ready",
+        path: "/x/claude",
+        version: "2.1.290",
+        firstOnPath: true,
+      }),
+    ).toBe("2.1.290");
+    expect(
+      resolutionVersion({
+        status: "too-old",
+        found: [
+          { path: "/a", version: "2.1.200" },
+          { path: "/b", version: null },
+          { path: "/c", version: "2.1.283" },
+        ],
+      }),
+    ).toBe("2.1.283");
+  });
+});
+
+describe("recheckClaudeCode", () => {
+  const REQUIRED = "2.1.284";
+  const SHIM = "/app/engine-bin/claude";
+  const NATIVE = "/Users/giovanni/.local/bin/claude";
+  const BREW = "/opt/homebrew/bin/claude";
+  const ready = (path: string, version: string | null): ClaudeCodeResolution => ({
+    status: "ready",
+    path,
+    version,
+    firstOnPath: false,
+  });
+  const tooOld = (version: string): ClaudeCodeResolution => ({
+    status: "too-old",
+    found: [{ path: BREW, version }],
+  });
+
+  function deps(input: {
+    engineCopy?: string | null;
+    manage?: boolean;
+    engineVersion?: ClaudeCodeVersionRead;
+    resolutions?: ClaudeCodeResolution[];
+    run?: InstallerRun;
+    repointOk?: boolean;
+  }) {
+    const resolutions = [...(input.resolutions ?? [])];
+    const d = {
+      required: REQUIRED,
+      engineCopy: input.engineCopy === undefined ? SHIM : input.engineCopy,
+      manage: input.manage ?? true,
+      readVersion: vi.fn(async () => input.engineVersion ?? "2.1.283"),
+      resolve: vi.fn(async () => {
+        const next = resolutions.shift();
+        if (!next) throw new Error("unexpected resolve");
+        return next;
+      }),
+      install: vi.fn(async () => input.run ?? { ok: true, output: "installed" }),
+      repoint: vi.fn(() => input.repointOk ?? true),
+      now: () => new Date("2026-10-08T16:30:00.000Z"),
+      log: vi.fn(),
+    } satisfies ClaudeCodeRecheckDeps;
+    return d;
+  }
+
+  it("the engine's copy meets the requirement: nothing installed, nothing re-pointed", async () => {
+    const d = deps({ engineVersion: "2.1.294" });
+    const outcome = await recheckClaudeCode(d);
+    expect(outcome).toEqual({
+      action: "current",
+      status: {
+        version: "2.1.294",
+        required: REQUIRED,
+        ok: true,
+        checkedAt: "2026-10-08T16:30:00.000Z",
+      },
+    });
+    expect(d.readVersion).toHaveBeenCalledWith(SHIM);
+    expect(d.resolve).not.toHaveBeenCalled();
+    expect(d.install).not.toHaveBeenCalled();
+  });
+
+  it("below the requirement: the official installer runs and new sessions get its copy", async () => {
+    const d = deps({ resolutions: [tooOld("2.1.283"), ready(NATIVE, "2.1.294")] });
+    const outcome = await recheckClaudeCode(d);
+    expect(outcome).toMatchObject({
+      action: "installed",
+      path: NATIVE,
+      status: { version: "2.1.294", ok: true },
+    });
+    expect(d.install).toHaveBeenCalledTimes(1);
+    expect(d.repoint).toHaveBeenCalledWith(NATIVE);
+  });
+
+  it("an old Homebrew/npm copy next to a good native one: re-pointed, no install", async () => {
+    // The native install leaves the package manager's copy where it is; resolve() (minimum =
+    // required) skips the old one and returns the native copy.
+    const d = deps({ resolutions: [ready(NATIVE, "2.1.294")] });
+    const outcome = await recheckClaudeCode(d);
+    expect(outcome).toMatchObject({ action: "repointed", path: NATIVE, status: { ok: true } });
+    expect(d.install).not.toHaveBeenCalled();
+    expect(d.repoint).toHaveBeenCalledWith(NATIVE);
+  });
+
+  it("a Windows link still on the replaced claude.exe: re-pointed at the new one", async () => {
+    const d = deps({
+      engineCopy: "C:\\Users\\G\\AppData\\Local\\Orchestra\\engine-bin\\claude.exe",
+      engineVersion: "2.1.283",
+      resolutions: [ready("C:\\Users\\G\\.local\\bin\\claude.exe", "2.1.294")],
+    });
+    await expect(recheckClaudeCode(d)).resolves.toMatchObject({ action: "repointed" });
+    expect(d.install).not.toHaveBeenCalled();
+  });
+
+  it("an installer that fails leaves the status as measured; the next check tries again", async () => {
+    const d = deps({
+      resolutions: [tooOld("2.1.283"), tooOld("2.1.283")],
+      run: { ok: false, output: "offline" },
+    });
+    const outcome = await recheckClaudeCode(d);
+    expect(outcome).toMatchObject({
+      action: "failed",
+      reason: "the installer failed",
+      status: { version: "2.1.283", ok: false },
+    });
+    expect(d.repoint).not.toHaveBeenCalled();
+  });
+
+  it("a link that cannot be written is a failure, not a success", async () => {
+    const d = deps({ resolutions: [ready(NATIVE, "2.1.294")], repointOk: false });
+    const outcome = await recheckClaudeCode(d);
+    expect(outcome).toMatchObject({ action: "failed", status: { version: "2.1.283", ok: false } });
+  });
+
+  it("a `--version` that is slow or unreadable is never reinstalled over", async () => {
+    const d = deps({ engineVersion: "unknown" });
+    await expect(recheckClaudeCode(d)).resolves.toMatchObject({
+      action: "unreadable",
+      status: { version: null, ok: false },
+    });
+    expect(d.install).not.toHaveBeenCalled();
+  });
+
+  it("an engine copy that does not start is replaced", async () => {
+    const d = deps({
+      engineVersion: "broken",
+      resolutions: [{ status: "missing" }, ready(NATIVE, "2.1.294")],
+    });
+    await expect(recheckClaudeCode(d)).resolves.toMatchObject({ action: "installed" });
+  });
+
+  it("no link yet (the setup at launch failed): installed and linked", async () => {
+    const d = deps({
+      engineCopy: null,
+      resolutions: [{ status: "missing" }, ready(NATIVE, "2.1.294")],
+    });
+    await expect(recheckClaudeCode(d)).resolves.toMatchObject({
+      action: "installed",
+      path: NATIVE,
+    });
+    expect(d.readVersion).not.toHaveBeenCalled();
+  });
+
+  it("an engine Orchestra did not launch is measured and never changed", async () => {
+    const reused = deps({ engineCopy: null, manage: false, resolutions: [tooOld("2.1.283")] });
+    await expect(recheckClaudeCode(reused)).resolves.toMatchObject({
+      action: "report-only",
+      status: { version: "2.1.283", ok: false },
+    });
+    expect(reused.install).not.toHaveBeenCalled();
+    expect(reused.repoint).not.toHaveBeenCalled();
+
+    const measureOnly = deps({ manage: false, engineVersion: "2.1.200" });
+    await expect(recheckClaudeCode(measureOnly)).resolves.toMatchObject({
+      action: "report-only",
+      status: { version: "2.1.200", ok: false },
+    });
+    expect(measureOnly.resolve).not.toHaveBeenCalled();
   });
 });

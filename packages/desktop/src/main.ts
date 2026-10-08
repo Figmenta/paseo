@@ -89,6 +89,7 @@ import { getDesktopSettingsStore } from "./settings/desktop-settings-electron.js
 import { clampWindowStateToWorkAreas, createWindowStateStore } from "./settings/window-state.js";
 import {
   isDesktopManagedDaemonRunningSync,
+  refreshDaemonProviderCatalog,
   setEngineEnvironmentPreparer,
   stopDesktopDaemonViaCli,
   wasDaemonSpawnedByThisApp,
@@ -121,6 +122,7 @@ import {
   prepareEngineEnvironment,
   registerEngineSetup,
   retryEngineSetup,
+  startClaudeCodeWatch,
 } from "./figmenta/claude-code-setup-electron.js";
 import {
   adoptFirstOrchestraWindow,
@@ -1267,6 +1269,7 @@ async function bootstrap(): Promise<void> {
       await startDaemon();
     },
     onStatusChange: refreshApplicationMenu,
+    refreshClaudeCatalog: () => refreshDaemonProviderCatalog("claude"),
   });
   registerWindowManager({ mode: DESKTOP_WINDOW_CHROME_MODE });
   registerDialogHandlers();
@@ -1308,6 +1311,14 @@ async function bootstrap(): Promise<void> {
   installOrchestraSessionPolicies();
   await seedOrchestraDaemonConfig();
   await startOrchestraDaemon();
+  // Figmenta fork: Claude Code is checked again every 30 minutes and on wake, updated in the
+  // background when it falls below what this build requires, and reported to the page as
+  // window.orchestraDesktop.claudeCode. The first measurement is ready before the window opens
+  // (the engine setup's own, or a quick one for an engine Orchestra did not launch), within 5 s.
+  await Promise.race([
+    startClaudeCodeWatch(),
+    new Promise((resolve) => setTimeout(resolve, 5_000)),
+  ]);
 
   // The first window of the session restores and persists saved geometry.
   const initialAgentNavigation = pendingAgentNavigation;

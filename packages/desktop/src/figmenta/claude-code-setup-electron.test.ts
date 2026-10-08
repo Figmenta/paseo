@@ -15,6 +15,8 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CLAUDE_MODEL_MANIFEST } from "../../../server/src/server/agent/providers/claude/model-manifest.js";
+import { compareVersions } from "./semver.js";
 
 // Figmenta fork: the Electron side of the engine setup (claude-code-setup-electron.ts), with real
 // processes on this machine and a fake Electron. What it pins (T-3083 block 5, review round):
@@ -35,7 +37,8 @@ const electron = vi.hoisted(() => {
     userData: "",
     quit: (() => {}) as () => void,
     handlers: new Map<string, (event: { sender: unknown }) => unknown>(),
-    onHandlers: new Map<string, (event: { sender: unknown }) => void>(),
+    onHandlers: new Map<string, (event: { sender: unknown; returnValue?: unknown }) => void>(),
+    power: new Map<string, () => void>(),
   };
 });
 
@@ -107,6 +110,9 @@ vi.mock("electron", () => ({
       electron.handlers.set(channel, handler),
     on: (channel: string, handler: (event: { sender: unknown }) => void) =>
       electron.onHandlers.set(channel, handler),
+  },
+  powerMonitor: {
+    on: (event: string, listener: () => void) => electron.power.set(event, listener),
   },
 }));
 
@@ -344,12 +350,12 @@ describe.skipIf(process.platform === "win32")("prepareEngineEnvironment", () => 
     expect(setup.engineSetupStatus()).toBe("ready");
   });
 
-  it("the first `claude` on PATH is good: PATH untouched, no private folder", async () => {
+  it("the first `claude` on PATH is good: still linked from the private folder, so it can be re-pointed", async () => {
     const local = path.join(home, ".local", "bin");
-    writeClaude(local);
+    const claude = writeClaude(local);
     const env = await setup.prepareEngineEnvironment({ ...baseEnv, PATH: `${local}:/usr/bin` });
-    expect(env.PATH).toBe(`${local}:/usr/bin`);
-    expect(existsSync(binDir())).toBe(false);
+    expect(env.PATH).toBe(`${binDir()}:${local}:/usr/bin`);
+    expect(readlinkSync(path.join(binDir(), "claude"))).toBe(claude);
   });
 
   it("the private folder is renewed: anything else in it goes, the link follows the new copy", async () => {
@@ -402,7 +408,9 @@ describe.skipIf(process.platform === "win32")("prepareEngineEnvironment", () => 
 
     const env = await setup.prepareEngineEnvironment(baseEnv);
 
-    expect(env).toEqual(baseEnv);
+    // The app's own env, plus the private folder, empty: a later background install links there.
+    expect(env).toEqual({ ...baseEnv, PATH: `${binDir()}:${baseEnv.PATH}` });
+    expect(readdirSync(binDir())).toEqual([]);
     expect(setup.engineSetupStatus()).toBe("failed");
     expect(statusChanges).toHaveBeenCalled();
     const win = openSetupWindow()!;
@@ -442,7 +450,7 @@ describe.skipIf(process.platform === "win32")("prepareEngineEnvironment", () => 
     const env = await pending;
 
     expect(Date.now() - closedAt).toBeLessThan(5_000);
-    expect(env).toEqual(baseEnv);
+    expect(env).toEqual({ ...baseEnv, PATH: `${binDir()}:${baseEnv.PATH}` });
     expect(await allDead(recordedPids())).toBe(true);
     expect(quit).not.toHaveBeenCalled();
     expect(FakeWindow.getAllWindows()).toEqual([]); // not reopened with the failure
@@ -457,7 +465,7 @@ describe.skipIf(process.platform === "win32")("prepareEngineEnvironment", () => 
     const env = await setup.prepareEngineEnvironment(baseEnv);
 
     expect(Date.now() - started).toBeLessThan(6_000);
-    expect(env).toEqual(baseEnv);
+    expect(env).toEqual({ ...baseEnv, PATH: `${binDir()}:${baseEnv.PATH}` });
     expect(await allDead(recordedPids())).toBe(true);
     const state = await screenOf(openSetupWindow()!);
     expect(state).toMatchObject({
@@ -534,6 +542,144 @@ describe.skipIf(process.platform === "win32")("prepareEngineEnvironment", () => 
         "Claude Code is ready, but the engine did not restart. Quit Orchestra and open it again.",
       detail: "daemon did not stop",
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 1.3.14: the requirement, the periodic check, and what the Orchestra page is told
+// ---------------------------------------------------------------------------
+
+describe("REQUIRED_CLAUDE_CODE_VERSION", () => {
+  it("no Claude model of the manifest needs more than what the app requires", () => {
+    for (const model of CLAUDE_MODEL_MANIFEST) {
+      const minimum =
+        "minimumClaudeCodeVersion" in model ? model.minimumClaudeCodeVersion : undefined;
+      if (minimum === undefined) continue;
+      expect(
+        compareVersions(minimum, setup.REQUIRED_CLAUDE_CODE_VERSION),
+        `${model.id} needs Claude Code ${minimum}, the app requires ${setup.REQUIRED_CLAUDE_CODE_VERSION}`,
+      ).not.toBe(1);
+    }
+  });
+});
+
+describe.skipIf(process.platform === "win32")("periodic Claude Code check", () => {
+  const binDir = () => path.join(electron.userData, "engine-bin");
+  const local = () => path.join(home, ".local", "bin");
+  const pageStatus = () => {
+    const event: { sender: unknown; returnValue?: unknown } = { sender: null };
+    electron.onHandlers.get(setup.CLAUDE_CODE_STATUS_GET_CHANNEL)?.(event);
+    return event.returnValue as Record<string, unknown> | null;
+  };
+
+  it("at launch the setup's own measurement is what the page reads", async () => {
+    writeClaude(local(), 'echo "2.1.290 (Claude Code)"');
+    await setup.prepareEngineEnvironment(baseEnv);
+    await setup.startClaudeCodeWatch();
+    expect(pageStatus()).toMatchObject({ version: "2.1.290", required: "2.1.284", ok: true });
+    expect(new Date(String(pageStatus()?.checkedAt)).toISOString()).toBe(pageStatus()?.checkedAt);
+    expect(fake.installs).toBe(0);
+  });
+
+  it("below the requirement while the engine runs: installed in the background, link followed, catalog read again, page told", async () => {
+    const refreshClaudeCatalog = vi.fn(async () => {});
+    setup.registerEngineSetup({ restartEngine: vi.fn(), refreshClaudeCatalog });
+    writeClaude(local(), 'echo "2.1.290 (Claude Code)"');
+    await setup.prepareEngineEnvironment(baseEnv);
+    await setup.startClaudeCodeWatch(); // as main.ts: after the engine, before the window
+    mainWindow = new FakeWindow();
+
+    // Claude Code goes back to 2.1.200 under the running engine.
+    writeClaude(local(), 'echo "2.1.200 (Claude Code)"');
+    fake.installer = installerThatInstalls();
+    await setup.recheckClaudeCodeNow("interval");
+
+    expect(fake.installs).toBe(1);
+    expect(FakeWindow.getAllWindows()).toEqual([mainWindow]); // no setup window: background
+    expect(readlinkSync(path.join(binDir(), "claude"))).toBe(path.join(local(), "claude"));
+    expect(refreshClaudeCatalog).toHaveBeenCalledTimes(1);
+    expect(pageStatus()).toMatchObject({ version: "2.1.290", ok: true });
+    expect(mainWindow.webContents.send).toHaveBeenLastCalledWith(
+      setup.CLAUDE_CODE_STATUS_CHANNEL,
+      expect.objectContaining({ version: "2.1.290", required: "2.1.284", ok: true }),
+    );
+  });
+
+  it("an old package-manager copy first on PATH, a good native copy installed: the link moves to the native one", async () => {
+    const brew = path.join(root, "homebrew", "bin");
+    writeClaude(brew, 'echo "2.1.290 (Claude Code)"');
+    const env = { ...baseEnv, PATH: `${brew}:/usr/bin:/bin` };
+    vi.stubEnv("PATH", env.PATH);
+    await setup.prepareEngineEnvironment(env);
+    await setup.startClaudeCodeWatch();
+    expect(readlinkSync(path.join(binDir(), "claude"))).toBe(path.join(brew, "claude"));
+
+    writeClaude(brew, 'echo "2.1.283 (Claude Code)"');
+    writeClaude(local(), 'echo "2.1.294 (Claude Code)"');
+    await setup.recheckClaudeCodeNow("interval");
+
+    expect(fake.installs).toBe(0);
+    expect(readlinkSync(path.join(binDir(), "claude"))).toBe(path.join(local(), "claude"));
+    expect(pageStatus()).toMatchObject({ version: "2.1.294", ok: true });
+  });
+
+  it("the setup at launch failed: the next check installs, links into the engine's folder, and the failure goes", async () => {
+    setup.registerEngineSetup({ restartEngine: vi.fn() });
+    const env = await setup.prepareEngineEnvironment(baseEnv); // offline: exit 1
+    expect(env.PATH).toBe(`${binDir()}:${baseEnv.PATH}`);
+    await setup.startClaudeCodeWatch();
+    mainWindow = new FakeWindow();
+    setup.finishEngineSetup();
+    const win = openSetupWindow()!;
+    await until(() => pageStatus() !== null); // measured once the setup is over
+    expect(pageStatus()).toMatchObject({ version: null, ok: false });
+    expect(fake.installs).toBe(1); // that measurement installed nothing
+
+    fake.installer = installerThatInstalls();
+    await setup.recheckClaudeCodeNow("interval");
+
+    expect(fake.installs).toBe(2);
+    expect(readlinkSync(path.join(binDir(), "claude"))).toBe(path.join(local(), "claude"));
+    expect(setup.engineSetupStatus()).toBe("ready");
+    expect(win.isDestroyed()).toBe(true);
+    expect(pageStatus()).toMatchObject({ version: "2.1.290", ok: true });
+  });
+
+  it("an engine Orchestra did not launch: measured for the page, never installed over", async () => {
+    writeClaude(local(), 'echo "2.1.200 (Claude Code)"');
+    fake.installer = installerThatInstalls();
+    await setup.startClaudeCodeWatch();
+    expect(pageStatus()).toMatchObject({ version: "2.1.200", ok: false });
+    expect(fake.installs).toBe(0);
+    expect(existsSync(binDir())).toBe(false);
+  });
+
+  it("checks again on resume and unlock, at most every 5 minutes", async () => {
+    writeClaude(local(), 'echo "2.1.290 (Claude Code)"');
+    await setup.startClaudeCodeWatch(); // measures now: reused engine
+    const first = pageStatus()?.checkedAt;
+    electron.power.get("resume")?.();
+    await sleep(50);
+    expect(pageStatus()?.checkedAt).toBe(first); // throttled
+  });
+
+  it("the period can be shortened for a test run, and only to a positive integer", () => {
+    expect(setup.claudeCodeCheckIntervalMs({})).toBe(30 * 60 * 1000);
+    expect(
+      setup.claudeCodeCheckIntervalMs({ [setup.CLAUDE_CODE_CHECK_INTERVAL_ENV]: "5000" }),
+    ).toBe(5_000);
+    expect(setup.claudeCodeCheckIntervalMs({ [setup.CLAUDE_CODE_CHECK_INTERVAL_ENV]: "x" })).toBe(
+      30 * 60 * 1000,
+    );
+  });
+
+  it("re-pointing the link never touches the file a running session executes", () => {
+    const oldCopy = writeClaude(path.join(root, "versions", "a"), 'echo "2.1.283 (Claude Code)"');
+    const newCopy = writeClaude(path.join(root, "versions", "b"), 'echo "2.1.294 (Claude Code)"');
+    expect(setup.writeClaudeCodeShim(oldCopy, binDir(), "darwin")).toBe(binDir());
+    expect(setup.writeClaudeCodeShim(newCopy, binDir(), "darwin")).toBe(binDir());
+    expect(readlinkSync(path.join(binDir(), "claude"))).toBe(newCopy);
+    expect(readFileSync(oldCopy, "utf8")).toContain("2.1.283");
   });
 });
 
