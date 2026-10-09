@@ -8,6 +8,7 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -884,6 +885,9 @@ function claudeCodeResolver(platform: NodeJS.Platform, env: Env) {
       exists: isFile,
       readVersion: (file) => readClaudeCodeVersion(file, env),
       minimum: REQUIRED_CLAUDE_CODE_VERSION,
+      // Never Orchestra's own shims: the terminal's `claude` and the engine's link.
+      excludeDirs: [terminalBinDir(env), engineBinDir(env)],
+      realpath: (file) => realpathSync(file),
     });
 }
 

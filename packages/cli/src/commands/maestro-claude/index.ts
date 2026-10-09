@@ -5,6 +5,7 @@ import { connectToDaemon } from "../../utils/client.js";
 import { selectDaemonTarget } from "../../utils/daemon-target.js";
 import {
   runMaestroClaude,
+  withoutLauncherEnv,
   type ChildHandle,
   type MaestroClaudeDeps,
   type SpawnRequest,
@@ -32,7 +33,9 @@ function spawnChild(request: SpawnRequest): ChildHandle {
 
 export function createMaestroClaudeDeps(): MaestroClaudeDeps {
   return {
-    env: process.env,
+    // A copy without the launcher's own keys (ELECTRON_RUN_AS_NODE and the rest): every branch's
+    // child starts from it, and process.env is never written.
+    env: withoutLauncherEnv(process.env),
     platform: process.platform,
     pid: process.pid,
     fs: {

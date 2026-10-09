@@ -24,7 +24,7 @@ export const PASSTHROUGH_COMMANDS: ReadonlySet<string> = new Set([
   "setup-token",
 ]);
 
-export const SELF_UPDATE_COMMANDS: ReadonlySet<string> = new Set(["update", "install"]);
+export const SELF_UPDATE_COMMANDS: ReadonlySet<string> = new Set(["update", "upgrade", "install"]);
 
 export const GOVERNED_FLAGS: readonly string[] = [
   "--model",
@@ -47,13 +47,68 @@ export const GOVERNED_FLAGS: readonly string[] = [
   "--append-system-prompt",
   "--append-system-prompt-file",
   "--plugin-dir",
+  "--plugin-url",
   "--add-dir",
+  "--agents",
+  "--agent",
+  "--fallback-model",
+  "--bg",
+  "--background",
+  "--cloud",
+  "--remote-control",
+  "--teleport",
 ];
+
+// Set by the CLI launcher: never inherited by `claude`, in any branch. Same keys as
+// RUNTIME_CONTROL_ENV_KEYS in packages/server/src/server/paseo-env.ts (not exported), plus PASEO_CLI.
+export const LAUNCHER_ENV_KEYS: readonly string[] = [
+  "ELECTRON_RUN_AS_NODE",
+  "ELECTRON_NO_ATTACH_CONSOLE",
+  "PASEO_NODE_ENV",
+  "PASEO_DESKTOP_MANAGED",
+  "PASEO_SUPERVISED",
+  "PASEO_CLI",
+  "ESBUILD_BINARY_PATH",
+];
+
+/** A copy of `env` without the launcher's keys. */
+export function withoutLauncherEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const copy: NodeJS.ProcessEnv = { ...env };
+  for (const key of LAUNCHER_ENV_KEYS) delete copy[key];
+  return copy;
+}
+
+// Fleet branch: the shell's own Claude Code settings (a base URL, an API key, Bedrock, another
+// config dir) must neither receive the fleet token nor replace it.
+const FLEET_STRIPPED_ENV_PREFIX = /^(ANTHROPIC_|CLAUDE_CODE_)/;
+const FLEET_STRIPPED_ENV_KEYS: ReadonlySet<string> = new Set([
+  "CLAUDE_CONFIG_DIR",
+  "AWS_BEARER_TOKEN_BEDROCK",
+]);
+const FLEET_KEPT_ENV_KEYS: ReadonlySet<string> = new Set(["CLAUDE_CODE_GIT_BASH_PATH"]);
+
+/** The base env of a fleet child, before Maestro's `env` is applied. */
+export function fleetBaseEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const base: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    const stripped =
+      !FLEET_KEPT_ENV_KEYS.has(key) &&
+      (FLEET_STRIPPED_ENV_PREFIX.test(key) || FLEET_STRIPPED_ENV_KEYS.has(key));
+    if (!stripped) base[key] = value;
+  }
+  return base;
+}
+
+/** cmd.exe runs a .cmd/.bat: an argument with a line break cannot reach it intact. */
+function isWindowsBatch(claude: string, platform: NodeJS.Platform): boolean {
+  return platform === "win32" && /\.(cmd|bat)$/i.test(claude);
+}
 
 export const MESSAGES = {
   notInstalled: "Claude Code is not installed. Orchestra installs it at the next check.",
   selfUpdate: "Orchestra keeps Claude Code up to date.",
   governed: (flag: string) => `${flag} is set by Maestro and cannot be changed here.`,
+  windowsBatchMultiline: "this Claude Code copy cannot take Maestro's settings on Windows",
   failed: (reason: string) =>
     `Maestro could not start Claude Code here: ${reason}. Use the chat, or ask the workspace owner.`,
 };
@@ -165,21 +220,21 @@ export function resolveClaudeExecutable(deps: {
     return null;
   }
 
-  const terminalBin = envValue(env, "ORCHESTRA_TERMINAL_BIN");
-  const terminalBinReal = terminalBin ? safeRealpath(fs, terminalBin) : null;
+  // Never Orchestra's own folders, before or after realpath: terminal-bin holds this very shim,
+  // engine-bin the chats' link.
+  const excluded = [envValue(env, "ORCHESTRA_TERMINAL_BIN"), envValue(env, "ORCHESTRA_ENGINE_BIN")]
+    .filter((dir): dir is string => dir !== null)
+    .flatMap((dir) => [dir, safeRealpath(fs, dir)]);
+  const isExcluded = (dir: string) => excluded.some((other) => samePath(dir, other, platform));
   const delimiter = platform === "win32" ? ";" : ":";
   for (const rawEntry of pathEnvValue(env).split(delimiter)) {
     const entry = rawEntry.trim();
     if (!entry) continue;
-    if (terminalBin && samePath(entry, terminalBin, platform)) continue;
-    if (terminalBinReal && samePath(safeRealpath(fs, entry), terminalBinReal, platform)) continue;
+    if (isExcluded(entry) || isExcluded(safeRealpath(fs, entry))) continue;
     for (const name of claudeNames(platform)) {
       const candidate = pathApi.join(entry, name);
       if (!isLaunchable(fs, candidate, platform)) continue;
-      if (terminalBinReal) {
-        const candidateDir = pathApi.dirname(safeRealpath(fs, candidate));
-        if (samePath(candidateDir, terminalBinReal, platform)) continue;
-      }
+      if (isExcluded(pathApi.dirname(safeRealpath(fs, candidate)))) continue;
       return candidate;
     }
   }
@@ -218,7 +273,7 @@ export function buildSpawnRequest(input: {
   platform: NodeJS.Platform;
 }): SpawnRequest {
   const { claude, args, env, platform } = input;
-  if (platform === "win32" && /\.(cmd|bat)$/i.test(claude)) {
+  if (isWindowsBatch(claude, platform)) {
     const comSpec = envValue(env, "ComSpec") ?? envValue(env, "COMSPEC") ?? "cmd.exe";
     const commandLine = [escapeCmdCommand(path.win32.normalize(claude))]
       .concat(args.map(escapeCmdArgument))
@@ -409,14 +464,21 @@ export async function runMaestroClaude(args: string[], deps: MaestroClaudeDeps):
     );
   }
 
-  // Fleet: the credentials live only in the child's env.
-  const childEnv: NodeJS.ProcessEnv = { ...deps.env, ...response.env };
+  // Fleet: the credentials live only in the child's env, over a base without the shell's own
+  // Claude Code settings.
+  const childEnv: NodeJS.ProcessEnv = { ...fleetBaseEnv(deps.env), ...response.env };
   try {
+    if (isWindowsBatch(claude, deps.platform) && response.argv.some((arg) => /[\r\n]/.test(arg))) {
+      deps.stderr(`${MESSAGES.failed(MESSAGES.windowsBatchMultiline)}\n`);
+      return 1;
+    }
     return await runChild(
       deps,
       buildSpawnRequest({
         claude,
-        args: [...args, ...response.argv],
+        // Maestro's argv first: a person's `--`, or an option left without its value at the end
+        // (`--session-id`), cannot swallow or shift Maestro's settings.
+        args: [...response.argv, ...args],
         env: childEnv,
         platform: deps.platform,
       }),

@@ -294,6 +294,32 @@ export type ClaudeCodeResolution =
       found: { path: string; version: string | null }[];
     };
 
+function isInExcludedDir(
+  candidate: ClaudeCodeCandidate,
+  input: {
+    platform: NodeJS.Platform;
+    excludeDirs?: readonly string[];
+    realpath?: (file: string) => string;
+  },
+): boolean {
+  const { platform, excludeDirs } = input;
+  if (!excludeDirs || excludeDirs.length === 0) return false;
+  const real = (file: string) => {
+    try {
+      return input.realpath ? input.realpath(file) : file;
+    } catch {
+      return file;
+    }
+  };
+  const excluded = excludeDirs.flatMap((dir) => [dir, real(dir)]);
+  const dirs = [
+    candidate.dir,
+    real(candidate.dir),
+    pathApi(platform).dirname(real(candidate.path)),
+  ];
+  return dirs.some((dir) => excluded.some((other) => sameDir(dir, other, platform)));
+}
+
 /**
  * The newest `claude` that meets the minimum (1.3.15: not the first in PATH order; on equal
  * versions the earlier one, PATH order and then the known folders). A copy whose `--version` is
@@ -308,10 +334,19 @@ export async function resolveClaudeCode(input: {
   exists: (file: string) => boolean;
   readVersion: (file: string) => Promise<ClaudeCodeVersionRead>;
   minimum?: string;
+  /**
+   * Orchestra's own folders (terminal-bin, engine-bin): a copy in one of them, or whose real file
+   * is in one of them, is never picked nor counted (it is Orchestra's shim, not Claude Code).
+   */
+  excludeDirs?: readonly string[];
+  /** Resolves links for excludeDirs; identity when absent or when it throws. */
+  realpath?: (file: string) => string;
 }): Promise<ClaudeCodeResolution> {
-  const candidates = claudeCodeCandidates(input);
+  const all = claudeCodeCandidates(input);
+  const candidates = all.filter((candidate) => !isInExcludedDir(candidate, input));
   if (candidates.length === 0) return { status: "missing" };
-  const firstOnPath = candidates.find((candidate) => candidate.onPath) ?? null;
+  // The PATH search the engine would do still meets an excluded copy first: say so.
+  const firstOnPath = all.find((candidate) => candidate.onPath) ?? null;
   const ready = (candidate: ClaudeCodeCandidate, version: string | null) => ({
     status: "ready" as const,
     path: candidate.path,

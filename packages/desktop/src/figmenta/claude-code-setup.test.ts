@@ -26,6 +26,7 @@ import {
   pathEnvKey,
   prependToPath,
   resolveClaudeCode,
+  resolutionCopies,
   searchPathDirs,
   type ClaudeCodeResolution,
   type ClaudeCodeVersionRead,
@@ -360,6 +361,108 @@ describe("resolveClaudeCode", () => {
       ...fs({}),
     });
     expect(resolution).toEqual({ status: "missing" });
+  });
+});
+
+describe("resolveClaudeCode never picks Orchestra's own folders (terminal-bin, engine-bin)", () => {
+  const SUPPORT = "/Users/me/Library/Application Support/Orchestra";
+  const TERMINAL_BIN = `${SUPPORT}/terminal-bin`;
+  const ENGINE_BIN = `${SUPPORT}/engine-bin`;
+  const LOCAL = "/Users/me/.local/bin/claude";
+  const VERSIONS = "/Users/me/.local/share/claude/versions/2.1.290";
+  // engine-bin/claude is a symlink to the real copy; terminal-bin/claude is the CLI shim itself.
+  const links: Record<string, string> = {
+    [`${ENGINE_BIN}/claude`]: VERSIONS,
+    [LOCAL]: VERSIONS,
+  };
+  const realpath = (file: string) => links[file] ?? file;
+  const exclude = { excludeDirs: [TERMINAL_BIN, ENGINE_BIN], realpath };
+
+  it("skips the terminal shim first on PATH, even when it answers a newer version", async () => {
+    const resolution = await resolveClaudeCode({
+      platform: "darwin",
+      env: { PATH: `${TERMINAL_BIN}:${ENGINE_BIN}:/Users/me/.local/bin:/usr/bin` },
+      homedir: "/Users/me",
+      ...fs({
+        [`${TERMINAL_BIN}/claude`]: "2.1.299",
+        [`${ENGINE_BIN}/claude`]: "2.1.299",
+        [LOCAL]: "2.1.290",
+      }),
+      ...exclude,
+    });
+    expect(resolution).toEqual({
+      status: "ready",
+      path: LOCAL,
+      version: "2.1.290",
+      firstOnPath: false,
+    });
+    expect(resolutionCopies(resolution)).toEqual([{ path: LOCAL, version: "2.1.290" }]);
+  });
+
+  it("skips a folder that is terminal-bin after realpath, and a link whose real file is in it", async () => {
+    const aliasDir = "/Users/me/orchestra-terminal";
+    const viaLink = "/opt/link/claude";
+    const aliasLinks: Record<string, string> = {
+      [aliasDir]: TERMINAL_BIN,
+      [`${aliasDir}/claude`]: `${TERMINAL_BIN}/claude`,
+      [viaLink]: `${TERMINAL_BIN}/claude`,
+    };
+    const resolution = await resolveClaudeCode({
+      platform: "darwin",
+      env: { PATH: `${aliasDir}:/opt/link:/usr/bin` },
+      homedir: "/Users/me",
+      ...fs({ [`${aliasDir}/claude`]: "2.1.299", [viaLink]: "2.1.299", [LOCAL]: "2.1.284" }),
+      excludeDirs: [TERMINAL_BIN],
+      realpath: (file) => aliasLinks[file] ?? file,
+    });
+    expect(resolution).toMatchObject({ status: "ready", path: LOCAL, version: "2.1.284" });
+  });
+
+  it("is missing, not too-old, when only Orchestra's shims exist: the installer runs", async () => {
+    const files = fs({ [`${TERMINAL_BIN}/claude`]: "2.1.100", [`${ENGINE_BIN}/claude`]: "broken" });
+    const resolution = await resolveClaudeCode({
+      platform: "darwin",
+      env: { PATH: `${TERMINAL_BIN}:${ENGINE_BIN}:/usr/bin` },
+      homedir: "/Users/me",
+      ...files,
+      ...exclude,
+    });
+    expect(resolution).toEqual({ status: "missing" });
+    expect(resolutionCopies(resolution)).toEqual([]);
+    expect(files.readVersion).not.toHaveBeenCalled();
+  });
+
+  it("Windows: the folders compare without case, and a throwing realpath is harmless", async () => {
+    const local = "C:\\Users\\Figmenta\\AppData\\Local\\Orchestra";
+    const env = { ...WIN_ENV, Path: `${local}\\terminal-bin;${local}\\engine-bin;${WIN_ENV.Path}` };
+    const resolution = await resolveClaudeCode({
+      platform: "win32",
+      env,
+      homedir: "C:\\Users\\Figmenta",
+      ...fs({
+        [`${local}\\terminal-bin\\claude.cmd`]: "2.1.299",
+        [`${local}\\engine-bin\\claude.exe`]: "2.1.299",
+        [WIN_NATIVE]: "2.1.284",
+      }),
+      excludeDirs: [
+        "c:\\users\\figmenta\\appdata\\local\\orchestra\\TERMINAL-BIN",
+        `${local}\\engine-bin\\`,
+      ],
+      realpath: () => {
+        throw new Error("ENOENT");
+      },
+    });
+    expect(resolution).toMatchObject({ status: "ready", path: WIN_NATIVE, version: "2.1.284" });
+  });
+
+  it("without excludeDirs nothing changes", async () => {
+    const resolution = await resolveClaudeCode({
+      platform: "darwin",
+      env: { PATH: `${TERMINAL_BIN}:/usr/bin` },
+      homedir: "/Users/me",
+      ...fs({ [`${TERMINAL_BIN}/claude`]: "2.1.290" }),
+    });
+    expect(resolution).toMatchObject({ status: "ready", path: `${TERMINAL_BIN}/claude` });
   });
 });
 

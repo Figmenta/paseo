@@ -6,11 +6,13 @@ import {
   findGovernedFlag,
   resolveClaudeExecutable,
   runMaestroClaude,
+  withoutLauncherEnv,
   type ChildHandle,
   type MaestroClaudeDeps,
   type MaestroClaudeFs,
   type SpawnRequest,
 } from "./maestro-claude.js";
+import { createMaestroClaudeDeps } from "./index.js";
 
 interface RpcCall {
   pluginId: string;
@@ -192,7 +194,7 @@ describe("maestro-claude passthrough", () => {
     });
   });
 
-  it.each(["update", "install"])("%s prints the message and exits 0", async (first) => {
+  it.each(["update", "upgrade", "install"])("%s prints the message and exits 0", async (first) => {
     const harness = createHarness({});
     const code = await runMaestroClaude([first], harness.deps);
 
@@ -225,7 +227,16 @@ const CONTRACT_GOVERNED_FLAGS = [
   "--append-system-prompt",
   "--append-system-prompt-file",
   "--plugin-dir",
+  "--plugin-url",
   "--add-dir",
+  "--agents",
+  "--agent",
+  "--fallback-model",
+  "--bg",
+  "--background",
+  "--cloud",
+  "--remote-control",
+  "--teleport",
 ];
 
 describe("maestro-claude governed flags", () => {
@@ -278,7 +289,7 @@ describe("maestro-claude fleet", () => {
     expect(harness.rpcCalls[0]?.input).toEqual({ terminalId: null, pid: 4242 });
   });
 
-  it("puts the credentials on the child only, person's args first, Maestro argv last", async () => {
+  it("puts the credentials on the child only, Maestro argv first, person's args last", async () => {
     const harness = createHarness({ launch: () => FLEET_RESPONSE });
     const parentEnvBefore = { ...harness.deps.env };
     const processEnvBefore = { ...process.env };
@@ -289,7 +300,7 @@ describe("maestro-claude fleet", () => {
     expect(harness.spawns).toHaveLength(1);
     const spawned = harness.spawns[0]!;
     expect(spawned.command).toBe("/engine-bin/claude");
-    expect(spawned.args).toEqual(["-p", "say ok", ...FLEET_RESPONSE.argv]);
+    expect(spawned.args).toEqual([...FLEET_RESPONSE.argv, "-p", "say ok"]);
     expect(spawned.env).toEqual({ ...parentEnvBefore, ...FLEET_RESPONSE.env });
     // The parent keeps its env: no credential in this process, the shell, or the screen.
     expect(harness.deps.env).toEqual(parentEnvBefore);
@@ -297,6 +308,76 @@ describe("maestro-claude fleet", () => {
     expect(process.env).toEqual(processEnvBefore);
     expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe(originalOauth);
     expect(harness.stdout.join("") + harness.stderr.join("")).not.toContain("sk-ant-oat-secret");
+  });
+
+  it("a person's `--` comes after every Maestro argument", async () => {
+    const harness = createHarness({ launch: () => FLEET_RESPONSE });
+    expect(await runMaestroClaude(["--", "hi"], harness.deps)).toBe(0);
+
+    const args = harness.spawns[0]!.args;
+    expect(args).toEqual([...FLEET_RESPONSE.argv, "--", "hi"]);
+    const dashDash = args.indexOf("--");
+    for (const arg of FLEET_RESPONSE.argv) {
+      expect(args.indexOf(arg)).toBeLessThan(dashDash);
+    }
+  });
+
+  it("an option left without its value at the end does not take Maestro's --model", async () => {
+    const harness = createHarness({ launch: () => FLEET_RESPONSE });
+    expect(await runMaestroClaude(["-p", "--session-id"], harness.deps)).toBe(0);
+
+    const args = harness.spawns[0]!.args;
+    expect(args).toEqual([...FLEET_RESPONSE.argv, "-p", "--session-id"]);
+    expect(args.slice(0, 2)).toEqual(["--model", "claude-opus"]);
+    expect(args.at(-1)).toBe("--session-id");
+  });
+
+  it("the shell's own Claude Code settings never reach the fleet child", async () => {
+    const harness = createHarness({
+      launch: () => FLEET_RESPONSE,
+      env: {
+        PATH: "/usr/bin",
+        ORCHESTRA_ENGINE_BIN: "/engine-bin",
+        PASEO_TERMINAL_ID: "term-1",
+        HOME: "/home/person",
+        ANTHROPIC_BASE_URL: "https://proxy.example.com",
+        ANTHROPIC_API_KEY: "sk-ant-api-shell",
+        ANTHROPIC_MODEL: "claude-haiku",
+        CLAUDE_CODE_USE_BEDROCK: "1",
+        CLAUDE_CODE_GIT_BASH_PATH: "C:\\Git\\bin\\bash.exe",
+        CLAUDE_CONFIG_DIR: "/home/person/.claude-other",
+        AWS_BEARER_TOKEN_BEDROCK: "bedrock-secret",
+      },
+    });
+    expect(await runMaestroClaude(["-p", "hi"], harness.deps)).toBe(0);
+
+    const env = harness.spawns[0]!.env;
+    for (const key of [
+      "ANTHROPIC_BASE_URL",
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_MODEL",
+      "CLAUDE_CODE_USE_BEDROCK",
+      "AWS_BEARER_TOKEN_BEDROCK",
+    ]) {
+      expect(env).not.toHaveProperty(key);
+    }
+    expect(env.CLAUDE_CODE_GIT_BASH_PATH).toBe("C:\\Git\\bin\\bash.exe");
+    // Maestro's own values win: config dir and token come from the answer only.
+    expect(env.CLAUDE_CONFIG_DIR).toBe(FLEET_RESPONSE.env.CLAUDE_CONFIG_DIR);
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(FLEET_RESPONSE.env.CLAUDE_CODE_OAUTH_TOKEN);
+    expect(env.PATH).toBe("/usr/bin");
+    expect(env.HOME).toBe("/home/person");
+    // The parent keeps them: only the child's copy is filtered.
+    expect(harness.deps.env.ANTHROPIC_API_KEY).toBe("sk-ant-api-shell");
+  });
+
+  it("own keeps the shell's Claude Code settings", async () => {
+    const harness = createHarness({
+      launch: () => ({ mode: "own" }),
+      env: { PATH: "/usr/bin", ORCHESTRA_ENGINE_BIN: "/engine-bin", ANTHROPIC_API_KEY: "k" },
+    });
+    await runMaestroClaude(["-p", "hi"], harness.deps);
+    expect(harness.spawns[0]!.env.ANTHROPIC_API_KEY).toBe("k");
   });
 
   it("returns the child's exit code and ends the session even on a non-zero exit", async () => {
@@ -355,6 +436,56 @@ describe("maestro-claude fleet", () => {
     for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
       expect(harness.signalHandlers.get(signal)?.size ?? 0).toBe(0);
     }
+  });
+});
+
+describe("maestro-claude fleet, Windows batch copy", () => {
+  const winEnv = { Path: "C:\\Windows", ORCHESTRA_ENGINE_BIN: "C:\\engine-bin" };
+  const winCmd = { "C:\\engine-bin\\claude.cmd": "" };
+
+  it.each(["line one\nline two", "a\rb"])(
+    "refuses a Maestro argument with a line break (%j): terminal_end, exit 1",
+    async (prompt) => {
+      const harness = createHarness({
+        platform: "win32",
+        env: winEnv,
+        files: winCmd,
+        launch: () => ({ ...FLEET_RESPONSE, argv: ["--append-system-prompt", prompt] }),
+      });
+      expect(await runMaestroClaude(["-p", "hi"], harness.deps)).toBe(1);
+
+      expect(harness.spawns).toEqual([]);
+      expect(harness.stderr.join("")).toBe(
+        `${MESSAGES.failed("this Claude Code copy cannot take Maestro's settings on Windows")}\n`,
+      );
+      expect(harness.rpcCalls.map((call) => call.method)).toEqual([
+        "maestro.terminal_launch",
+        "maestro.terminal_end",
+      ]);
+      expect(harness.rpcCalls[1]?.input).toEqual({ agentId: FLEET_RESPONSE.agentId });
+    },
+  );
+
+  it("starts a .cmd copy when no Maestro argument has a line break", async () => {
+    const harness = createHarness({
+      platform: "win32",
+      env: winEnv,
+      files: winCmd,
+      launch: () => FLEET_RESPONSE,
+    });
+    expect(await runMaestroClaude(["-p", "a\nb"], harness.deps)).toBe(0);
+    expect(harness.spawns).toHaveLength(1);
+  });
+
+  it("starts a claude.exe copy even with a line break", async () => {
+    const harness = createHarness({
+      platform: "win32",
+      env: winEnv,
+      files: { "C:\\engine-bin\\claude.exe": "" },
+      launch: () => ({ ...FLEET_RESPONSE, argv: ["--append-system-prompt", "a\nb"] }),
+    });
+    expect(await runMaestroClaude([], harness.deps)).toBe(0);
+    expect(harness.spawns[0]?.args).toEqual(["--append-system-prompt", "a\nb"]);
   });
 });
 
@@ -539,5 +670,79 @@ describe("buildSpawnRequest", () => {
     expect(request.args.slice(0, 3)).toEqual(["/d", "/s", "/c"]);
     expect(request.args[3]).toContain("C:\\npm\\claude.cmd");
     expect(request.args[3]).toContain("a^^^&b");
+  });
+});
+
+const LAUNCHER_KEYS = [
+  "ELECTRON_RUN_AS_NODE",
+  "ELECTRON_NO_ATTACH_CONSOLE",
+  "PASEO_NODE_ENV",
+  "PASEO_DESKTOP_MANAGED",
+  "PASEO_SUPERVISED",
+  "PASEO_CLI",
+  "ESBUILD_BINARY_PATH",
+];
+
+describe("the launcher's env never reaches claude", () => {
+  it("withoutLauncherEnv drops exactly the launcher's keys, on a copy", () => {
+    const env: NodeJS.ProcessEnv = { PATH: "/usr/bin", HOME: "/h", PASEO_TERMINAL_ID: "t" };
+    for (const key of LAUNCHER_KEYS) env[key] = "1";
+    const before = { ...env };
+    expect(withoutLauncherEnv(env)).toEqual({
+      PATH: "/usr/bin",
+      HOME: "/h",
+      PASEO_TERMINAL_ID: "t",
+    });
+    expect(env).toEqual(before);
+  });
+});
+
+describe("createMaestroClaudeDeps: the launcher's env never reaches claude", () => {
+  const saved: Record<string, string | undefined> = {};
+  const touched = [...LAUNCHER_KEYS, "ORCHESTRA_ENGINE_BIN", "PASEO_TERMINAL_ID"];
+  afterEach(() => {
+    for (const key of touched) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  });
+
+  it.each([
+    ["passthrough", ["--version"], { mode: "own" }],
+    ["own", ["-p", "hi"], { mode: "own" }],
+    ["fleet", ["-p", "hi"], FLEET_RESPONSE],
+  ] as const)("%s: the child's env has none of them", async (_branch, args, answer) => {
+    for (const key of touched) saved[key] = process.env[key];
+    for (const key of LAUNCHER_KEYS) process.env[key] = "1";
+    process.env.ORCHESTRA_ENGINE_BIN = "/engine-bin";
+    process.env.PASEO_TERMINAL_ID = "term-1";
+    const processEnvBefore = { ...process.env };
+
+    const real = createMaestroClaudeDeps();
+    for (const key of LAUNCHER_KEYS) expect(real.env).not.toHaveProperty(key);
+    expect(real.env.PASEO_TERMINAL_ID).toBe("term-1");
+
+    const spawns: SpawnRequest[] = [];
+    const deps: MaestroClaudeDeps = {
+      ...real,
+      fs: fakeFs({ "/engine-bin/claude": "/engine-bin/claude" }),
+      connect: async () => ({
+        invokePluginRpc: async (_pluginId, method) =>
+          method === "maestro.terminal_launch" ? answer : { ok: true },
+        close: async () => {},
+      }),
+      spawn: (request) => {
+        spawns.push(request);
+        const child = createFakeChild();
+        setTimeout(() => child.exit(0), 0);
+        return child.handle;
+      },
+      onSignal: () => () => {},
+    };
+    expect(await runMaestroClaude([...args], deps)).toBe(0);
+
+    expect(spawns).toHaveLength(1);
+    for (const key of LAUNCHER_KEYS) expect(spawns[0]!.env).not.toHaveProperty(key);
+    expect(process.env).toEqual(processEnvBefore);
   });
 });
