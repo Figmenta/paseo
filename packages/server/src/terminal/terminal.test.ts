@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { isPlatform } from "../test-utils/platform.js";
 import {
+  buildInteractiveShellArgs,
   buildTerminalEnvironment,
   createTerminal,
   ensureNodePtySpawnHelperExecutableForCurrentPlatform,
@@ -17,6 +18,7 @@ import {
   existsSync,
   mkdtempSync,
   mkdirSync,
+  readFileSync,
   realpathSync,
   rmSync,
   statSync,
@@ -24,8 +26,8 @@ import {
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import * as pty from "node-pty";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
+import { tmpdir, userInfo } from "node:os";
 import { setImmediate as waitForImmediate, setTimeout as delay } from "node:timers/promises";
 import { stripVTControlCharacters } from "node:util";
 
@@ -1147,6 +1149,112 @@ describe.skipIf(isPlatform("win32"))("colors", () => {
     expect(outputRow[0].char).toBe("B");
     expect(outputRow[0].bg).toBe(1); // ANSI red = 1
     expect(outputRow[0].bgMode).toBe(1); // Mode 1 = 16 ANSI colors
+  });
+});
+
+describe("Orchestra terminal-bin", () => {
+  const terminalBin = join(tmpdir(), "orchestra-terminal-bin");
+  const cliBinDir = join(tmpdir(), "paseo-cli-bin");
+  const basePath = ["/usr/local/bin", terminalBin, "/usr/bin"].join(delimiter);
+  const runtimeDir = join(tmpdir(), `${userInfo().username || "unknown"}-paseo-zsh-${process.pid}`);
+
+  function build(input: {
+    shell: string;
+    interactiveShell?: boolean;
+    orchestraTerminalBin?: string | null;
+  }): Record<string, string> {
+    return buildTerminalEnvironment({
+      ...input,
+      env: { PATH: basePath, HOME: "/tmp/paseo-home" },
+      paseoCliBinDir: cliBinDir,
+      paseoHookCliPath: null,
+      zshShellIntegrationDir: resolveZshShellIntegrationDir(),
+    });
+  }
+
+  it("puts terminal-bin at the head of PATH, before the paseo CLI dir, without duplicates", () => {
+    for (const shell of ["/bin/zsh", "/bin/bash", "/usr/bin/fish", "/bin/sh", "pwsh.exe"]) {
+      const env = build({ shell, interactiveShell: true, orchestraTerminalBin: terminalBin });
+      expect(env.PATH?.split(delimiter)).toEqual([
+        terminalBin,
+        cliBinDir,
+        "/usr/local/bin",
+        "/usr/bin",
+      ]);
+    }
+  });
+
+  it("leaves PATH alone when the terminal runs a command", () => {
+    const withCommand = build({
+      shell: "/bin/bash",
+      interactiveShell: false,
+      orchestraTerminalBin: terminalBin,
+    });
+    const without = build({ shell: "/bin/bash", orchestraTerminalBin: null });
+    expect(withCommand).toEqual(without);
+  });
+
+  it("changes nothing without ORCHESTRA_TERMINAL_BIN", () => {
+    for (const shell of ["/bin/bash", "/usr/bin/fish", "/bin/sh", "/bin/zsh"]) {
+      const legacy = buildTerminalEnvironment({
+        shell,
+        env: { PATH: basePath, HOME: "/tmp/paseo-home" },
+        paseoCliBinDir: cliBinDir,
+        paseoHookCliPath: null,
+        zshShellIntegrationDir: resolveZshShellIntegrationDir(),
+      });
+      expect(build({ shell, interactiveShell: true, orchestraTerminalBin: null })).toEqual(legacy);
+      expect(buildInteractiveShellArgs({ shell, orchestraTerminalBin: null })).toEqual([]);
+    }
+  });
+
+  it("reads ORCHESTRA_TERMINAL_BIN from the daemon env by default", () => {
+    const previous = process.env.ORCHESTRA_TERMINAL_BIN;
+    try {
+      Reflect.deleteProperty(process.env, "ORCHESTRA_TERMINAL_BIN");
+      expect(buildInteractiveShellArgs({ shell: "/usr/bin/fish" })).toEqual([]);
+      expect(build({ shell: "/bin/sh", interactiveShell: true }).PATH?.split(delimiter)[0]).toBe(
+        cliBinDir,
+      );
+
+      process.env.ORCHESTRA_TERMINAL_BIN = terminalBin;
+      expect(buildInteractiveShellArgs({ shell: "/usr/bin/fish" })[0]).toBe("--init-command");
+      expect(build({ shell: "/bin/sh", interactiveShell: true }).PATH?.split(delimiter)[0]).toBe(
+        terminalBin,
+      );
+    } finally {
+      if (previous === undefined) Reflect.deleteProperty(process.env, "ORCHESTRA_TERMINAL_BIN");
+      else process.env.ORCHESTRA_TERMINAL_BIN = previous;
+    }
+  });
+
+  it("starts bash with an --rcfile that sources ~/.bashrc first", () => {
+    const args = buildInteractiveShellArgs({
+      shell: "/bin/bash",
+      orchestraTerminalBin: terminalBin,
+    });
+    expect(args).toEqual(["--rcfile", join(runtimeDir, "paseo-bashrc")]);
+    const rcfile = readFileSync(args[1]!, "utf8");
+    expect(rcfile.split("\n")[0]).toBe('[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"');
+    expect(rcfile).toContain("ORCHESTRA_TERMINAL_BIN");
+  });
+
+  it("starts fish with the --init-command of the contract", () => {
+    expect(
+      buildInteractiveShellArgs({
+        shell: "/opt/homebrew/bin/fish",
+        orchestraTerminalBin: terminalBin,
+      }),
+    ).toEqual([
+      "--init-command",
+      "if set -q ORCHESTRA_TERMINAL_BIN; set -gx PATH $ORCHESTRA_TERMINAL_BIN $PATH; end",
+    ]);
+  });
+
+  it("adds no args for zsh, sh, cmd.exe or PowerShell", () => {
+    for (const shell of ["/bin/zsh", "/bin/sh", "cmd.exe", "powershell.exe", "pwsh"]) {
+      expect(buildInteractiveShellArgs({ shell, orchestraTerminalBin: terminalBin })).toEqual([]);
+    }
   });
 });
 

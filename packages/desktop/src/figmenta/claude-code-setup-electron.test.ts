@@ -10,9 +10,10 @@ import {
   readlinkSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { release, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CLAUDE_MODEL_MANIFEST } from "../../../server/src/server/agent/providers/claude/model-manifest.js";
@@ -122,7 +123,12 @@ vi.mock("electron-log/main", () => ({
 
 // The real resolution, confined to this test's folders (a real claude on this machine is not
 // the test's business), and a fake official installer.
-const fake = vi.hoisted(() => ({ root: "", installer: "exit 1", installs: 0 }));
+const fake = vi.hoisted(() => ({
+  root: "",
+  installer: "exit 1",
+  installs: 0,
+  targets: [] as string[],
+}));
 vi.mock("./claude-code-setup.js", async (importOriginal) => {
   const real = await importOriginal<typeof import("./claude-code-setup.js")>();
   return {
@@ -132,14 +138,23 @@ vi.mock("./claude-code-setup.js", async (importOriginal) => {
         ...input,
         exists: (file) => file.startsWith(fake.root) && input.exists(file),
       }),
-    claudeCodeInstallerCommand: (_platform: NodeJS.Platform, env: Record<string, string>) => {
+    claudeCodeInstallerCommand: (
+      platform: NodeJS.Platform,
+      env: Record<string, string>,
+      target?: string,
+    ) => {
+      // The real one validates the target: what reaches it is what the installer would get.
+      real.claudeCodeInstallerCommand(platform, env, target);
       fake.installs += 1;
+      fake.targets.push(target ?? real.CLAUDE_CODE_INSTALL_TARGET);
       return { command: "/bin/sh", args: ["-c", fake.installer], env };
     },
   };
 });
 
 const setup = await import("./claude-code-setup-electron.js");
+const { getBundledCliShimPath } = await import("../integrations/cli-install/paths.js");
+const log = (await import("electron-log/main")).default;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -221,6 +236,12 @@ beforeEach(() => {
   fake.root = root;
   fake.installer = "exit 1";
   fake.installs = 0;
+  fake.targets = [];
+  // Never the real network: the newest version is unknown unless a test says otherwise.
+  setup.__setLatestClaudeCodeSource(async () => {
+    throw new Error("offline (test)");
+  });
+  vi.mocked(log.info).mockClear();
   quit = vi.fn();
   electron.quit = quit;
   vi.stubEnv("HOME", home);
@@ -409,7 +430,11 @@ describe.skipIf(process.platform === "win32")("prepareEngineEnvironment", () => 
     const env = await setup.prepareEngineEnvironment(baseEnv);
 
     // The app's own env, plus the private folder, empty: a later background install links there.
-    expect(env).toEqual({ ...baseEnv, PATH: `${binDir()}:${baseEnv.PATH}` });
+    expect(env).toEqual({
+      ...baseEnv,
+      PATH: `${binDir()}:${baseEnv.PATH}`,
+      ORCHESTRA_ENGINE_BIN: binDir(),
+    });
     expect(readdirSync(binDir())).toEqual([]);
     expect(setup.engineSetupStatus()).toBe("failed");
     expect(statusChanges).toHaveBeenCalled();
@@ -450,7 +475,11 @@ describe.skipIf(process.platform === "win32")("prepareEngineEnvironment", () => 
     const env = await pending;
 
     expect(Date.now() - closedAt).toBeLessThan(5_000);
-    expect(env).toEqual({ ...baseEnv, PATH: `${binDir()}:${baseEnv.PATH}` });
+    expect(env).toEqual({
+      ...baseEnv,
+      PATH: `${binDir()}:${baseEnv.PATH}`,
+      ORCHESTRA_ENGINE_BIN: binDir(),
+    });
     expect(await allDead(recordedPids())).toBe(true);
     expect(quit).not.toHaveBeenCalled();
     expect(FakeWindow.getAllWindows()).toEqual([]); // not reopened with the failure
@@ -465,7 +494,11 @@ describe.skipIf(process.platform === "win32")("prepareEngineEnvironment", () => 
     const env = await setup.prepareEngineEnvironment(baseEnv);
 
     expect(Date.now() - started).toBeLessThan(6_000);
-    expect(env).toEqual({ ...baseEnv, PATH: `${binDir()}:${baseEnv.PATH}` });
+    expect(env).toEqual({
+      ...baseEnv,
+      PATH: `${binDir()}:${baseEnv.PATH}`,
+      ORCHESTRA_ENGINE_BIN: binDir(),
+    });
     expect(await allDead(recordedPids())).toBe(true);
     const state = await screenOf(openSetupWindow()!);
     expect(state).toMatchObject({
@@ -680,6 +713,215 @@ describe.skipIf(process.platform === "win32")("periodic Claude Code check", () =
     expect(setup.writeClaudeCodeShim(newCopy, binDir(), "darwin")).toBe(binDir());
     expect(readlinkSync(path.join(binDir(), "claude"))).toBe(newCopy);
     expect(readFileSync(oldCopy, "utf8")).toContain("2.1.283");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 1.3.15: the newest version (V2), the failure for Settings (V1), terminal-bin (V3)
+// ---------------------------------------------------------------------------
+
+describe.skipIf(process.platform === "win32")("1.3.15 on the desktop", () => {
+  const binDir = () => path.join(electron.userData, "engine-bin");
+  const terminalBin = () => path.join(electron.userData, "terminal-bin");
+  const local = () => path.join(home, ".local", "bin");
+  const brakeFile = () => path.join(electron.userData, setup.LATEST_ATTEMPT_FILE);
+  const pageStatus = () => {
+    const event: { sender: unknown; returnValue?: unknown } = { sender: null };
+    electron.onHandlers.get(setup.CLAUDE_CODE_STATUS_GET_CHANNEL)?.(event);
+    return event.returnValue as Record<string, unknown> | null;
+  };
+  const newest = (body: string) => {
+    const reads = vi.fn(async () => body);
+    setup.__setLatestClaudeCodeSource(reads);
+    return reads;
+  };
+  /** The official installer for `version`, which notes whether the brake was on disk before it ran. */
+  const installs = (version: string) => {
+    const dir = local();
+    return `test -f "${brakeFile()}" && touch "${root}/brake-was-written"; mkdir -p "${dir}" && printf '#!/bin/sh\\necho "${version} (Claude Code)"\\n' > "${dir}/claude" && chmod +x "${dir}/claude"`;
+  };
+  const OTHER_ENGINE =
+    "[terminal] another engine is running: terminals use the person's own claude";
+  const fakeCli = () => {
+    const cli = getBundledCliShimPath();
+    mkdirSync(path.dirname(cli), { recursive: true });
+    writeFileSync(cli, '#!/bin/sh\necho "cli: $*"\n');
+    chmodSync(cli, 0o755);
+    return cli;
+  };
+
+  it("V2: a good copy below the newest goes to the newest at the first check; brake written before the installer", async () => {
+    const reads = newest("2.1.295\n");
+    writeClaude(local(), 'echo "2.1.289 (Claude Code)"');
+    fake.installer = installs("2.1.295");
+    await setup.prepareEngineEnvironment(baseEnv);
+    expect(fake.installs).toBe(0); // the launch is not held up by it
+
+    await setup.startClaudeCodeWatch(); // main.ts: the first check, in the background
+
+    expect(fake.targets).toEqual(["2.1.295"]);
+    expect(existsSync(path.join(root, "brake-was-written"))).toBe(true);
+    expect(JSON.parse(readFileSync(brakeFile(), "utf8"))).toMatchObject({ target: "2.1.295" });
+    expect(readlinkSync(path.join(binDir(), "claude"))).toBe(path.join(local(), "claude"));
+    expect(pageStatus()).toMatchObject({ version: "2.1.295", ok: true, latest: "2.1.295" });
+
+    await setup.recheckClaudeCodeNow("interval");
+    expect(reads).toHaveBeenCalledTimes(1); // read at most once an hour
+  });
+
+  it("V2: a failed attempt above the minimum is the log's only; the brake holds across a restart; below the minimum it does not", async () => {
+    newest("2.1.295");
+    writeClaude(local(), 'echo "2.1.289 (Claude Code)"');
+    fake.installer = 'echo "curl: (6) Could not resolve host" >&2; exit 6';
+    await setup.prepareEngineEnvironment(baseEnv);
+    await setup.startClaudeCodeWatch();
+    expect(fake.installs).toBe(1);
+    expect(pageStatus()).toMatchObject({ version: "2.1.289", ok: true, failure: null });
+
+    await setup.recheckClaudeCodeNow("interval");
+    expect(fake.installs).toBe(1); // braked
+
+    // A new run of the app: the brake is on disk.
+    setup.__resetEngineSetup();
+    newest("2.1.295");
+    await setup.prepareEngineEnvironment(baseEnv);
+    await setup.startClaudeCodeWatch();
+    expect(fake.installs).toBe(1);
+    expect(pageStatus()).toMatchObject({ version: "2.1.289", ok: true, latest: "2.1.295" });
+
+    // Below the minimum the brake does not hold, and the failure is Settings' business.
+    writeClaude(local(), 'echo "2.1.200 (Claude Code)"');
+    await setup.recheckClaudeCodeNow("interval");
+    expect(fake.installs).toBe(2);
+    expect(fake.targets).toEqual(["2.1.295", "2.1.295"]);
+    const status = pageStatus();
+    expect(status).toMatchObject({ version: "2.1.200", ok: false });
+    const failure = status?.failure as { message: string; detail: string; at: string };
+    expect(failure.message).toBe(
+      "Claude Code 2.1.200 is older than 2.1.284 and could not be updated: the installer failed.",
+    );
+    expect(failure.detail).toContain("Could not resolve host");
+  });
+
+  it("V1: a failed launch is recorded with its reason, the bridge has every key, and an ok check clears it", async () => {
+    setup.registerEngineSetup({ restartEngine: vi.fn() });
+    fake.installer = 'echo "curl: (6) Could not resolve host: claude.ai" >&2; exit 6';
+    await setup.prepareEngineEnvironment(baseEnv);
+    await setup.startClaudeCodeWatch();
+    await until(() => pageStatus() !== null);
+
+    const status = pageStatus()!;
+    expect(Object.keys(status).sort()).toEqual(
+      [
+        "version",
+        "required",
+        "ok",
+        "checkedAt",
+        "latest",
+        "failure",
+        "platform",
+        "osVersion",
+      ].sort(),
+    );
+    expect(status).toMatchObject({
+      version: null,
+      ok: false,
+      latest: null, // the read failed
+      platform: process.platform,
+      osVersion: release().slice(0, 64),
+    });
+    const failure = status.failure as { message: string; detail: string; at: string };
+    expect(failure.message).toBe(
+      "Claude Code could not be installed. Check your internet connection and try again.",
+    );
+    expect(failure.detail).toBe("curl: (6) Could not resolve host: claude.ai");
+    expect(new Date(failure.at).toISOString()).toBe(failure.at);
+
+    fake.installer = installerThatInstalls();
+    await setup.recheckClaudeCodeNow("interval");
+    expect(pageStatus()).toMatchObject({ version: "2.1.290", ok: true, failure: null });
+  });
+
+  it("V3: the engine Orchestra launches gets terminal-bin and both variables; `claude` there runs the CLI", async () => {
+    const cli = fakeCli();
+    writeClaude(local());
+    const env = await setup.prepareEngineEnvironment(baseEnv);
+
+    expect(env.ORCHESTRA_TERMINAL_BIN).toBe(terminalBin());
+    expect(env.ORCHESTRA_ENGINE_BIN).toBe(binDir());
+    expect(env.PATH).toBe(`${binDir()}:/usr/bin:/bin`); // terminal-bin is the daemon's to place
+    const shim = path.join(terminalBin(), "claude");
+    expect(readdirSync(terminalBin())).toEqual(["claude"]);
+    expect(readFileSync(shim, "utf8")).toBe(`#!/bin/sh\nexec "${cli}" maestro-claude -- "$@"\n`);
+    expect(statSync(shim).mode & 0o777).toBe(0o755);
+    const run = await setup.runProcess(shim, ["-p", "say ok"], { env: baseEnv, timeoutMs: 5_000 });
+    expect(run.output.trim()).toBe("cli: maestro-claude -- -p say ok");
+    await setup.startClaudeCodeWatch();
+    expect(log.info).not.toHaveBeenCalledWith(OTHER_ENGINE);
+
+    // Written again at every launch.
+    writeFileSync(shim, "stale");
+    chmodSync(shim, 0o644);
+    setup.__resetEngineSetup();
+    await setup.prepareEngineEnvironment(baseEnv);
+    expect(readFileSync(shim, "utf8")).toContain("maestro-claude");
+    expect(statSync(shim).mode & 0o777).toBe(0o755);
+  });
+
+  it("V3: without Orchestra's CLI on disk (a development run) there is no terminal-bin", async () => {
+    writeClaude(local());
+    const env = await setup.prepareEngineEnvironment(baseEnv);
+    expect(env.ORCHESTRA_TERMINAL_BIN).toBeUndefined();
+    expect(env.ORCHESTRA_ENGINE_BIN).toBe(binDir());
+    expect(existsSync(terminalBin())).toBe(false);
+  });
+
+  it("V3: an engine Orchestra did not launch gets nothing, and the log says so", async () => {
+    fakeCli();
+    writeClaude(local());
+    await setup.startClaudeCodeWatch(); // no prepareEngineEnvironment: the daemon was reused
+    expect(log.info).toHaveBeenCalledWith(OTHER_ENGINE);
+    expect(existsSync(terminalBin())).toBe(false);
+    expect(fake.installs).toBe(0);
+  });
+});
+
+describe("terminalClaudeShims", () => {
+  it("POSIX: one `claude` calling the CLI by absolute path, quoted", () => {
+    expect(
+      setup.terminalClaudeShims(
+        "darwin",
+        "/Applications/Orchestra.app/Contents/Resources/bin/paseo",
+        "/t",
+      ),
+    ).toEqual([
+      {
+        file: "/t/claude",
+        content:
+          '#!/bin/sh\nexec "/Applications/Orchestra.app/Contents/Resources/bin/paseo" maestro-claude -- "$@"\n',
+      },
+    ]);
+    expect(setup.terminalClaudeShims("linux", '/opt/a"b$c/paseo', "/t")[0]?.content).toBe(
+      '#!/bin/sh\nexec "/opt/a\\"b\\$c/paseo" maestro-claude -- "$@"\n',
+    );
+  });
+
+  it("Windows: `claude` for Git Bash and `claude.cmd` for cmd.exe and PowerShell, % escaped", () => {
+    const cli =
+      "C:\\Users\\100%real\\AppData\\Local\\Programs\\Orchestra\\resources\\bin\\paseo.cmd";
+    const dir = "C:\\Users\\100%real\\AppData\\Local\\Orchestra\\terminal-bin";
+    expect(setup.terminalClaudeShims("win32", cli, dir)).toEqual([
+      {
+        file: `${dir}\\claude`,
+        content:
+          '#!/bin/sh\nexec "C:/Users/100%real/AppData/Local/Programs/Orchestra/resources/bin/paseo.cmd" maestro-claude -- "$@"\n',
+      },
+      {
+        file: `${dir}\\claude.cmd`,
+        content:
+          '@"C:\\Users\\100%%real\\AppData\\Local\\Programs\\Orchestra\\resources\\bin\\paseo.cmd" maestro-claude -- %*\r\n',
+      },
+    ]);
   });
 });
 

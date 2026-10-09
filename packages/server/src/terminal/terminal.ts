@@ -159,7 +159,43 @@ interface BuildTerminalEnvironmentInput {
   zshShellIntegrationDir?: string;
   paseoCliBinDir?: string | null;
   paseoHookCliPath?: string | null;
+  // True only when the terminal opens the interactive shell (no command).
+  interactiveShell?: boolean;
+  // Defaults to ORCHESTRA_TERMINAL_BIN from the daemon env.
+  orchestraTerminalBin?: string | null;
 }
+
+interface BuildInteractiveShellArgsInput {
+  shell: string;
+  // Defaults to ORCHESTRA_TERMINAL_BIN from the daemon env.
+  orchestraTerminalBin?: string | null;
+}
+
+const ORCHESTRA_TERMINAL_BIN_ENV = "ORCHESTRA_TERMINAL_BIN";
+const BASH_RCFILE_NAME = "paseo-bashrc";
+const FISH_ORCHESTRA_INIT_COMMAND =
+  "if set -q ORCHESTRA_TERMINAL_BIN; set -gx PATH $ORCHESTRA_TERMINAL_BIN $PATH; end";
+// Sourced by bash via --rcfile: the person's own ~/.bashrc first, then the
+// Orchestra terminal-bin dir goes back to the head of PATH (duplicates removed).
+const BASH_RCFILE_CONTENT = [
+  '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"',
+  "_paseo_orchestra_path() {",
+  '  [ -n "${ORCHESTRA_TERMINAL_BIN-}" ] || return 0',
+  '  local next="$ORCHESTRA_TERMINAL_BIN" entry rest="$PATH:"',
+  '  while [ -n "$rest" ]; do',
+  '    entry="${rest%%:*}"',
+  '    rest="${rest#*:}"',
+  '    if [ -n "$entry" ] && [ "$entry" != "$ORCHESTRA_TERMINAL_BIN" ]; then',
+  '      next="$next:$entry"',
+  "    fi",
+  "  done",
+  '  PATH="$next"',
+  "  export PATH",
+  "}",
+  "_paseo_orchestra_path",
+  "unset -f _paseo_orchestra_path",
+  "",
+].join("\n");
 
 interface EnsureNodePtySpawnHelperExecutableOptions {
   packageRoot?: string;
@@ -473,6 +509,41 @@ function resolveZshShellIntegrationRuntimeDir(): string {
   return join(tmpdir(), `${username}-paseo-zsh-${process.pid}`);
 }
 
+export function resolveOrchestraTerminalBin(env: NodeJS.ProcessEnv = process.env): string | null {
+  const value = env[ORCHESTRA_TERMINAL_BIN_ENV]?.trim();
+  return value ? value : null;
+}
+
+function prepareBashRcfile(): string {
+  const runtimeDir = resolveZshShellIntegrationRuntimeDir();
+  mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
+  chmodSync(runtimeDir, 0o700);
+  const rcfile = join(runtimeDir, BASH_RCFILE_NAME);
+  writePrivateFileAtomicSync(rcfile, BASH_RCFILE_CONTENT);
+  return rcfile;
+}
+
+// Args for the interactive shell (no command). Empty unless Orchestra started
+// the daemon with ORCHESTRA_TERMINAL_BIN: then bash and fish put the
+// terminal-bin dir back at the head of PATH after the person's own rc files.
+export function buildInteractiveShellArgs(input: BuildInteractiveShellArgsInput): string[] {
+  const orchestraTerminalBin =
+    input.orchestraTerminalBin === undefined
+      ? resolveOrchestraTerminalBin()
+      : input.orchestraTerminalBin;
+  if (!orchestraTerminalBin) {
+    return [];
+  }
+  const shellName = basename(input.shell);
+  if (shellName === "bash") {
+    return ["--rcfile", prepareBashRcfile()];
+  }
+  if (shellName === "fish") {
+    return ["--init-command", FISH_ORCHESTRA_INIT_COMMAND];
+  }
+  return [];
+}
+
 function prepareZshShellIntegrationRuntimeDir(sourceDir = resolveZshShellIntegrationDir()): string {
   const readableSourceDir = resolveExternalProcessPath(sourceDir);
   const runtimeDir = resolveZshShellIntegrationRuntimeDir();
@@ -500,9 +571,14 @@ export function buildTerminalEnvironment(
     baseEnv,
     input.paseoCliBinDir === undefined ? resolvePaseoCliBinDir() : input.paseoCliBinDir,
   );
-  const envWithHookCli = injectPaseoHookCli(
-    envWithAgentHooks,
-    input.paseoHookCliPath === undefined ? resolvePaseoCliExecutablePath() : input.paseoHookCliPath,
+  const envWithHookCli = prependOrchestraTerminalBin(
+    injectPaseoHookCli(
+      envWithAgentHooks,
+      input.paseoHookCliPath === undefined
+        ? resolvePaseoCliExecutablePath()
+        : input.paseoHookCliPath,
+    ),
+    input,
   );
 
   if (basename(input.shell) !== "zsh") {
@@ -514,6 +590,27 @@ export function buildTerminalEnvironment(
     ...envWithHookCli,
     PASEO_ZSH_ZDOTDIR: originalZdotdir,
     ZDOTDIR: prepareZshShellIntegrationRuntimeDir(input.zshShellIntegrationDir),
+  };
+}
+
+function prependOrchestraTerminalBin(
+  env: Record<string, string>,
+  input: BuildTerminalEnvironmentInput,
+): Record<string, string> {
+  if (!input.interactiveShell) {
+    return env;
+  }
+  const orchestraTerminalBin =
+    input.orchestraTerminalBin === undefined
+      ? resolveOrchestraTerminalBin()
+      : input.orchestraTerminalBin;
+  if (!orchestraTerminalBin) {
+    return env;
+  }
+  const pathKey = getPathEnvKey(env);
+  return {
+    ...env,
+    [pathKey]: prependPathEntry(env[pathKey] ?? "", orchestraTerminalBin),
   };
 }
 
@@ -940,7 +1037,7 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
   // Create PTY
   const { command: spawnCommand, args: spawnArgs } = command
     ? await resolveTerminalSpawnCommand(command, args)
-    : { command: resolvedShell, args: [] as string[] };
+    : { command: resolvedShell, args: buildInteractiveShellArgs({ shell: resolvedShell }) };
   const ptyProcess = pty.spawn(spawnCommand, spawnArgs, {
     name: "xterm-256color",
     cols,
@@ -948,6 +1045,7 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     cwd,
     env: buildTerminalEnvironment({
       shell: spawnCommand,
+      interactiveShell: !command,
       env: {
         ...env,
         ...activityEnv,

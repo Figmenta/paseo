@@ -6,7 +6,11 @@ import { CLAUDE_MODEL_MANIFEST as BUILT_MANIFEST } from "@getpaseo/server/claude
 import { compareVersions } from "./semver.js";
 import {
   CLAUDE_CODE_INSTALL_TARGET,
+  claudeCodeReport,
   claudeCodeStatus,
+  decideClaudeCodeAction,
+  LATEST_ATTEMPT_INTERVAL_MS,
+  parseLatestVersion,
   recheckClaudeCode,
   requiredClaudeCodeVersion,
   resolutionVersion,
@@ -226,10 +230,43 @@ describe("resolveClaudeCode", () => {
     });
   });
 
-  it("stops reading versions at the first good copy", async () => {
+  it("1.3.15: reads every copy and takes the newest that meets the minimum, not the first", async () => {
     const files = fs({ [WIN_NATIVE]: "2.1.284", [WIN_NPM]: "2.1.290" });
-    await resolveClaudeCode({ platform: "win32", env: WIN_ENV, homedir: "C:\\x", ...files });
-    expect(files.readVersion).toHaveBeenCalledTimes(1);
+    const resolution = await resolveClaudeCode({
+      platform: "win32",
+      env: WIN_ENV,
+      homedir: "C:\\Users\\Figmenta",
+      ...files,
+    });
+    expect(files.readVersion).toHaveBeenCalledTimes(2);
+    expect(resolution).toMatchObject({ status: "ready", path: WIN_NPM, version: "2.1.290" });
+  });
+
+  it("1.3.15: an older copy first on PATH, a newer one later on PATH: the newer one", async () => {
+    const files = fs({ "/usr/local/bin/claude": "2.1.289", "/opt/homebrew/bin/claude": "2.1.295" });
+    const resolution = await resolveClaudeCode({
+      platform: "darwin",
+      env: { PATH: "/usr/local/bin:/opt/homebrew/bin:/usr/bin" },
+      homedir: "/Users/giovanni",
+      ...files,
+    });
+    expect(resolution).toEqual({
+      status: "ready",
+      path: "/opt/homebrew/bin/claude",
+      version: "2.1.295",
+      firstOnPath: false,
+    });
+  });
+
+  it("1.3.15: equal versions keep PATH order", async () => {
+    const files = fs({ "/usr/local/bin/claude": "2.1.295", "/opt/homebrew/bin/claude": "2.1.295" });
+    const resolution = await resolveClaudeCode({
+      platform: "darwin",
+      env: { PATH: "/usr/local/bin:/opt/homebrew/bin" },
+      homedir: "/Users/giovanni",
+      ...files,
+    });
+    expect(resolution).toMatchObject({ path: "/usr/local/bin/claude", firstOnPath: true });
   });
 
   it("macOS opened from the Finder: ~/.local/bin is not on PATH", async () => {
@@ -825,5 +862,359 @@ describe("recheckClaudeCode", () => {
       status: { version: "2.1.200", ok: false },
     });
     expect(measureOnly.resolve).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 1.3.15 (V2): always the newest published Claude Code; (V1) what Settings is told
+// ---------------------------------------------------------------------------
+
+describe("parseLatestVersion", () => {
+  it("reads the body of claude-code-releases/latest", () => {
+    expect(parseLatestVersion("2.1.295")).toBe("2.1.295");
+    expect(parseLatestVersion("2.1.295\n")).toBe("2.1.295");
+    expect(parseLatestVersion("  2.1.295\r\n")).toBe("2.1.295");
+  });
+
+  it("anything that is not x.y.z is null: never an install toward it", () => {
+    expect(parseLatestVersion("")).toBeNull();
+    expect(parseLatestVersion("<html>Bad gateway</html>")).toBeNull();
+    expect(parseLatestVersion("2.1")).toBeNull();
+    expect(parseLatestVersion("2.1.295-beta")).toBeNull();
+    expect(parseLatestVersion("2.1.295; rm -rf ~")).toBeNull();
+    expect(parseLatestVersion("v2.1.295")).toBeNull();
+  });
+});
+
+describe("claudeCodeInstallerCommand with the exact version", () => {
+  it("macOS and Linux: install.sh gets the version after --", () => {
+    for (const platform of ["darwin", "linux"] as const) {
+      const command = claudeCodeInstallerCommand(platform, { PATH: "/usr/bin" }, "2.1.295");
+      expect(command.command).toBe("/bin/bash");
+      expect(command.args).toEqual([
+        "-c",
+        "set -o pipefail; curl --proto '=https' --tlsv1.2 -fsSL https://claude.ai/install.sh | bash -s -- 2.1.295",
+      ]);
+    }
+  });
+
+  it("Windows: install.ps1 gets the version after the script block", () => {
+    const command = claudeCodeInstallerCommand("win32", WIN_ENV, "2.1.295");
+    expect(command.args[5]).toMatch(
+      /& \(\[scriptblock\]::Create\(\(Invoke-RestMethod -Uri 'https:\/\/claude\.ai\/install\.ps1'\)\)\) 2\.1\.295$/,
+    );
+  });
+
+  it("refuses a target the installers would not accept: it lands in a command line", () => {
+    expect(() => claudeCodeInstallerCommand("darwin", {}, "2.1.295; rm -rf ~")).toThrow(
+      /not a version/,
+    );
+    expect(() => claudeCodeInstallerCommand("win32", {}, "$(evil)")).toThrow(/not a version/);
+  });
+});
+
+describe("decideClaudeCodeAction", () => {
+  const REQUIRED = "2.1.284";
+  const LATEST = "2.1.295";
+  const NOW = new Date("2026-10-09T12:00:00.000Z");
+  const SHIM = "/app/engine-bin/claude";
+  const NATIVE = "/Users/giovanni/.local/bin/claude";
+  const BREW = "/opt/homebrew/bin/claude";
+  const hoursAgo = (hours: number) => new Date(NOW.getTime() - hours * 60 * 60 * 1000);
+  const base = { required: REQUIRED, latest: LATEST, lastAttemptAt: null, now: NOW, current: SHIM };
+
+  it("below the newest, no copy at the newest: install that exact version", () => {
+    expect(
+      decideClaudeCodeAction({
+        ...base,
+        copies: [
+          { path: SHIM, version: "2.1.289" },
+          { path: NATIVE, version: "2.1.289" },
+        ],
+      }),
+    ).toEqual({ kind: "install", target: "2.1.295" });
+  });
+
+  it("a copy at the newest is already there: re-point, no install", () => {
+    expect(
+      decideClaudeCodeAction({
+        ...base,
+        copies: [
+          { path: SHIM, version: "2.1.289" },
+          { path: NATIVE, version: "2.1.295" },
+        ],
+      }),
+    ).toEqual({ kind: "repoint", path: NATIVE });
+  });
+
+  it("the copy new sessions get is the newest: ok (a tie keeps it)", () => {
+    expect(
+      decideClaudeCodeAction({
+        ...base,
+        copies: [
+          { path: NATIVE, version: "2.1.295" },
+          { path: SHIM, version: "2.1.295" },
+        ],
+      }),
+    ).toEqual({ kind: "ok", path: SHIM });
+    expect(
+      decideClaudeCodeAction({ ...base, copies: [{ path: SHIM, version: "2.1.296" }] }),
+    ).toEqual({ kind: "ok", path: SHIM });
+  });
+
+  it("the newest could not be read: only the minimum counts, as in 1.3.14", () => {
+    const latest = null;
+    expect(
+      decideClaudeCodeAction({ ...base, latest, copies: [{ path: SHIM, version: "2.1.289" }] }),
+    ).toEqual({ kind: "ok", path: SHIM });
+    expect(
+      decideClaudeCodeAction({
+        ...base,
+        latest,
+        copies: [
+          { path: SHIM, version: "2.1.200" },
+          { path: NATIVE, version: "2.1.284" },
+        ],
+      }),
+    ).toEqual({ kind: "repoint", path: NATIVE });
+    expect(
+      decideClaudeCodeAction({ ...base, latest, copies: [{ path: SHIM, version: "2.1.200" }] }),
+    ).toEqual({ kind: "install", target: CLAUDE_CODE_INSTALL_TARGET });
+  });
+
+  it("the brake: an attempt less than 6 hours ago and a copy that meets the minimum is ok", () => {
+    const copies = [{ path: SHIM, version: "2.1.289" }];
+    expect(decideClaudeCodeAction({ ...base, copies, lastAttemptAt: hoursAgo(1) })).toEqual({
+      kind: "ok",
+      path: SHIM,
+    });
+    expect(decideClaudeCodeAction({ ...base, copies, lastAttemptAt: hoursAgo(5.9) })).toEqual({
+      kind: "ok",
+      path: SHIM,
+    });
+    // Braked onto a better copy that meets the minimum: re-pointed, still no install.
+    expect(
+      decideClaudeCodeAction({
+        ...base,
+        lastAttemptAt: hoursAgo(1),
+        copies: [
+          { path: SHIM, version: "2.1.200" },
+          { path: BREW, version: "2.1.290" },
+        ],
+      }),
+    ).toEqual({ kind: "repoint", path: BREW });
+  });
+
+  it("the brake ends after 6 hours, and an attempt dated in the future does not brake", () => {
+    const copies = [{ path: SHIM, version: "2.1.289" }];
+    expect(LATEST_ATTEMPT_INTERVAL_MS).toBe(6 * 60 * 60 * 1000);
+    expect(decideClaudeCodeAction({ ...base, copies, lastAttemptAt: hoursAgo(6) })).toEqual({
+      kind: "install",
+      target: LATEST,
+    });
+    expect(decideClaudeCodeAction({ ...base, copies, lastAttemptAt: hoursAgo(-2) })).toEqual({
+      kind: "install",
+      target: LATEST,
+    });
+  });
+
+  it("below the minimum the brake does not hold", () => {
+    expect(
+      decideClaudeCodeAction({
+        ...base,
+        lastAttemptAt: hoursAgo(1),
+        copies: [{ path: SHIM, version: "2.1.200" }],
+      }),
+    ).toEqual({ kind: "install", target: LATEST });
+    expect(
+      decideClaudeCodeAction({ ...base, current: null, lastAttemptAt: hoursAgo(1), copies: [] }),
+    ).toEqual({ kind: "install", target: LATEST });
+  });
+
+  it("an unreadable copy never counts", () => {
+    expect(decideClaudeCodeAction({ ...base, copies: [{ path: SHIM, version: null }] })).toEqual({
+      kind: "install",
+      target: LATEST,
+    });
+  });
+});
+
+describe("recheckClaudeCode toward the newest version (1.3.15)", () => {
+  const REQUIRED = "2.1.284";
+  const SHIM = "/app/engine-bin/claude";
+  const NATIVE = "/Users/giovanni/.local/bin/claude";
+  const NOW = new Date("2026-10-09T12:00:00.000Z");
+
+  function deps(input: {
+    engineVersion: ClaudeCodeVersionRead;
+    resolutions: ClaudeCodeResolution[];
+    run?: InstallerRun;
+    lastAttemptAt?: Date | null;
+    latest?: string | null;
+  }) {
+    const resolutions = [...input.resolutions];
+    const order: string[] = [];
+    const d = {
+      required: REQUIRED,
+      engineCopy: SHIM,
+      manage: true,
+      latest: input.latest === undefined ? "2.1.295" : input.latest,
+      lastAttemptAt: () => input.lastAttemptAt ?? null,
+      recordAttempt: vi.fn((target: string) => {
+        order.push(`record ${target}`);
+      }),
+      readVersion: vi.fn(async () => input.engineVersion),
+      resolve: vi.fn(async () => {
+        const next = resolutions.shift();
+        if (!next) throw new Error("unexpected resolve");
+        return next;
+      }),
+      install: vi.fn(async (target: string) => {
+        order.push(`install ${target}`);
+        return input.run ?? { ok: true, output: "installed" };
+      }),
+      repoint: vi.fn(() => true),
+      now: () => NOW,
+      log: vi.fn(),
+    } satisfies ClaudeCodeRecheckDeps;
+    return { d, order };
+  }
+  const ready = (path: string, version: string): ClaudeCodeResolution => ({
+    status: "ready",
+    path,
+    version,
+    firstOnPath: false,
+  });
+
+  it("Giovanni at 2.1.289, newest 2.1.295: installs 2.1.295, brake written first, link follows", async () => {
+    const { d, order } = deps({
+      engineVersion: "2.1.289",
+      resolutions: [ready(NATIVE, "2.1.289"), ready(NATIVE, "2.1.295")],
+    });
+    const outcome = await recheckClaudeCode(d);
+    expect(order).toEqual(["record 2.1.295", "install 2.1.295"]);
+    expect(outcome).toMatchObject({
+      action: "installed",
+      path: NATIVE,
+      status: { version: "2.1.295", ok: true },
+    });
+  });
+
+  it("at the newest already: nothing resolved, nothing installed", async () => {
+    const { d } = deps({ engineVersion: "2.1.295", resolutions: [] });
+    await expect(recheckClaudeCode(d)).resolves.toMatchObject({ action: "current" });
+    expect(d.resolve).not.toHaveBeenCalled();
+  });
+
+  it("braked: below the newest but meeting the minimum, no install", async () => {
+    const { d } = deps({
+      engineVersion: "2.1.289",
+      resolutions: [ready(NATIVE, "2.1.289")],
+      lastAttemptAt: new Date(NOW.getTime() - 60 * 60 * 1000),
+    });
+    await expect(recheckClaudeCode(d)).resolves.toMatchObject({
+      action: "current",
+      status: { version: "2.1.289", ok: true },
+    });
+    expect(d.install).not.toHaveBeenCalled();
+  });
+
+  it("an attempt toward the newest that fails above the minimum: failed, but ok stays true", async () => {
+    const { d } = deps({
+      engineVersion: "2.1.289",
+      resolutions: [ready(NATIVE, "2.1.289"), ready(NATIVE, "2.1.289")],
+      run: { ok: false, output: "curl: (6) Could not resolve host" },
+    });
+    const outcome = await recheckClaudeCode(d);
+    expect(outcome).toMatchObject({
+      action: "failed",
+      reason: "toward 2.1.295: the installer failed",
+      status: { version: "2.1.289", ok: true },
+    });
+    expect(d.repoint).not.toHaveBeenCalled();
+  });
+
+  it("below the minimum the brake does not hold, and the failure carries the installer's output", async () => {
+    const { d } = deps({
+      engineVersion: "2.1.200",
+      resolutions: [{ status: "missing" }, { status: "missing" }],
+      run: { ok: false, output: `${"x".repeat(900)}exit 1` },
+      lastAttemptAt: new Date(NOW.getTime() - 60 * 1000),
+    });
+    const outcome = await recheckClaudeCode(d);
+    expect(d.install).toHaveBeenCalledWith("2.1.295");
+    expect(outcome).toMatchObject({ action: "failed", status: { ok: false } });
+    expect(outcome.detail?.endsWith("exit 1")).toBe(true);
+    expect(outcome.detail?.length).toBeLessThanOrEqual(600);
+  });
+
+  it("an install toward the newest that fails still moves off a copy below the minimum", async () => {
+    const { d } = deps({
+      engineVersion: "2.1.200",
+      resolutions: [ready(NATIVE, "2.1.290"), ready(NATIVE, "2.1.290")],
+      run: { ok: false, output: "offline" },
+    });
+    await expect(recheckClaudeCode(d)).resolves.toMatchObject({
+      action: "repointed",
+      path: NATIVE,
+      status: { version: "2.1.290", ok: true },
+    });
+  });
+
+  it("the newest unknown: `latest` only below the minimum, and no brake written", async () => {
+    const { d } = deps({
+      engineVersion: "2.1.200",
+      latest: null,
+      resolutions: [{ status: "missing" }, ready(NATIVE, "2.1.295")],
+    });
+    await expect(recheckClaudeCode(d)).resolves.toMatchObject({ action: "installed" });
+    expect(d.install).toHaveBeenCalledWith("latest");
+    expect(d.recordAttempt).not.toHaveBeenCalled();
+  });
+});
+
+describe("claudeCodeReport — window.orchestraDesktop.claudeCode in 1.3.15", () => {
+  const status = claudeCodeStatus("2.1.289", "2.1.284", new Date("2026-10-09T12:00:00.000Z"));
+
+  it("has every key of the contract", () => {
+    const report = claudeCodeReport(status, {
+      latest: "2.1.295",
+      failure: {
+        message: "Claude Code installer exited with code 1",
+        detail: "…",
+        at: new Date("2026-10-09T12:00:00.000Z"),
+      },
+      platform: "darwin",
+      osVersion: "25.6.0",
+    });
+    expect(report).toEqual({
+      version: "2.1.289",
+      required: "2.1.284",
+      ok: true,
+      checkedAt: "2026-10-09T12:00:00.000Z",
+      latest: "2.1.295",
+      failure: {
+        message: "Claude Code installer exited with code 1",
+        detail: "…",
+        at: "2026-10-09T12:00:00.000Z",
+      },
+      platform: "darwin",
+      osVersion: "25.6.0",
+    });
+  });
+
+  it("keeps message ≤ 300, detail = the tail ≤ 600, osVersion ≤ 64", () => {
+    const report = claudeCodeReport(status, {
+      latest: null,
+      failure: { message: "m".repeat(400), detail: `${"d".repeat(900)}END`, at: new Date() },
+      platform: "freebsd",
+      osVersion: "9".repeat(80),
+    });
+    expect(report.failure?.message.length).toBe(300);
+    expect(report.failure?.detail.length).toBe(600);
+    expect(report.failure?.detail.endsWith("END")).toBe(true);
+    expect(report.osVersion.length).toBe(64);
+    expect(report.platform).toBe("linux");
+    expect(report.latest).toBeNull();
   });
 });

@@ -3,6 +3,7 @@ import { Command, Option } from "commander";
 import { createAgentCommand } from "./commands/agent/index.js";
 import { createDaemonCommand } from "./commands/daemon/index.js";
 import { createPermitCommand } from "./commands/permit/index.js";
+import { createMaestroClaudeCommand } from "./commands/maestro-claude/index.js";
 import { createProviderCommand } from "./commands/provider/index.js";
 import { createPluginCommand } from "./commands/plugin/index.js";
 import { createProjectCommand } from "./commands/project/index.js";
@@ -176,6 +177,10 @@ export function createCli(): Command {
     if (command.name() !== "plugin")
       command.version(VERSION, "-v, --version", "output the version number");
   }
+
+  // Orchestra terminal `claude` shim. Added after the global options on purpose:
+  // everything after `--` belongs to claude (`--version`, `--json`, `-q`, ...).
+  program.addCommand(createMaestroClaudeCommand(), { hidden: true });
 
   const enforceSelectorDuplicates = (command: Command) => {
     for (const option of command.options) {

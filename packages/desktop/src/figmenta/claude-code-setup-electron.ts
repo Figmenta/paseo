@@ -1,6 +1,7 @@
 import { execFile, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   createReadStream,
   linkSync,
   mkdirSync,
@@ -13,25 +14,32 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, release } from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { app, BrowserWindow, ipcMain, powerMonitor, type WebContents } from "electron";
 import log from "electron-log/main";
 import { CLAUDE_MODEL_MANIFEST } from "@getpaseo/server/claude-model-manifest";
+import { getBundledCliShimPath } from "../integrations/cli-install/paths.js";
 import { dismissStartupSplash, isStartupSplashWindow } from "./startup-splash-electron.js";
 import {
+  CLAUDE_CODE_INSTALL_TARGET,
+  CLAUDE_CODE_LATEST_URL,
   claudeCodeInstallerCommand,
+  claudeCodeReport,
   claudeCodeShim,
   claudeCodeStatus,
   ensureClaudeCode,
   envValue,
   MIN_CLAUDE_CODE_VERSION,
   parseClaudeCodeVersion,
+  parseLatestVersion,
   prependToPath,
   recheckClaudeCode,
   requiredClaudeCodeVersion,
   resolveClaudeCode,
+  type ClaudeCodeRecheckOutcome,
+  type ClaudeCodeReport,
   type ClaudeCodeStatus,
   type ClaudeCodeVersionRead,
   type Env,
@@ -507,6 +515,113 @@ export function writeClaudeCodeShim(
 }
 
 // ---------------------------------------------------------------------------
+// 1.3.15 (V3): `claude` in the Terminal tab, through Orchestra's CLI
+// ---------------------------------------------------------------------------
+
+/** Next to the engine's bin folder: `<userData>/terminal-bin`, Windows `%LOCALAPPDATA%\Orchestra\terminal-bin`. */
+export function terminalBinDir(env: Env): string {
+  const engineBin = engineBinDir(env);
+  return (process.platform === "win32" ? path.win32 : path).join(
+    path.dirname(engineBin),
+    "terminal-bin",
+  );
+}
+
+export interface TerminalClaudeShim {
+  file: string;
+  content: string;
+}
+
+/**
+ * What terminal-bin holds: `claude` (POSIX shell; on Windows for Git Bash) and, on Windows,
+ * `claude.cmd`, both handing every argument to `<Orchestra's CLI> maestro-claude --`, which decides
+ * whether this person's `claude` runs on a fleet seat (packages/cli). The daemon puts the folder
+ * first on a terminal's PATH only when ORCHESTRA_TERMINAL_BIN is in its environment.
+ */
+export function terminalClaudeShims(
+  platform: NodeJS.Platform,
+  cliPath: string,
+  dir: string,
+): TerminalClaudeShim[] {
+  const p = platform === "win32" ? path.win32 : path.posix;
+  // Git Bash reads C:/x as C:\x; inside double quotes a backslash, ", $ and ` would be special.
+  const shPath = (platform === "win32" ? cliPath.replaceAll("\\", "/") : cliPath).replace(
+    /[\\"$`]/g,
+    "\\$&",
+  );
+  const shims: TerminalClaudeShim[] = [
+    {
+      file: p.join(dir, "claude"),
+      content: `#!/bin/sh\nexec "${shPath}" maestro-claude -- "$@"\n`,
+    },
+  ];
+  if (platform === "win32") {
+    // `%` would expand inside a batch file: doubled, it is a literal one.
+    shims.push({
+      file: p.join(dir, "claude.cmd"),
+      content: `@"${cliPath.replaceAll("%", "%%")}" maestro-claude -- %*\r\n`,
+    });
+  }
+  return shims;
+}
+
+/**
+ * Writes terminal-bin for `cliPath` (made again at every launch of the engine; a file already
+ * right is left as is, cmd.exe reads a running batch file again). False when it cannot be written.
+ */
+export function writeTerminalBin(
+  dir: string,
+  cliPath: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  try {
+    mkdirSync(dir, { recursive: true });
+    for (const shim of terminalClaudeShims(platform, cliPath, dir)) {
+      let current: string | null = null;
+      try {
+        current = readFileSync(shim.file, "utf8");
+      } catch {
+        current = null;
+      }
+      if (current !== shim.content) writeFileSync(shim.file, shim.content);
+      chmodSync(shim.file, 0o755);
+    }
+    return true;
+  } catch (error) {
+    log.warn("[terminal] terminal-bin could not be written", { dir, error: errorText(error) });
+    return false;
+  }
+}
+
+/**
+ * For the engine Orchestra launches, and only for it: terminal-bin written and named in
+ * ORCHESTRA_TERMINAL_BIN, the engine's bin folder named in ORCHESTRA_ENGINE_BIN. Without
+ * Orchestra's CLI on disk (a development run) there is no terminal-bin and no variable.
+ */
+function withTerminalBin(env: Env): Env {
+  let cliPath: string | null = null;
+  try {
+    cliPath = getBundledCliShimPath();
+  } catch (error) {
+    log.warn("[terminal] Orchestra's CLI not located", { error: errorText(error) });
+  }
+  const next: Env = { ...env };
+  const engineBin = engineClaudeCode?.shimDir ?? null;
+  if (engineBin !== null) next.ORCHESTRA_ENGINE_BIN = engineBin;
+  if (cliPath === null || !isFile(cliPath)) {
+    log.info("[terminal] no Orchestra CLI on disk: terminals use the person's own claude", {
+      cliPath,
+    });
+    return next;
+  }
+  const dir = terminalBinDir(env);
+  if (!writeTerminalBin(dir, cliPath)) return next;
+  next.ORCHESTRA_TERMINAL_BIN = dir;
+  log.info("[terminal] claude in the Terminal tab goes through Orchestra", { dir, cliPath });
+  return next;
+}
+
+// ---------------------------------------------------------------------------
 // Orchestra's own PortableGit (Windows)
 // ---------------------------------------------------------------------------
 
@@ -791,8 +906,17 @@ async function prepareOnce(baseEnv: Env, signal: AbortSignal): Promise<Prepared>
   const shimDir = engineBinDir(env);
   const claude = await ensureClaudeCode({
     resolve: claudeCodeResolver(platform, env),
-    install: () => {
-      const installer = claudeCodeInstallerCommand(platform, env);
+    // Below the minimum or missing: the exact newest version when it can be read (no brake below
+    // the minimum), else `latest` as in 1.3.14. A copy that meets the minimum is brought to the
+    // newest version by the check right after launch, in the background (startClaudeCodeWatch).
+    install: async () => {
+      const latest = await latestClaudeCodeVersion();
+      if (latest !== null) recordLatestAttempt(latest);
+      const installer = claudeCodeInstallerCommand(
+        platform,
+        env,
+        latest ?? CLAUDE_CODE_INSTALL_TARGET,
+      );
       return runInstaller(installer.command, installer.args, installer.env, signal);
     },
     minimum: REQUIRED_CLAUDE_CODE_VERSION,
@@ -865,6 +989,7 @@ async function prepareOnce(baseEnv: Env, signal: AbortSignal): Promise<Prepared>
 async function prepare(baseEnv: NodeJS.ProcessEnv): Promise<NodeJS.ProcessEnv> {
   // One installer at a time: a background check that is installing finishes first.
   if (recheckRunning) await recheckRunning;
+  ownEngineLaunched = true;
   const abort = new AbortController();
   active = abort;
   let prepared: Prepared;
@@ -885,9 +1010,13 @@ async function prepare(baseEnv: NodeJS.ProcessEnv): Promise<NodeJS.ProcessEnv> {
   if (prepared.status === "ready") {
     setStatus("ready");
     if (setupWindow?.isOpen()) setupWindow.show({ phase: "starting", restart: retrying });
-    return prepared.env as NodeJS.ProcessEnv;
+    return withTerminalBin(prepared.env) as NodeJS.ProcessEnv;
   }
   setStatus("failed");
+  // Settings shows why (V1); a Git Bash failure leaves Claude Code itself as it is.
+  if (prepared.failure.component === "claude-code") {
+    recordClaudeCodeFailure(prepared.failure.message, prepared.failure.detail);
+  }
   logSetup("the engine starts without the setup: Maestro waits for Claude Code", {
     component: prepared.failure.component,
     dismissed: abort.signal.aborted,
@@ -900,7 +1029,7 @@ async function prepare(baseEnv: NodeJS.ProcessEnv): Promise<NodeJS.ProcessEnv> {
     measureAfterFailure = null;
     void recheckClaudeCodeNow("setup failed", { measureOnly: true });
   }, 0);
-  return (prepared.env ?? baseEnv) as NodeJS.ProcessEnv;
+  return withTerminalBin(prepared.env ?? baseEnv) as NodeJS.ProcessEnv;
 }
 
 /**
@@ -1005,6 +1134,10 @@ export function __resetEngineSetup(): void {
   if (measureAfterFailure) clearTimeout(measureAfterFailure);
   measureAfterFailure = null;
   watchStarted = false;
+  failureNow = null;
+  latestCache = null;
+  latestNow = null;
+  ownEngineLaunched = false;
 }
 
 app.on("before-quit", () => {
@@ -1023,7 +1156,7 @@ export const CLAUDE_CODE_STATUS_GET_CHANNEL = "orchestra-desktop:claude-code:get
 /** Test knob: a shorter period for the check (the local E2E of 1.3.14 uses it). */
 export const CLAUDE_CODE_CHECK_INTERVAL_ENV = "ORCHESTRA_CLAUDE_CODE_CHECK_INTERVAL_MS";
 
-let claudeCodeStatusNow: ClaudeCodeStatus | null = null;
+let claudeCodeStatusNow: ClaudeCodeReport | null = null;
 let recheckRunning: Promise<void> | null = null;
 let lastRecheckAt: number | null = null;
 let recheckTimer: NodeJS.Timeout | null = null;
@@ -1031,6 +1164,8 @@ let measureAfterFailure: NodeJS.Timeout | null = null;
 let watchStarted = false;
 /** The background install running now: aborted at quit, with every process it started. */
 let background: AbortController | null = null;
+/** prepareEngineEnvironment() ran in this run of the app: the engine running is Orchestra's own. */
+let ownEngineLaunched = false;
 
 export function claudeCodeCheckIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env[CLAUDE_CODE_CHECK_INTERVAL_ENV];
@@ -1038,12 +1173,154 @@ export function claudeCodeCheckIntervalMs(env: NodeJS.ProcessEnv = process.env):
   return Number.isInteger(value) && value > 0 ? value : UPDATE_CHECK_INTERVAL_MS;
 }
 
+// --- V1: the last failure that left the machine below the minimum or without Claude Code ---
+
+let failureNow: { message: string; detail: string; at: Date } | null = null;
+
+/** Kept until a status that meets the minimum is published (publishClaudeCodeStatus). */
+function recordClaudeCodeFailure(message: string, detail: string): void {
+  failureNow = { message, detail, at: new Date() };
+}
+
+// --- V2: the newest published Claude Code, and the 6-hour brake ---
+
+const LATEST_TIMEOUT_MS = 5_000;
+const LATEST_CACHE_MS = 60 * 60 * 1000;
+/** The file the brake lives in, under userData: {"at":"<ISO>","target":"2.1.295"}. */
+export const LATEST_ATTEMPT_FILE = "claude-code-latest-attempt.json";
+
+/** The body of CLAUDE_CODE_LATEST_URL; throws on a failed read. Tests hand in their own. */
+export type LatestClaudeCodeSource = (signal: AbortSignal) => Promise<string>;
+
+const fetchLatestClaudeCode: LatestClaudeCodeSource = async (signal) => {
+  const response = await fetch(CLAUDE_CODE_LATEST_URL, { signal });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.text();
+};
+
+let latestSource: LatestClaudeCodeSource = fetchLatestClaudeCode;
+let latestCache: { version: string; readAt: number } | null = null;
+/** What the page reads as `latest`: the last read, null when it failed. */
+let latestNow: string | null = null;
+
+/** Test seam: where the newest version is read from (null: the real URL). */
+export function __setLatestClaudeCodeSource(source: LatestClaudeCodeSource | null): void {
+  latestSource = source ?? fetchLatestClaudeCode;
+  latestCache = null;
+}
+
+/** The newest published version: read at most once an hour, within 5 s; null when it cannot be. */
+export async function latestClaudeCodeVersion(): Promise<string | null> {
+  if (latestCache !== null && Date.now() - latestCache.readAt < LATEST_CACHE_MS) {
+    return latestCache.version;
+  }
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), LATEST_TIMEOUT_MS);
+  let version: string | null = null;
+  try {
+    const body = await Promise.race([
+      latestSource(abort.signal),
+      new Promise<never>((_resolve, reject) => {
+        abort.signal.addEventListener("abort", () => reject(new Error("timed out after 5 s")), {
+          once: true,
+        });
+      }),
+    ]);
+    version = parseLatestVersion(body);
+    if (version === null) {
+      log.warn("[engine-setup] the newest Claude Code version is unreadable", {
+        body: body.slice(0, 100),
+      });
+    }
+  } catch (error) {
+    log.warn("[engine-setup] the newest Claude Code version could not be read", {
+      error: errorText(error),
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+  latestNow = version;
+  latestCache = version === null ? null : { version, readAt: Date.now() };
+  return version;
+}
+
+function latestAttemptFile(): string {
+  return path.join(app.getPath("userData"), LATEST_ATTEMPT_FILE);
+}
+
+/** When the last attempt toward the newest version started; null when none is on record. */
+export function lastLatestAttemptAt(): Date | null {
+  try {
+    const record = JSON.parse(readFileSync(latestAttemptFile(), "utf8")) as { at?: unknown };
+    if (typeof record.at !== "string") return null;
+    const at = new Date(record.at);
+    return Number.isNaN(at.getTime()) ? null : at;
+  } catch {
+    return null;
+  }
+}
+
+/** Written BEFORE the installer starts: an install that never returns still brakes. */
+function recordLatestAttempt(target: string): void {
+  const file = latestAttemptFile();
+  try {
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({ at: new Date().toISOString(), target }));
+  } catch (error) {
+    log.warn("[engine-setup] the attempt toward the newest Claude Code was not recorded", {
+      file,
+      error: errorText(error),
+    });
+  }
+}
+
+// --- What the page reads ---
+
 function publishClaudeCodeStatus(next: ClaudeCodeStatus): void {
-  claudeCodeStatusNow = next;
+  if (next.ok) failureNow = null;
+  const report = claudeCodeReport(next, {
+    latest: latestNow,
+    failure: failureNow,
+    platform: process.platform,
+    osVersion: release(),
+  });
+  claudeCodeStatusNow = report;
   lastRecheckAt = Date.now();
   for (const win of BrowserWindow.getAllWindows()) {
     if (win.isDestroyed() || win.webContents.isDestroyed()) continue;
-    win.webContents.send(CLAUDE_CODE_STATUS_CHANNEL, next);
+    win.webContents.send(CLAUDE_CODE_STATUS_CHANNEL, report);
+  }
+}
+
+/**
+ * Below the minimum (or without Claude Code) after an attempt: Settings shows why. An attempt
+ * toward the newest version that leaves a copy meeting the minimum is the log's business only.
+ */
+function recordRecheckFailure(outcome: ClaudeCodeRecheckOutcome): void {
+  if (outcome.action !== "failed" || outcome.status.ok) return;
+  const { version, required } = outcome.status;
+  const reason = outcome.reason ?? "unknown reason";
+  recordClaudeCodeFailure(
+    version === null
+      ? `Claude Code could not be installed: ${reason}.`
+      : `Claude Code ${version} is older than ${required} and could not be updated: ${reason}.`,
+    outcome.detail ?? "",
+  );
+}
+
+/** The official installer for `target`, in the background: aborted at quit with its children. */
+async function installInBackground(
+  platform: NodeJS.Platform,
+  env: Env,
+  target: string,
+): Promise<InstallerRun> {
+  const installer = claudeCodeInstallerCommand(platform, env, target);
+  const abort = new AbortController();
+  background = abort;
+  try {
+    return await runInstaller(installer.command, installer.args, installer.env, abort.signal);
+  } finally {
+    if (background === abort) background = null;
   }
 }
 
@@ -1051,22 +1328,18 @@ async function runRecheck(reason: string, measureOnly: boolean): Promise<void> {
   const platform = process.platform;
   const env: Env = { ...process.env };
   const engine = engineClaudeCode;
+  const manage = !measureOnly && engine !== null && engine.shimDir !== null;
+  const latest = await latestClaudeCodeVersion();
   const outcome = await recheckClaudeCode({
     required: REQUIRED_CLAUDE_CODE_VERSION,
     engineCopy: engine?.copy ?? null,
-    manage: !measureOnly && engine !== null && engine.shimDir !== null,
+    manage,
+    latest,
+    lastAttemptAt: lastLatestAttemptAt,
+    recordAttempt: recordLatestAttempt,
     readVersion: (file) => readClaudeCodeVersion(file, env),
     resolve: claudeCodeResolver(platform, env),
-    install: async () => {
-      const installer = claudeCodeInstallerCommand(platform, env);
-      const abort = new AbortController();
-      background = abort;
-      try {
-        return await runInstaller(installer.command, installer.args, installer.env, abort.signal);
-      } finally {
-        if (background === abort) background = null;
-      }
-    },
+    install: (target) => installInBackground(platform, env, target),
     repoint: (file) => {
       // An engine launched since this check began has its own link: left alone.
       if (engine === null || engine.shimDir === null || engine !== engineClaudeCode) return false;
@@ -1078,12 +1351,14 @@ async function runRecheck(reason: string, measureOnly: boolean): Promise<void> {
     now: () => new Date(),
     log: logSetup,
   });
+  recordRecheckFailure(outcome);
   publishClaudeCodeStatus(outcome.status);
   logSetup("Claude Code check", {
     reason,
     action: outcome.action,
     version: outcome.status.version,
     required: outcome.status.required,
+    latest,
     ok: outcome.status.ok,
     ...(outcome.path ? { path: outcome.path } : {}),
     ...(outcome.reason ? { why: outcome.reason } : {}),
@@ -1132,8 +1407,10 @@ export function recheckClaudeCodeNow(
 /**
  * main.ts, before the first Orchestra window: answers the page's preload, then checks Claude Code
  * on the mandatory updater's cadence (every 30 minutes, and on resume, unlock and window focus at
- * most every 5 minutes). The launch check is the engine setup's own; when Orchestra reused an
- * engine it did not launch, the first check runs now (the returned promise).
+ * most every 5 minutes). When Orchestra launched the engine and its setup found a copy that meets
+ * the minimum, the first check runs now and brings it to the newest version in the background
+ * (V2: "at the first check"); when Orchestra reused an engine it did not launch, the first check
+ * only measures, and terminals keep the person's own `claude` (V3). Returns that first check.
  */
 export function startClaudeCodeWatch(): Promise<void> {
   if (watchStarted) return Promise.resolve();
@@ -1152,8 +1429,16 @@ export function startClaudeCodeWatch(): Promise<void> {
   powerMonitor.on("resume", () => onWake("resume"));
   powerMonitor.on("unlock-screen", () => onWake("unlock-screen"));
   app.on("browser-window-focus", () => onWake("focus"));
-  if (claudeCodeStatusNow !== null || recheckRunning) return recheckRunning ?? Promise.resolve();
-  // Measured only: an engine Orchestra launched was just set up (an install that failed is tried
-  // again at the next check, not a second time now), and one it reused is never changed.
+  if (!ownEngineLaunched) {
+    log.info("[terminal] another engine is running: terminals use the person's own claude");
+  }
+  if (recheckRunning) return recheckRunning;
+  if (claudeCodeStatusNow !== null) {
+    // The setup just measured: an engine of Orchestra's own with a good copy goes on to the newest.
+    if (claudeCodeStatusNow.ok && engineClaudeCode?.shimDir) return recheckClaudeCodeNow("launch");
+    return Promise.resolve();
+  }
+  // Measured only: an install that failed at launch is tried again at the next check, not a second
+  // time now, and an engine Orchestra reused is never changed.
   return recheckClaudeCodeNow("launch", { measureOnly: true });
 }

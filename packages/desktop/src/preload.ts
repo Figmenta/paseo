@@ -23,11 +23,17 @@ function readArgument(prefix: string): string {
   return value ? value.slice(prefix.length) : "";
 }
 
+// claude-code-setup.ts: ClaudeCodeReport (not imported: see above). 1.3.15 adds `latest`,
+// `failure`, `platform` and `osVersion` (contratto-1315, V1).
 interface ClaudeCodeStatus {
   version: string | null;
   required: string;
   ok: boolean;
   checkedAt: string;
+  latest: string | null;
+  failure: { message: string; detail: string; at: string } | null;
+  platform: "darwin" | "win32" | "linux";
+  osVersion: string;
 }
 
 function initialClaudeCodeStatus(): ClaudeCodeStatus | null {
@@ -61,7 +67,13 @@ contextBridge.executeInMainWorld({
     initialClaudeCode: ClaudeCodeStatus | null,
     eventName: string,
   ) => {
-    let claudeCode = initialClaudeCode === null ? null : Object.freeze({ ...initialClaudeCode });
+    // Read-only all the way down: `failure` is an object of its own.
+    const frozen = (status: ClaudeCodeStatus) =>
+      Object.freeze({
+        ...status,
+        failure: status.failure ? Object.freeze({ ...status.failure }) : null,
+      });
+    let claudeCode = initialClaudeCode === null ? null : frozen(initialClaudeCode);
     const api = Object.freeze(
       Object.defineProperty({ ...initialFacts }, "claudeCode", {
         enumerable: true,
@@ -79,7 +91,7 @@ contextBridge.executeInMainWorld({
       (event) => {
         const detail = (event as CustomEvent<unknown>).detail as ClaudeCodeStatus | null;
         if (detail && typeof detail === "object" && typeof detail.required === "string") {
-          claudeCode = Object.freeze({ ...detail });
+          claudeCode = frozen(detail);
         }
       },
       { capture: true },

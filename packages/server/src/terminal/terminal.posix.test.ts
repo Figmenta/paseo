@@ -377,6 +377,133 @@ describe.skipIf(isPlatform("win32"))("terminal POSIX-only", () => {
     });
   });
 
+  describe("Orchestra terminal-bin in real shells", () => {
+    const previousTerminalBin = process.env.ORCHESTRA_TERMINAL_BIN;
+
+    afterEach(() => {
+      if (previousTerminalBin === undefined) {
+        Reflect.deleteProperty(process.env, "ORCHESTRA_TERMINAL_BIN");
+      } else {
+        process.env.ORCHESTRA_TERMINAL_BIN = previousTerminalBin;
+      }
+    });
+
+    function prepareHome(prefix: string): { homeDir: string; terminalBin: string } {
+      const homeDir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+      temporaryDirs.push(homeDir);
+      const terminalBin = join(homeDir, "terminal-bin");
+      const localBin = join(homeDir, ".local", "bin");
+      mkdirSync(terminalBin, { recursive: true });
+      mkdirSync(localBin, { recursive: true });
+      for (const dir of [terminalBin, localBin]) {
+        writeFileSync(join(dir, "claude"), "#!/bin/sh\nexit 0\n");
+        chmodSync(join(dir, "claude"), 0o755);
+      }
+      return { homeDir, terminalBin };
+    }
+
+    async function expectLine(session: TerminalSession, expected: string): Promise<void> {
+      try {
+        await waitForState(session, (state) => getLines(state).includes(expected), 8000);
+      } catch {
+        throw new Error(
+          `expected line ${JSON.stringify(expected)} in:\n${getLines(session.getState()).join("\n")}`,
+        );
+      }
+    }
+
+    it.skipIf(!hasZsh)(
+      "zsh: at the first prompt terminal-bin is back at the head after a .zshrc that prepends ~/.local/bin",
+      async () => {
+        const { homeDir, terminalBin } = prepareHome("terminal-orchestra-zsh-");
+        const realZdotdir = join(homeDir, ".config", "zsh");
+        mkdirSync(realZdotdir, { recursive: true });
+        writeFileSync(join(realZdotdir, ".zshenv"), "");
+        // Prepends ~/.local/bin and appends a duplicate terminal-bin.
+        writeFileSync(
+          join(realZdotdir, ".zshrc"),
+          "export PATH=\"$HOME/.local/bin:$PATH:$HOME/terminal-bin\"\nPS1='$ '\n",
+        );
+        process.env.ORCHESTRA_TERMINAL_BIN = terminalBin;
+
+        const session = trackSession(
+          await createTerminal({
+            workspaceId: "ws-test",
+            cwd: homeDir,
+            shell: "/bin/zsh",
+            env: { HOME: homeDir, ZDOTDIR: realZdotdir },
+          }),
+        );
+        await waitForLines(session, ["$"]);
+        session.send({
+          type: "input",
+          data: 'print -r -- "H=${path[1]:t} N=${path[2]:h:t} C=${#${(@M)path:#$ORCHESTRA_TERMINAL_BIN}} W=${$(whence -p claude):h:t}"\r',
+        });
+        await expectLine(session, "H=terminal-bin N=.local C=1 W=terminal-bin");
+
+        // One-shot: a later PATH change by the person stays as written.
+        session.send({
+          type: "input",
+          data: 'path=(/k2-later $path); print -r -- "L=${path[1]}"\r',
+        });
+        await expectLine(session, "L=/k2-later");
+        session.send({ type: "input", data: 'print -r -- "L2=${path[1]}"\r' });
+        await expectLine(session, "L2=/k2-later");
+      },
+    );
+
+    it.skipIf(!hasZsh)("zsh without the variable keeps the .zshrc order", async () => {
+      const { homeDir } = prepareHome("terminal-orchestra-zsh-none-");
+      const realZdotdir = join(homeDir, ".config", "zsh");
+      mkdirSync(realZdotdir, { recursive: true });
+      writeFileSync(join(realZdotdir, ".zshenv"), "");
+      writeFileSync(
+        join(realZdotdir, ".zshrc"),
+        "export PATH=\"$HOME/.local/bin:$PATH\"\nPS1='$ '\n",
+      );
+      Reflect.deleteProperty(process.env, "ORCHESTRA_TERMINAL_BIN");
+
+      const session = trackSession(
+        await createTerminal({
+          workspaceId: "ws-test",
+          cwd: homeDir,
+          shell: "/bin/zsh",
+          env: { HOME: homeDir, ZDOTDIR: realZdotdir },
+        }),
+      );
+      await waitForLines(session, ["$"]);
+      session.send({ type: "input", data: 'print -r -- "H=${path[1]:h:t}"\r' });
+      await expectLine(session, "H=.local");
+    });
+
+    it.skipIf(!existsSync("/bin/bash"))(
+      "bash --rcfile: terminal-bin is at the head after a .bashrc that prepends ~/.local/bin",
+      async () => {
+        const { homeDir, terminalBin } = prepareHome("terminal-orchestra-bash-");
+        writeFileSync(
+          join(homeDir, ".bashrc"),
+          "export PATH=\"$HOME/.local/bin:$PATH:$HOME/terminal-bin\"\nPS1='$ '\n",
+        );
+        process.env.ORCHESTRA_TERMINAL_BIN = terminalBin;
+
+        const session = trackSession(
+          await createTerminal({
+            workspaceId: "ws-test",
+            cwd: homeDir,
+            shell: "/bin/bash",
+            env: { HOME: homeDir, BASH_SILENCE_DEPRECATION_WARNING: "1" },
+          }),
+        );
+        await waitForLines(session, ["$"]);
+        session.send({
+          type: "input",
+          data: 'h=${PATH%%:*}; r=${PATH#*:}; n=${r%%:*}; c=$(printf %s "$PATH" | tr : "\\n" | grep -cx "$ORCHESTRA_TERMINAL_BIN"); w=$(command -v claude); echo "H=${h##*/} N=${n%/*} C=$c W=${w%/claude}" | sed "s|$HOME|~|g"\r',
+        });
+        await expectLine(session, "H=terminal-bin N=~/.local C=1 W=~/terminal-bin");
+      },
+    );
+  });
+
   describe("terminal title", () => {
     it.skipIf(!hasZsh)("restores the user's ZDOTDIR through the zsh wrapper", async () => {
       const homeDir = mkdtempSync(join(tmpdir(), "terminal-zsh-home-"));

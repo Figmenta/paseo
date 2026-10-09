@@ -30,3 +30,16 @@ function _paseo_preexec() {
 
 add-zsh-hook precmd _paseo_precmd
 add-zsh-hook preexec _paseo_preexec
+
+# Orchestra terminal-bin: once the person's rc files have run, put
+# $ORCHESTRA_TERMINAL_BIN back at the head of PATH (dropping the duplicate) at
+# the first prompt, then remove the hook. No-op when the variable is unset.
+if [[ -n "${ORCHESTRA_TERMINAL_BIN-}" ]]; then
+  function _paseo_orchestra_path_precmd() {
+    add-zsh-hook -d precmd _paseo_orchestra_path_precmd
+    if [[ -n "${ORCHESTRA_TERMINAL_BIN-}" ]]; then
+      path=("$ORCHESTRA_TERMINAL_BIN" "${(@)path:#${~${(b)ORCHESTRA_TERMINAL_BIN}}}")
+    fi
+  }
+  add-zsh-hook precmd _paseo_orchestra_path_precmd
+fi

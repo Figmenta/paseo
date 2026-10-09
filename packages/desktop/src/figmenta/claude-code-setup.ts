@@ -57,10 +57,88 @@ export function requiredClaudeCodeVersion(
 }
 
 /**
- * What the installers are asked for. The `stable` channel was 2.1.277 on 2026-09-29, below the
- * minimum, and install.sh without a target installs `stable`: the target is always explicit.
+ * What the installers are asked for when the newest published version could not be read (1.3.15:
+ * otherwise the exact version, see decideClaudeCodeAction). The `stable` channel was 2.1.277 on
+ * 2026-09-29, below the minimum, and install.sh without a target installs `stable`: the target is
+ * always explicit.
  */
 export const CLAUDE_CODE_INSTALL_TARGET = "latest";
+
+/** What the official installers accept as a target (install.sh lines 6-9, install.ps1 1-4). */
+const INSTALL_TARGET_PATTERN = /^(latest|stable|\d+\.\d+\.\d+)$/;
+
+/**
+ * 1.3.15: the newest published Claude Code, the same URL install.sh, install.ps1 and install.cmd
+ * read. Its body is the bare version ("2.1.295", no newline on 2026-10-09).
+ */
+export const CLAUDE_CODE_LATEST_URL = "https://downloads.claude.ai/claude-code-releases/latest";
+
+/** The body of CLAUDE_CODE_LATEST_URL, trimmed, when it is x.y.z; null for anything else. */
+export function parseLatestVersion(body: string): string | null {
+  const version = body.trim();
+  return /^\d+\.\d+\.\d+$/.test(version) ? version : null;
+}
+
+/** At most one attempt toward the newest version every 6 hours per machine (the brake). */
+export const LATEST_ATTEMPT_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+export interface ClaudeCodeCopy {
+  path: string;
+  /** Null: unreadable or not starting; such a copy never counts as meeting anything. */
+  version: string | null;
+}
+
+export type ClaudeCodeAction =
+  /** Keep `path`: the copy new sessions get now (`current`) is the one to use. */
+  | { kind: "ok"; path: string }
+  /** Point new sessions at `path`, a copy already on the machine. */
+  | { kind: "repoint"; path: string }
+  /** Run the official installer for `target`: an exact version, or `latest` when unknown. */
+  | { kind: "install"; target: string };
+
+/**
+ * 1.3.15 (V2): what to do with the Claude Code new sessions get. The minimum is the gate (below it
+ * the machine is not ok), the newest published version is the goal:
+ *  - the newest copy found that meets the minimum is the candidate (ties: `current`, then the first);
+ *  - it is at the newest version, or the newest is unknown (`latest` null): use it;
+ *  - below the newest, not braked: install the exact newest version;
+ *  - below the newest, braked (an attempt within 6 hours): use it;
+ *  - no copy meets the minimum: install, brake or not (the newest when known, else `latest`, the
+ *    rule of 1.3.14: never an install toward a version that could not be read).
+ * `current` is the copy new sessions get now: using it is "ok", using another one is "repoint".
+ */
+export function decideClaudeCodeAction(input: {
+  copies: readonly ClaudeCodeCopy[];
+  current?: string | null;
+  required: string;
+  latest: string | null;
+  lastAttemptAt: Date | null;
+  now: Date;
+}): ClaudeCodeAction {
+  const current = input.current ?? null;
+  let best: ClaudeCodeCopy | null = null;
+  for (const copy of input.copies) {
+    if (copy.version === null || !meetsClaudeCodeMinimum(copy.version, input.required)) continue;
+    if (best === null || best.version === null) {
+      best = copy;
+      continue;
+    }
+    const order = compareVersions(copy.version, best.version);
+    if (order === 1 || (order === 0 && copy.path === current && best.path !== current)) {
+      best = copy;
+    }
+  }
+  if (best === null) return { kind: "install", target: input.latest ?? CLAUDE_CODE_INSTALL_TARGET };
+  const choose = (copy: ClaudeCodeCopy): ClaudeCodeAction =>
+    copy.path === current ? { kind: "ok", path: copy.path } : { kind: "repoint", path: copy.path };
+  if (input.latest === null || meetsClaudeCodeMinimum(best.version, input.latest))
+    return choose(best);
+  const since =
+    input.lastAttemptAt === null ? null : input.now.getTime() - input.lastAttemptAt.getTime();
+  // An attempt "in the future" (a clock set back) does not brake: it would brake for good.
+  if (since !== null && since >= 0 && since < LATEST_ATTEMPT_INTERVAL_MS) return choose(best);
+  return { kind: "install", target: input.latest };
+}
 
 export type Env = Record<string, string | undefined>;
 
@@ -217,10 +295,11 @@ export type ClaudeCodeResolution =
     };
 
 /**
- * The first `claude` that meets the minimum, in PATH order and then in the known folders. A copy
- * whose `--version` is slow or unreadable is present with an unknown version: it is used, after
- * any copy known to be good, and never reinstalled over (the plugin checks the version itself).
- * Only copies that are all too old, or that do not start, call for the installer.
+ * The newest `claude` that meets the minimum (1.3.15: not the first in PATH order; on equal
+ * versions the earlier one, PATH order and then the known folders). A copy whose `--version` is
+ * slow or unreadable is present with an unknown version: it is used when no copy is known to be
+ * good, and never reinstalled over (the plugin checks the version itself). Only copies that are all
+ * too old, or that do not start, call for the installer.
  */
 export async function resolveClaudeCode(input: {
   platform: NodeJS.Platform;
@@ -241,6 +320,7 @@ export async function resolveClaudeCode(input: {
   });
   const found: { path: string; version: string | null }[] = [];
   let unknown: ClaudeCodeCandidate | null = null;
+  let best: { candidate: ClaudeCodeCandidate; version: string } | null = null;
   for (const candidate of candidates) {
     const read = await input.readVersion(candidate.path);
     if (read === "unknown") {
@@ -249,12 +329,24 @@ export async function resolveClaudeCode(input: {
     }
     const version = read === "broken" ? null : read;
     if (version !== null && meetsClaudeCodeMinimum(version, input.minimum)) {
-      return ready(candidate, version);
+      if (best === null || compareVersions(version, best.version) === 1) {
+        best = { candidate, version };
+      }
+      continue;
     }
     found.push({ path: candidate.path, version });
   }
+  if (best) return ready(best.candidate, best.version);
   if (unknown) return ready(unknown, null);
   return { status: "too-old", found };
+}
+
+/** The copies a resolution read, for decideClaudeCodeAction: the one it picked is the newest. */
+export function resolutionCopies(resolution: ClaudeCodeResolution): ClaudeCodeCopy[] {
+  if (resolution.status === "ready")
+    return [{ path: resolution.path, version: resolution.version }];
+  if (resolution.status === "missing") return [];
+  return resolution.found.map(({ path: file, version }) => ({ path: file, version }));
 }
 
 /**
@@ -312,7 +404,8 @@ export interface InstallerCommand {
 }
 
 /**
- * The official installer, per user, no password and no elevation:
+ * The official installer, per user, no password and no elevation, for `target`: the exact newest
+ * version (1.3.15), or `latest` when it could not be read:
  *  - Windows: install.ps1 through Windows PowerShell 5.1 by absolute path. PSModulePath is dropped
  *    because a value inherited from PowerShell 7 breaks 5.1's own modules (measured on the runner:
  *    install.ps1 failed with "Get-FileHash is not recognized"); TLS 1.2 is forced for older .NET.
@@ -324,6 +417,10 @@ export function claudeCodeInstallerCommand(
   env: Env,
   target: string = CLAUDE_CODE_INSTALL_TARGET,
 ): InstallerCommand {
+  // The target lands in a command line: only what the installers themselves accept.
+  if (!INSTALL_TARGET_PATTERN.test(target)) {
+    throw new Error(`Claude Code install target "${target}" is not a version`);
+  }
   if (platform === "win32") {
     const systemRoot = envValue(env, "SystemRoot", platform) ?? "C:\\Windows";
     const installEnv: Env = { ...env };
@@ -520,6 +617,69 @@ export function claudeCodeStatus(
   };
 }
 
+/** What the setup or a check could not do, for Settings (1.3.15, V1). */
+export interface ClaudeCodeFailureReport {
+  /** At most 300 characters. */
+  message: string;
+  /** The tail of the installer's output, at most 600 characters. */
+  detail: string;
+  /** ISO 8601. */
+  at: string;
+}
+
+/**
+ * 1.3.15: what the Orchestra page reads as its Claude Code status: the status, the newest
+ * published version last read (null: never read, or the read failed), the last failure that left
+ * the machine below the minimum or without Claude Code (null once it is ok again), and the machine.
+ */
+export interface ClaudeCodeReport extends ClaudeCodeStatus {
+  latest: string | null;
+  failure: ClaudeCodeFailureReport | null;
+  platform: "darwin" | "win32" | "linux";
+  /** os.release(), at most 64 characters. */
+  osVersion: string;
+}
+
+export const FAILURE_MESSAGE_LIMIT = 300;
+export const FAILURE_DETAIL_LIMIT = 600;
+export const OS_VERSION_LIMIT = 64;
+
+function clipHead(text: string, limit: number): string {
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
+function clipTail(text: string, limit: number): string {
+  const trimmed = text.trim();
+  return trimmed.length > limit ? `…${trimmed.slice(-(limit - 1))}` : trimmed;
+}
+
+export function claudeCodeReport(
+  status: ClaudeCodeStatus,
+  extras: {
+    latest: string | null;
+    failure: { message: string; detail: string; at: Date } | null;
+    platform: NodeJS.Platform;
+    osVersion: string;
+  },
+): ClaudeCodeReport {
+  const platform =
+    extras.platform === "darwin" || extras.platform === "win32" ? extras.platform : "linux";
+  return {
+    ...status,
+    latest: extras.latest,
+    failure:
+      extras.failure === null
+        ? null
+        : {
+            message: clipHead(extras.failure.message.trim(), FAILURE_MESSAGE_LIMIT),
+            detail: clipTail(extras.failure.detail, FAILURE_DETAIL_LIMIT),
+            at: extras.failure.at.toISOString(),
+          },
+    platform,
+    osVersion: extras.osVersion.slice(0, OS_VERSION_LIMIT),
+  };
+}
+
 /** The version a resolution stands for: the copy used, or the newest copy found too old. */
 export function resolutionVersion(resolution: ClaudeCodeResolution): string | null {
   if (resolution.status === "ready") return resolution.version;
@@ -543,7 +703,10 @@ export type ClaudeCodeRecheckAction =
   | "repointed"
   /** The official installer ran and new sessions now get the copy it installed. */
   | "installed"
-  /** Still below the requirement: the next check tries again. */
+  /**
+   * Still below the requirement, or (status ok) still below the newest version: the next check
+   * tries again.
+   */
   | "failed";
 
 export interface ClaudeCodeRecheckOutcome {
@@ -551,8 +714,10 @@ export interface ClaudeCodeRecheckOutcome {
   status: ClaudeCodeStatus;
   /** The copy new sessions get, when this check changed it. */
   path?: string;
-  /** For the log: why a check that had to act could not. */
+  /** For the log (and, below the minimum, for Settings): why a check that had to act could not. */
   reason?: string;
+  /** The tail of the installer's output, when it ran and did not get there. */
+  detail?: string;
 }
 
 export interface ClaudeCodeRecheckDeps {
@@ -564,11 +729,17 @@ export interface ClaudeCodeRecheckDeps {
   engineCopy: string | null;
   /** Orchestra launched this engine: it may install Claude Code and point the link elsewhere. */
   manage: boolean;
+  /** 1.3.15: the newest published version (null or absent: unknown, the minimum is the rule). */
+  latest?: string | null;
+  /** 1.3.15: when the last attempt toward the newest version started (the 6-hour brake). */
+  lastAttemptAt?: () => Date | null;
+  /** 1.3.15: called right before the installer runs for an exact version (persists the brake). */
+  recordAttempt?: (target: string) => void;
   readVersion(file: string): Promise<ClaudeCodeVersionRead>;
   /** resolveClaudeCode() with `minimum` = `required`. */
   resolve(): Promise<ClaudeCodeResolution>;
-  /** The official installer, in the background: never a window, never a stop of the engine. */
-  install(): Promise<InstallerRun>;
+  /** The official installer for `target`, in the background: never a window, never a stop. */
+  install(target: string): Promise<InstallerRun>;
   /** Points the engine's link at `file`; false when it could not. */
   repoint(file: string): boolean;
   now(): Date;
@@ -576,17 +747,20 @@ export interface ClaudeCodeRecheckDeps {
 }
 
 /**
- * The periodic check: reads the version of the copy new sessions get and, when it is below what
- * this build requires and Orchestra launched the engine, makes it meet it: first by pointing at
- * a copy that already does (the native copy next to an old Homebrew or npm one, a Windows link
- * still on the replaced file), else with the official installer. Running sessions are never
- * touched: the installer keeps the version they run (measured on macOS, Linux and Windows,
- * docs/FIGMENTA.md) and only the engine's link changes, never a file a session runs.
+ * The periodic check: reads the version of the copy new sessions get and, when Orchestra launched
+ * the engine, keeps it at the newest published version (decideClaudeCodeAction): first by pointing
+ * at a copy that already is (the native copy next to an old Homebrew or npm one, a Windows link
+ * still on the replaced file), else with the official installer for that exact version. Below the
+ * minimum it is the same, with no brake. Running sessions are never touched: the installer keeps
+ * the version they run (measured on macOS, Linux and Windows, docs/FIGMENTA.md) and only the
+ * engine's link changes, never a file a session runs. An attempt toward the newest version that
+ * fails while the copy still meets the minimum is "failed" with an ok status: the log, nothing else.
  */
 export async function recheckClaudeCode(
   deps: ClaudeCodeRecheckDeps,
 ): Promise<ClaudeCodeRecheckOutcome> {
   const { required } = deps;
+  const latest = deps.latest ?? null;
   const status = (version: string | null) => claudeCodeStatus(version, required, deps.now());
 
   let engineVersion: string | null = null;
@@ -594,9 +768,11 @@ export async function recheckClaudeCode(
     const read = await deps.readVersion(deps.engineCopy);
     if (read === "unknown") return { action: "unreadable", status: status(null) };
     engineVersion = read === "broken" ? null : read;
-    if (meetsClaudeCodeMinimum(engineVersion, required)) {
-      return { action: "current", status: status(engineVersion) };
-    }
+  }
+  const engineMeets = meetsClaudeCodeMinimum(engineVersion, required);
+  const atLatest = latest === null || meetsClaudeCodeMinimum(engineVersion, latest);
+  if (engineMeets && (!deps.manage || atLatest)) {
+    return { action: "current", status: status(engineVersion) };
   }
 
   if (!deps.manage) {
@@ -605,42 +781,104 @@ export async function recheckClaudeCode(
     const resolution = await deps.resolve();
     return { action: "report-only", status: status(resolutionVersion(resolution)) };
   }
+  return bringClaudeCodeUp(deps, engineVersion);
+}
 
-  const pointAt = (
-    resolution: ClaudeCodeResolution,
-    action: "repointed" | "installed",
-  ): ClaudeCodeRecheckOutcome | null => {
-    if (resolution.status !== "ready" || resolution.version === null) return null;
-    if (!deps.repoint(resolution.path)) {
-      return {
-        action: "failed",
-        status: status(engineVersion),
-        reason: `the engine's link to ${resolution.path} could not be written`,
-      };
-    }
-    deps.log(`Claude Code for new sessions: ${action}`, {
-      path: resolution.path,
-      version: resolution.version,
-      before: engineVersion,
-    });
-    return { action, status: status(resolution.version), path: resolution.path };
+/** Points the engine's link at a resolved copy; null when the resolution has no usable copy. */
+function pointEngineAt(
+  deps: ClaudeCodeRecheckDeps,
+  resolution: ClaudeCodeResolution,
+  action: "repointed" | "installed",
+  engineVersion: string | null,
+): ClaudeCodeRecheckOutcome | null {
+  if (resolution.status !== "ready" || resolution.version === null) return null;
+  if (!deps.repoint(resolution.path)) {
+    return {
+      action: "failed",
+      status: claudeCodeStatus(engineVersion, deps.required, deps.now()),
+      reason: `the engine's link to ${resolution.path} could not be written`,
+    };
+  }
+  deps.log(`Claude Code for new sessions: ${action}`, {
+    path: resolution.path,
+    version: resolution.version,
+    before: engineVersion,
+  });
+  return {
+    action,
+    status: claudeCodeStatus(resolution.version, deps.required, deps.now()),
+    path: resolution.path,
   };
+}
+
+function installFailureReason(run: InstallerRun, after: ClaudeCodeResolution): string {
+  if (run.timedOut) return "the installer did not finish in time";
+  if (run.ok) return `after the installer the copy found is ${after.status}`;
+  return "the installer failed";
+}
+
+/** recheckClaudeCode for an engine Orchestra launched whose copy is below the minimum or the newest. */
+async function bringClaudeCodeUp(
+  deps: ClaudeCodeRecheckDeps,
+  engineVersion: string | null,
+): Promise<ClaudeCodeRecheckOutcome> {
+  const { required } = deps;
+  const latest = deps.latest ?? null;
+  const engineMeets = meetsClaudeCodeMinimum(engineVersion, required);
+  const status = () => claudeCodeStatus(engineVersion, required, deps.now());
 
   const before = await deps.resolve();
-  const already = pointAt(before, "repointed");
-  if (already) return already;
-
-  deps.log("Claude Code is below what Orchestra requires: installing in the background", {
+  const engine: ClaudeCodeCopy[] =
+    deps.engineCopy === null ? [] : [{ path: deps.engineCopy, version: engineVersion }];
+  const decision = decideClaudeCodeAction({
+    copies: [...engine, ...resolutionCopies(before)],
+    current: deps.engineCopy,
     required,
-    engineVersion,
-    found: before.status === "too-old" ? before.found : [],
+    latest,
+    lastAttemptAt: deps.lastAttemptAt?.() ?? null,
+    now: deps.now(),
   });
-  const run = await deps.install();
+  if (decision.kind === "ok") {
+    // Braked: below the newest version, at or above the minimum.
+    deps.log("Claude Code is below the newest version: last attempt less than 6 hours ago", {
+      engineVersion,
+      latest,
+    });
+    return { action: "current", status: status() };
+  }
+  if (decision.kind === "repoint") {
+    const pointed = pointEngineAt(deps, before, "repointed", engineVersion);
+    return pointed ?? { action: "failed", status: status(), reason: "no copy to use" };
+  }
+
+  deps.log(
+    engineMeets
+      ? "Claude Code is below the newest version: installing it in the background"
+      : "Claude Code is below what Orchestra requires: installing in the background",
+    {
+      required,
+      latest,
+      target: decision.target,
+      engineVersion,
+      found: before.status === "too-old" ? before.found : [],
+    },
+  );
+  if (decision.target !== CLAUDE_CODE_INSTALL_TARGET) deps.recordAttempt?.(decision.target);
+  const run = await deps.install(decision.target);
   const after = await deps.resolve();
-  const installed = pointAt(after, "installed");
-  if (installed) return installed;
-  let reason = "the installer failed";
-  if (run.timedOut) reason = "the installer did not finish in time";
-  else if (run.ok) reason = `after the installer the copy found is ${after.status}`;
-  return { action: "failed", status: status(engineVersion), reason };
+  const afterVersion = after.status === "ready" ? after.version : null;
+  const improved =
+    afterVersion !== null &&
+    (engineVersion === null || compareVersions(afterVersion, engineVersion) === 1);
+  if (improved) {
+    const pointed = pointEngineAt(deps, after, run.ok ? "installed" : "repointed", engineVersion);
+    if (pointed) return pointed;
+  }
+  const reason = installFailureReason(run, after);
+  return {
+    action: "failed",
+    status: status(),
+    reason: engineMeets ? `toward ${decision.target}: ${reason}` : reason,
+    detail: outputTail(run.output, FAILURE_DETAIL_LIMIT - 1),
+  };
 }
