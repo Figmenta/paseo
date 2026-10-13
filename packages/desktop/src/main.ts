@@ -8,7 +8,7 @@ import { inheritLoginShellEnv } from "./login-shell-env.js";
 
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { copyFileSync, existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import {
   app,
@@ -27,8 +27,7 @@ import {
   shell,
   webContents,
 } from "electron";
-import { listDaemonPlugins, registerDaemonManager, startDaemon } from "./daemon/daemon-manager.js";
-import { resolvePaseoHome, writeFileAtomic } from "@getpaseo/server";
+import { registerDaemonManager, startDaemon } from "./daemon/daemon-manager.js";
 import { parsePassthroughCliArgsFromArgv, runPassthroughCli } from "./daemon/cli/passthrough.js";
 import { closeAllTransportSessions } from "./daemon/local-transport.js";
 import {
@@ -101,17 +100,20 @@ import {
 } from "./daemon/quit-lifecycle.js";
 import { runDesktopStartup } from "./desktop-startup.js";
 import {
-  corsAllowsOrchestra,
   isAllowedNavigation,
+  ORCHESTRA_COPYRIGHT,
   isOrchestraOrigin,
   ORCHESTRA_BACKGROUND_COLOR,
   ORCHESTRA_PLUGIN_ID,
   ORCHESTRA_URL,
   permissionPolicy,
-  pluginIsRunning,
-  seedPaseoConfigText,
   titleBarInset,
 } from "./figmenta/orchestra.js";
+import {
+  seedOrchestraDaemonConfig,
+  verifyOrchestraDaemonSeed,
+  type DaemonSeedWarning,
+} from "./figmenta/orchestra-daemon-seed.js";
 import {
   offerMoveToApplicationsFolder,
   startMandatoryUpdater,
@@ -162,6 +164,9 @@ const bootstrapComplete = new Promise<void>((resolve) => {
 let bootstrapIsComplete = false;
 
 app.setName(APP_NAME);
+// Figmenta fork: the About panel names Figmenta. Paseo's own copyright stays in LICENSE and
+// the repository root package.json, as its MIT license requires.
+app.setAboutPanelOptions({ copyright: ORCHESTRA_COPYRIGHT });
 log.info("[desktop] app startup", {
   version: app.getVersion(),
   platform: process.platform,
@@ -1024,49 +1029,11 @@ function resolveOrchestraPluginPath(): string {
     : path.resolve(__dirname, "../figmenta-plugin");
 }
 
-// The Orchestra shell is the only thing that configures this daemon, so it seeds
-// ~/.paseo/config.json itself: plugins on, our plugin registered (never replacing an
-// entry the user already has), and the Orchestra origin allowed through daemon CORS.
-async function seedOrchestraDaemonConfig(): Promise<void> {
-  const home = resolvePaseoHome(process.env);
-  const configPath = path.join(home, "config.json");
-  let current = "";
-  try {
-    current = readFileSync(configPath, "utf-8");
-  } catch {
-    current = "";
-  }
-
-  const result = seedPaseoConfigText(current, { pluginPath: resolveOrchestraPluginPath() });
-  if (result.status === "corrupt") {
-    // A config we cannot parse is not ours to replace: it may be hand-edited and this
-    // may be its only copy. Keep a dated copy as evidence, report, and leave it alone —
-    // the daemon will refuse it too, and the log says why.
-    const backupPath = `${configPath}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-    try {
-      copyFileSync(configPath, backupPath);
-    } catch (error) {
-      log.error("[orchestra] could not preserve the unreadable config", error);
-    }
-    log.error("[orchestra] config.json does not parse: not seeded, left untouched", {
-      configPath,
-      backupPath,
-      reason: result.reason,
-    });
-    return;
-  }
-
-  if (result.text === current) {
-    return;
-  }
-  // Atomic: a half-written config.json is a daemon that will not start.
-  await writeFileAtomic(configPath, result.text);
-  log.info("[orchestra] seeded daemon config", { configPath });
-}
-
 // In Paseo the renderer asks for the daemon over IPC. The Orchestra page is remote and
 // has no such bridge, so the main process starts it. startDaemon() returns an already
 // running daemon untouched: a daemon Federico started by hand keeps its own lifecycle.
+// The check after it (figmenta/orchestra-daemon-seed.ts) restarts, once and without
+// asking, a daemon an Orchestra launched that still runs an older plugin.
 async function startOrchestraDaemon(): Promise<void> {
   let listen: string | null = null;
   try {
@@ -1081,58 +1048,49 @@ async function startOrchestraDaemon(): Promise<void> {
     log.error("[orchestra] failed to start the local daemon", error);
     return;
   }
-  await verifyOrchestraDaemonSeed(listen);
-}
-
-// Seeding the config is a no-op on a daemon that was ALREADY running: it read its config
-// at boot. So we ask the live daemon, instead of assuming: does it allow our origin, and
-// did it load our plugin? If not, the only cure is a restart, and a daemon we did not
-// spawn is not ours to restart — we say so instead.
-async function verifyOrchestraDaemonSeed(listen: string | null): Promise<void> {
-  const target = listen?.trim() || "127.0.0.1:6767";
-  let corsOk = false;
-  try {
-    const response = await net.fetch(`http://${target}/api/health`, {
-      headers: { Origin: ORCHESTRA_URL },
-    });
-    corsOk = corsAllowsOrchestra(response.headers.get("access-control-allow-origin"));
-  } catch (error) {
-    log.error("[orchestra] could not reach the daemon health endpoint", { target, error });
-  }
-
-  let pluginOk = false;
-  try {
-    pluginOk = pluginIsRunning(await listDaemonPlugins());
-  } catch (error) {
-    log.error("[orchestra] could not list the daemon plugins", error);
-  }
-
-  if (corsOk && pluginOk) {
-    log.info("[orchestra] daemon seed verified", { target });
-    return;
-  }
-
-  log.error("[orchestra] the daemon is not running with the Orchestra seed", {
-    target,
-    corsAllowsOrchestra: corsOk,
-    pluginRunning: pluginOk,
-    spawnedByThisApp: wasDaemonSpawnedByThisApp(),
+  await verifyOrchestraDaemonSeed({
+    listen,
+    pluginPath: resolveOrchestraPluginPath(),
+    warn: showDaemonSeedWarning,
   });
-  showDaemonSeedWarning();
 }
 
-function showDaemonSeedWarning(): void {
+function daemonSeedWarningText(
+  warning: DaemonSeedWarning,
+  ours: boolean,
+): {
+  message: string;
+  detail: string;
+} {
+  if (warning.kind === "plugin-outdated") {
+    const loaded = warning.loadedVersion ? `v${warning.loadedVersion}` : "an older version";
+    const bundled = warning.bundledVersion ? `v${warning.bundledVersion}` : "the current one";
+    return {
+      message: "The engine is running an older Orchestra plugin",
+      detail: ours
+        ? `The engine loaded the Orchestra plugin ${loaded}, but this app ships ${bundled}: Claude Code may not be signed in. Restarting the engine takes a few seconds.`
+        : `The engine running on this machine was started outside Orchestra (for example by the Paseo app) and loaded the Orchestra plugin ${loaded}; this app ships ${bundled}. Until it restarts, Claude Code may not be signed in. Quit Paseo (or the app that started the engine) and reopen Orchestra.`,
+    };
+  }
+  return {
+    message: "Engine needs a restart to load the Orchestra plugin",
+    detail: ours
+      ? "The engine is running with an older configuration. Restarting it takes a few seconds."
+      : "The engine running on this machine was started outside Orchestra, so Orchestra will not restart it. Quit it (or the app that owns it) and reopen Orchestra.",
+  };
+}
+
+function showDaemonSeedWarning(warning: DaemonSeedWarning): void {
   const ours = wasDaemonSpawnedByThisApp();
+  const text = daemonSeedWarningText(warning, ours);
   // Figmenta fork: the startup splash floats above every window; the warning goes first.
   dismissStartupSplash("engine warning");
   void dialog
     .showMessageBox({
       type: "warning",
       title: APP_NAME,
-      message: "Engine needs a restart to load the Orchestra plugin",
-      detail: ours
-        ? "The engine is running with an older configuration. Restarting it takes a few seconds."
-        : "The engine running on this machine was started outside Orchestra, so Orchestra will not restart it. Quit it (or the app that owns it) and reopen Orchestra.",
+      message: text.message,
+      detail: text.detail,
       buttons: ours ? ["Restart engine", "Later"] : ["OK"],
       defaultId: 0,
       cancelId: ours ? 1 : 0,
@@ -1309,7 +1267,7 @@ async function bootstrap(): Promise<void> {
   });
 
   installOrchestraSessionPolicies();
-  await seedOrchestraDaemonConfig();
+  await seedOrchestraDaemonConfig({ pluginPath: resolveOrchestraPluginPath() });
   await startOrchestraDaemon();
   // Figmenta fork: Claude Code is checked again every 30 minutes and on wake, updated in the
   // background when it falls below what this build requires, and reported to the page as

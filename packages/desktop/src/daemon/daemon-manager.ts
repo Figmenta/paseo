@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { app, ipcMain, powerMonitor } from "electron";
 import log from "electron-log/main";
@@ -44,7 +44,10 @@ import {
 import type { DesktopSettings } from "../settings/desktop-settings.js";
 import { getDesktopSettingsStore } from "../settings/desktop-settings-electron.js";
 import { isRunningUnderARM64Translation } from "../system/arm64-translation.js";
-import { shouldRestartDaemonForVersion } from "../figmenta/orchestra.js";
+import {
+  ORCHESTRA_DAEMON_MARKER_FILENAME,
+  shouldRestartDaemonForVersion,
+} from "../figmenta/orchestra.js";
 import { describeSandbox } from "../diagnostics/sandbox.js";
 import { getDesktopAppLogs } from "../diagnostics/app-logs.js";
 import { getDesktopUpdaterDiagnostics } from "../diagnostics/updater.js";
@@ -68,6 +71,7 @@ const DESKTOP_DAEMON_STOP_REASON_VALUES = [
   "app_update",
   "version_mismatch",
   "restart",
+  "plugin_outdated",
 ] as const;
 export type DesktopDaemonStopReason = (typeof DESKTOP_DAEMON_STOP_REASON_VALUES)[number];
 
@@ -430,6 +434,22 @@ export function pickOrchestraDaemonRuntime(
   return picked;
 }
 
+// Figmenta fork: names the instance this Orchestra launched, so a LATER Orchestra process
+// can tell it apart from a daemon an installed Paseo.app started (figmenta/orchestra.ts,
+// classifyDaemonOwner). A stale file names an instance that no longer holds the lock.
+function recordOrchestraLaunch(home: string, instance: DaemonInstance): void {
+  try {
+    writeFileSync(
+      path.join(home, ORCHESTRA_DAEMON_MARKER_FILENAME),
+      `${JSON.stringify({ pid: instance.pid, startedAt: instance.startedAt }, null, 2)}\n`,
+    );
+  } catch (error) {
+    logDesktopDaemonLifecycle("could not record the Orchestra launch marker", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 async function launchDaemonRuntime(
   home: string,
   runtime: DaemonLaunchRuntime,
@@ -452,6 +472,7 @@ async function launchDaemonRuntime(
       ...(signal ? { signal } : {}),
       onAcquired: (instance) => {
         ownedLaunch = { home, instance, serverVersion: runtime.version };
+        recordOrchestraLaunch(home, instance);
       },
     });
     return "ready";
@@ -473,8 +494,10 @@ export async function stopDesktopDaemon(
     ownedLaunch.home === home &&
     isSameDaemonInstance(instance, ownedLaunch.instance),
   );
+  // Figmenta fork: "plugin_outdated" is Orchestra stopping a daemon an EARLIER Orchestra
+  // launched (figmenta/orchestra-daemon-seed.ts), named by the pid lock it just read.
   const explicit =
-    reason === "manual_ipc" &&
+    (reason === "manual_ipc" || reason === "plugin_outdated") &&
     confirmedInstance &&
     instance &&
     instance.pid === confirmedInstance.pid &&

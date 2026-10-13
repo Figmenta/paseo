@@ -1,6 +1,9 @@
 npmRebuild: false
 appId: it.figmenta.orchestra
 productName: Orchestra
+# Figmenta fork: macOS Info.plist NSHumanReadableCopyright (About panel), Windows file
+# properties. Paseo's copyright stays in LICENSE and the root package.json (MIT).
+copyright: "© 2026 Figmenta"
 executableName: Orchestra
 protocols:
   - name: Orchestra agent link
