@@ -4,7 +4,7 @@
 // main.ts calls it at boot; the dialog stays in main.ts and is handed in as `warn`.
 
 import { execFileSync } from "node:child_process";
-import { copyFileSync, readFileSync } from "node:fs";
+import { copyFileSync, readFileSync, readlinkSync } from "node:fs";
 import path from "node:path";
 import { net } from "electron";
 import log from "electron-log/main";
@@ -23,6 +23,7 @@ import {
   loadedPluginPath,
   ORCHESTRA_DAEMON_MARKER_FILENAME,
   ORCHESTRA_URL,
+  parseProcessExecutable,
   planDaemonSeedAction,
   pluginIsRunning,
   seedPaseoConfigText,
@@ -125,6 +126,8 @@ export interface DaemonSeedWarning {
   /** "plugin-outdated": the daemon loaded an older plugin than this app ships. */
   kind: "seed" | "plugin-outdated";
   owner: DaemonOwner;
+  /** The pid lock the owner was read from: what a "Restart engine" may stop. */
+  instance: DaemonLockInfo | null;
   loadedVersion: string | null;
   bundledVersion: string | null;
 }
@@ -139,21 +142,47 @@ export interface DaemonSeedCheck {
   bundledVersion: string | null;
   pluginOutdated: boolean;
   owner: DaemonOwner;
+  executable: string | null;
   restarted: boolean;
 }
 
-function processCommand(pid: number): string | null {
-  if (process.platform === "win32") return null;
+function runProbe(command: string, args: string[]): string | null {
   try {
-    const out = execFileSync("ps", ["-o", "command=", "-p", String(pid)], {
+    return execFileSync(command, args, {
       encoding: "utf-8",
-      timeout: 2_000,
+      timeout: 3_000,
       stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    return out || null;
+      windowsHide: true,
+    });
   } catch {
     return null;
   }
+}
+
+/** The executable image of `pid` (not its command line: the supervisor retitles itself). */
+export function processExecutable(pid: number): string | null {
+  if (process.platform === "darwin") {
+    return (
+      parseProcessExecutable(
+        "lsof",
+        runProbe("lsof", ["-a", "-p", String(pid), "-d", "txt", "-Fn"]),
+      ) ?? parseProcessExecutable("proc", runProbe("ps", ["-o", "ucomm=", "-p", String(pid)]))
+    );
+  }
+  if (process.platform === "linux") {
+    try {
+      return parseProcessExecutable("proc", readlinkSync(`/proc/${pid}/exe`));
+    } catch {
+      return null;
+    }
+  }
+  if (process.platform === "win32") {
+    return parseProcessExecutable(
+      "powershell",
+      runProbe("powershell", ["-NoProfile", "-Command", `(Get-Process -Id ${pid}).Path`]),
+    );
+  }
+  return null;
 }
 
 function readLaunchMarker(home: string): { pid?: unknown; startedAt?: unknown } | null {
@@ -169,7 +198,11 @@ function readLaunchMarker(home: string): { pid?: unknown; startedAt?: unknown } 
   }
 }
 
-async function resolveDaemonOwner(): Promise<{ owner: DaemonOwner; lock: DaemonLockInfo | null }> {
+async function resolveDaemonOwner(): Promise<{
+  owner: DaemonOwner;
+  lock: DaemonLockInfo | null;
+  executable: string | null;
+}> {
   const home = resolvePaseoHome(process.env);
   let lock: DaemonLockInfo | null = null;
   try {
@@ -177,18 +210,20 @@ async function resolveDaemonOwner(): Promise<{ owner: DaemonOwner; lock: DaemonL
   } catch (error) {
     log.error("[orchestra] could not read the daemon pid lock", error);
   }
+  const executable = lock ? processExecutable(lock.pid) : null;
   const owner = classifyDaemonOwner({
     spawnedByThisApp: wasDaemonSpawnedByThisApp(),
     lock,
     marker: readLaunchMarker(home),
-    command: lock ? processCommand(lock.pid) : null,
+    executable,
   });
-  return { owner, lock };
+  return { owner, lock, executable };
 }
 
 /** Stops the daemon Orchestra launched (this process or an earlier one) and starts one
- * that reads the seeded config. Returns the new listen address, or null on failure. */
-async function restartOrchestraDaemon(
+ * that reads the seeded config. Returns the new listen address, or null on failure. A
+ * foreign daemon is never stopped: null. */
+export async function restartOrchestraDaemon(
   owner: DaemonOwner,
   lock: DaemonLockInfo | null,
 ): Promise<string | null> {
@@ -201,14 +236,14 @@ async function restartOrchestraDaemon(
       return null;
     }
     const status = await startDaemon();
-    log.info("[orchestra] engine restarted to load the bundled plugin", {
+    log.info("[orchestra] engine restarted to load the seeded config", {
       status: status.status,
       listen: status.listen,
       pid: status.pid,
     });
     return status.listen;
   } catch (error) {
-    log.error("[orchestra] engine restart for the bundled plugin failed", error);
+    log.error("[orchestra] engine restart failed", error);
     return null;
   }
 }
@@ -250,7 +285,7 @@ export async function verifyOrchestraDaemonSeed(input: {
   // Only a plugin the daemon reports is compared: a missing entry is the seed failure below.
   const pluginOutdated =
     loadedPath !== null && loadedPluginIsOutdated(loadedVersion, bundledVersion);
-  const { owner, lock } = await resolveDaemonOwner();
+  const { owner, lock, executable } = await resolveDaemonOwner();
   const alreadyRestarted = input.alreadyRestarted === true;
   const action = planDaemonSeedAction({
     corsOk,
@@ -269,6 +304,7 @@ export async function verifyOrchestraDaemonSeed(input: {
     bundledVersion,
     pluginOutdated,
     owner,
+    executable,
     restarted: alreadyRestarted,
   };
 
@@ -282,6 +318,7 @@ export async function verifyOrchestraDaemonSeed(input: {
       target,
       owner,
       pid: lock?.pid ?? null,
+      executable,
       loadedPath,
       loadedVersion,
       bundledVersion,
@@ -302,11 +339,13 @@ export async function verifyOrchestraDaemonSeed(input: {
     loadedVersion,
     bundledVersion,
     owner,
+    executable,
     alreadyRestarted,
   });
   input.warn({
     kind: pluginOutdated ? "plugin-outdated" : "seed",
     owner,
+    instance: lock,
     loadedVersion,
     bundledVersion,
   });

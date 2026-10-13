@@ -17,7 +17,9 @@ import {
   loadedPluginPath,
   loadedPluginIsOutdated,
   classifyDaemonOwner,
-  isOrchestraDaemonCommand,
+  daemonSeedWarningText,
+  isOrchestraExecutable,
+  parseProcessExecutable,
   planDaemonSeedAction,
   type PluginVersionProbe,
   type SeedOptions,
@@ -371,41 +373,46 @@ describe("loadedPluginPath / loadedPluginIsOutdated", () => {
 
 describe("classifyDaemonOwner", () => {
   const lock = { pid: 4242, startedAt: "2026-10-13T08:00:00.000Z", desktopManaged: true };
-  const ORCHESTRA_CMD =
-    "/Users/x/Downloads/Orchestra.app/Contents/Frameworks/Orchestra Helper.app/Contents/MacOS/Orchestra Helper --disable-warning=DEP0040 runner.js node-script entry.js";
-  const PASEO_CMD =
-    "/Applications/Paseo.app/Contents/Frameworks/Paseo Helper.app/Contents/MacOS/Paseo Helper --disable-warning=DEP0040 runner.js node-script entry.js";
+  const ORCHESTRA_EXE =
+    "/Users/x/Downloads/Orchestra.app/Contents/Frameworks/Orchestra Helper.app/Contents/MacOS/Orchestra Helper";
+  const PASEO_EXE =
+    "/Applications/Paseo.app/Contents/Frameworks/Paseo Helper.app/Contents/MacOS/Paseo Helper";
 
   it("this app's own launch wins", () => {
     expect(
-      classifyDaemonOwner({ spawnedByThisApp: true, lock: null, marker: null, command: null }),
+      classifyDaemonOwner({ spawnedByThisApp: true, lock: null, marker: null, executable: null }),
     ).toBe("this-app");
   });
 
-  it("an Orchestra launch is recognised by the marker or by an Orchestra bundle", () => {
+  it("an Orchestra launch is recognised by the marker or by an Orchestra executable", () => {
     expect(
       classifyDaemonOwner({
         spawnedByThisApp: false,
         lock,
         marker: { pid: lock.pid, startedAt: lock.startedAt },
-        command: PASEO_CMD,
+        executable: PASEO_EXE,
       }),
     ).toBe("orchestra");
     expect(
-      classifyDaemonOwner({ spawnedByThisApp: false, lock, marker: null, command: ORCHESTRA_CMD }),
+      classifyDaemonOwner({
+        spawnedByThisApp: false,
+        lock,
+        marker: null,
+        executable: ORCHESTRA_EXE,
+      }),
     ).toBe("orchestra");
   });
 
   it("a Paseo.app daemon, a hand-started one, or a stale marker is foreign", () => {
     expect(
-      classifyDaemonOwner({ spawnedByThisApp: false, lock, marker: null, command: PASEO_CMD }),
+      classifyDaemonOwner({ spawnedByThisApp: false, lock, marker: null, executable: PASEO_EXE }),
     ).toBe("foreign");
     expect(
       classifyDaemonOwner({
         spawnedByThisApp: false,
         lock,
         marker: { pid: lock.pid, startedAt: "2026-10-12T08:00:00.000Z" },
-        command: PASEO_CMD,
+        executable: PASEO_EXE,
       }),
     ).toBe("foreign");
     expect(
@@ -413,19 +420,87 @@ describe("classifyDaemonOwner", () => {
         spawnedByThisApp: false,
         lock: { ...lock, desktopManaged: false },
         marker: { pid: lock.pid, startedAt: lock.startedAt },
-        command: ORCHESTRA_CMD,
+        executable: ORCHESTRA_EXE,
       }),
     ).toBe("foreign");
     expect(
-      classifyDaemonOwner({ spawnedByThisApp: false, lock: null, marker: null, command: null }),
+      classifyDaemonOwner({ spawnedByThisApp: false, lock: null, marker: null, executable: null }),
     ).toBe("foreign");
   });
+});
 
-  it("matches any Orchestra bundle and nothing else", () => {
-    expect(isOrchestraDaemonCommand("/Applications/Orchestra 2.app/Contents/MacOS/x")).toBe(true);
-    expect(isOrchestraDaemonCommand(PASEO_CMD)).toBe(false);
-    expect(isOrchestraDaemonCommand("/usr/local/bin/node /x/orchestra/entry.js")).toBe(false);
-    expect(isOrchestraDaemonCommand(null)).toBe(false);
+// 2026-10-13 review: the supervisor sets process.title = "Paseo Supervisor", so `ps -o
+// command=` shows the title and never the Orchestra bundle. The owner is read from the
+// executable image; these pin the parsers of each platform's probe and the path rule.
+describe("parseProcessExecutable / isOrchestraExecutable", () => {
+  it("takes the first name field of lsof -Fn (macOS)", () => {
+    const out =
+      "p81466\nftxt\nn/Applications/Orchestra.app/Contents/Frameworks/Orchestra Helper.app/Contents/MacOS/Orchestra Helper\nftxt\nn/Applications/Orchestra.app/Contents/Frameworks/Squirrel.framework/Versions/A/Squirrel\n";
+    expect(parseProcessExecutable("lsof", out)).toBe(
+      "/Applications/Orchestra.app/Contents/Frameworks/Orchestra Helper.app/Contents/MacOS/Orchestra Helper",
+    );
+    expect(parseProcessExecutable("lsof", "p1\nftxt\n")).toBeNull();
+    expect(parseProcessExecutable("lsof", null)).toBeNull();
+  });
+
+  it("reads /proc/<pid>/exe, ps -o ucomm= and PowerShell's Path as they are", () => {
+    expect(parseProcessExecutable("proc", "/opt/Orchestra/orchestra")).toBe(
+      "/opt/Orchestra/orchestra",
+    );
+    expect(parseProcessExecutable("proc", "Orchestra Helper\n")).toBe("Orchestra Helper");
+    expect(
+      parseProcessExecutable(
+        "powershell",
+        "\r\nC:\\Users\\x\\AppData\\Local\\Programs\\Orchestra\\Orchestra.exe\r\n",
+      ),
+    ).toBe("C:\\Users\\x\\AppData\\Local\\Programs\\Orchestra\\Orchestra.exe");
+    expect(parseProcessExecutable("powershell", "  \r\n")).toBeNull();
+  });
+
+  it("recognises every Orchestra install, and nothing inside Paseo", () => {
+    for (const exe of [
+      "/Applications/Orchestra.app/Contents/Frameworks/Orchestra Helper.app/Contents/MacOS/Orchestra Helper",
+      "/Users/x/Downloads/Orchestra 2.app/Contents/MacOS/Orchestra",
+      "C:\\Users\\x\\AppData\\Local\\Programs\\Orchestra\\Orchestra.exe",
+      "D:\\Apps\\Orchestra.exe",
+      "/opt/Orchestra/orchestra",
+      "/usr/bin/orchestra",
+      "Orchestra Helper",
+      "Orchestra",
+    ]) {
+      expect(isOrchestraExecutable(exe), exe).toBe(true);
+    }
+    for (const exe of [
+      "Paseo Supervisor",
+      "/Applications/Paseo.app/Contents/Frameworks/Paseo Helper.app/Contents/MacOS/Paseo Helper",
+      "C:\\Users\\x\\AppData\\Local\\Programs\\Paseo\\Paseo.exe",
+      "/x/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron",
+      "/usr/local/bin/node",
+      null,
+    ]) {
+      expect(isOrchestraExecutable(exe), String(exe)).toBe(false);
+    }
+  });
+});
+
+describe("daemonSeedWarningText", () => {
+  const base = { loadedVersion: "0.3.0", bundledVersion: "0.11.0" };
+
+  it("offers a restart for any daemon an Orchestra launched, never for a foreign one", () => {
+    for (const owner of ["this-app", "orchestra"] as const) {
+      const text = daemonSeedWarningText({ ...base, kind: "plugin-outdated", owner });
+      expect(text.canRestart, owner).toBe(true);
+      expect(text.message).toBe("The engine is running an older Orchestra plugin");
+      expect(text.detail).toContain("Restarting it takes a few seconds.");
+      expect(text.detail).not.toContain("outside Orchestra");
+    }
+    const foreign = daemonSeedWarningText({ ...base, kind: "plugin-outdated", owner: "foreign" });
+    expect(foreign.canRestart).toBe(false);
+    expect(foreign.detail).toContain("started outside Orchestra");
+    expect(foreign.detail).toContain("v0.3.0");
+    expect(daemonSeedWarningText({ ...base, kind: "seed", owner: "orchestra" }).canRestart).toBe(
+      true,
+    );
   });
 });
 

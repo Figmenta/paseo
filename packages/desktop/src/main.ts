@@ -100,6 +100,7 @@ import {
 } from "./daemon/quit-lifecycle.js";
 import { runDesktopStartup } from "./desktop-startup.js";
 import {
+  daemonSeedWarningText,
   isAllowedNavigation,
   ORCHESTRA_COPYRIGHT,
   isOrchestraOrigin,
@@ -110,6 +111,7 @@ import {
   titleBarInset,
 } from "./figmenta/orchestra.js";
 import {
+  restartOrchestraDaemon,
   seedOrchestraDaemonConfig,
   verifyOrchestraDaemonSeed,
   type DaemonSeedWarning,
@@ -1055,34 +1057,10 @@ async function startOrchestraDaemon(): Promise<void> {
   });
 }
 
-function daemonSeedWarningText(
-  warning: DaemonSeedWarning,
-  ours: boolean,
-): {
-  message: string;
-  detail: string;
-} {
-  if (warning.kind === "plugin-outdated") {
-    const loaded = warning.loadedVersion ? `v${warning.loadedVersion}` : "an older version";
-    const bundled = warning.bundledVersion ? `v${warning.bundledVersion}` : "the current one";
-    return {
-      message: "The engine is running an older Orchestra plugin",
-      detail: ours
-        ? `The engine loaded the Orchestra plugin ${loaded}, but this app ships ${bundled}: Claude Code may not be signed in. Restarting the engine takes a few seconds.`
-        : `The engine running on this machine was started outside Orchestra (for example by the Paseo app) and loaded the Orchestra plugin ${loaded}; this app ships ${bundled}. Until it restarts, Claude Code may not be signed in. Quit Paseo (or the app that started the engine) and reopen Orchestra.`,
-    };
-  }
-  return {
-    message: "Engine needs a restart to load the Orchestra plugin",
-    detail: ours
-      ? "The engine is running with an older configuration. Restarting it takes a few seconds."
-      : "The engine running on this machine was started outside Orchestra, so Orchestra will not restart it. Quit it (or the app that owns it) and reopen Orchestra.",
-  };
-}
-
 function showDaemonSeedWarning(warning: DaemonSeedWarning): void {
-  const ours = wasDaemonSpawnedByThisApp();
-  const text = daemonSeedWarningText(warning, ours);
+  // The owner the check measured, not "did THIS process spawn it": a daemon an earlier
+  // Orchestra launched is ours to restart too (figmenta/orchestra.ts, classifyDaemonOwner).
+  const text = daemonSeedWarningText(warning);
   // Figmenta fork: the startup splash floats above every window; the warning goes first.
   dismissStartupSplash("engine warning");
   void dialog
@@ -1091,20 +1069,15 @@ function showDaemonSeedWarning(warning: DaemonSeedWarning): void {
       title: APP_NAME,
       message: text.message,
       detail: text.detail,
-      buttons: ours ? ["Restart engine", "Later"] : ["OK"],
+      buttons: text.canRestart ? ["Restart engine", "Later"] : ["OK"],
       defaultId: 0,
-      cancelId: ours ? 1 : 0,
+      cancelId: text.canRestart ? 1 : 0,
       noLink: true,
     })
     .then(async (result) => {
-      if (!ours || result.response !== 0) return undefined;
-      try {
-        await stopDesktopDaemonViaCli("quit");
-        await startDaemon();
-        log.info("[orchestra] engine restarted on request");
-      } catch (error) {
-        log.error("[orchestra] engine restart failed", error);
-      }
+      if (!text.canRestart || result.response !== 0) return undefined;
+      const listen = await restartOrchestraDaemon(warning.owner, warning.instance);
+      log.info("[orchestra] engine restart on request", { restarted: listen !== null, listen });
       return undefined;
     })
     .catch((error: unknown) => {

@@ -370,7 +370,7 @@ export function loadedPluginIsOutdated(
  *  - "this-app": this Orchestra process launched it;
  *  - "orchestra": a desktop-managed daemon an earlier Orchestra launched — the instance
  *    named in `orchestra-daemon.json` (written by every Orchestra launch since 1.3.16), or
- *    a supervisor running from an Orchestra app bundle (what earlier versions launched);
+ *    a supervisor whose executable is an Orchestra install (what earlier versions launched);
  *  - "foreign": anything else — a daemon started by hand, or by an installed Paseo.app
  *    for its own sessions. Never restarted by Orchestra.
  */
@@ -385,22 +385,57 @@ export interface DaemonLockInfo {
 /**
  * File in the Paseo home naming the daemon instance (`{ pid, startedAt }` of its pid lock)
  * that an Orchestra launched. The pid lock's `desktopManaged` says "a desktop app", not
- * which one: an Orchestra may launch an installed Paseo.app's runtime, whose command line
- * looks exactly like Paseo's own daemon.
+ * which one: an Orchestra may launch an installed Paseo.app's runtime, whose executable
+ * is exactly Paseo's own.
  */
 export const ORCHESTRA_DAEMON_MARKER_FILENAME = "orchestra-daemon.json";
 
-/** Does this process command line run from an Orchestra app bundle (any copy of it)? */
-export function isOrchestraDaemonCommand(command: string | null | undefined): boolean {
-  if (!command) return false;
-  return /\/Orchestra[^/]*\.app\/Contents\//.test(command);
+/**
+ * The executable of a process, from the platform probe's output. The supervisor renames
+ * itself (`process.title = "Paseo Supervisor"`), which rewrites what `ps -o command=` and
+ * Linux /proc/<pid>/cmdline show, so the owner is read from the executable image instead:
+ *  - "lsof": `lsof -a -p <pid> -d txt -Fn` (macOS) — the first `n` field is the executable;
+ *  - "proc": readlink of /proc/<pid>/exe (Linux), or `ps -o ucomm=` (macOS fallback, the
+ *    executable's own name) — the output as is;
+ *  - "powershell": `(Get-Process -Id <pid>).Path` (Windows).
+ */
+export function parseProcessExecutable(
+  format: "lsof" | "proc" | "powershell",
+  output: string | null | undefined,
+): string | null {
+  if (!output) return null;
+  const lines = output.split(/\r?\n/).map((line) => line.trim());
+  if (format === "lsof") {
+    const name = lines.find((line) => line.startsWith("n") && line.length > 1);
+    return name ? name.slice(1) : null;
+  }
+  return lines.find((line) => line.length > 0) ?? null;
+}
+
+const ORCHESTRA_EXECUTABLE_NAMES = new Set(["orchestra", "orchestra.exe", "orchestra helper"]);
+
+/**
+ * Is this executable an Orchestra install (any copy of it)? macOS: anything inside an
+ * `Orchestra*.app/Contents/` bundle (the Helper the daemon runs on included); Windows:
+ * `Orchestra.exe` or the per-user install folder `\Programs\Orchestra\`; Linux:
+ * `/opt/Orchestra/` or an executable named `orchestra`. A bare name (the `ps -o ucomm=`
+ * fallback) counts by name. Anything inside Paseo.app is not Orchestra.
+ */
+export function isOrchestraExecutable(executable: string | null | undefined): boolean {
+  if (!executable) return false;
+  const normalized = executable.replace(/\\/g, "/");
+  if (/\/Orchestra[^/]*\.app\/Contents\//.test(normalized)) return true;
+  const lower = normalized.toLowerCase();
+  if (lower.includes("/programs/orchestra/") || lower.startsWith("/opt/orchestra/")) return true;
+  const base = lower.slice(lower.lastIndexOf("/") + 1);
+  return ORCHESTRA_EXECUTABLE_NAMES.has(base);
 }
 
 export function classifyDaemonOwner(input: {
   spawnedByThisApp: boolean;
   lock: DaemonLockInfo | null;
   marker: { pid?: unknown; startedAt?: unknown } | null;
-  command: string | null;
+  executable: string | null;
 }): DaemonOwner {
   if (input.spawnedByThisApp) return "this-app";
   const lock = input.lock;
@@ -408,7 +443,7 @@ export function classifyDaemonOwner(input: {
   if (input.marker && input.marker.pid === lock.pid && input.marker.startedAt === lock.startedAt) {
     return "orchestra";
   }
-  return isOrchestraDaemonCommand(input.command) ? "orchestra" : "foreign";
+  return isOrchestraExecutable(input.executable) ? "orchestra" : "foreign";
 }
 
 export type DaemonSeedAction = "ok" | "restart" | "warn";
@@ -430,4 +465,36 @@ export function planDaemonSeedAction(input: {
     return "restart";
   }
   return "warn";
+}
+
+/**
+ * The dialog for a check that still fails. Whether it offers "Restart engine" follows the
+ * measured owner: a daemon an Orchestra launched (this process or an earlier one) can be
+ * restarted from the dialog; a foreign one cannot, and the text says what to do instead.
+ */
+export function daemonSeedWarningText(warning: {
+  kind: "seed" | "plugin-outdated";
+  owner: DaemonOwner;
+  loadedVersion: string | null;
+  bundledVersion: string | null;
+}): { message: string; detail: string; canRestart: boolean } {
+  const canRestart = warning.owner !== "foreign";
+  if (warning.kind === "plugin-outdated") {
+    const loaded = warning.loadedVersion ? `v${warning.loadedVersion}` : "an older version";
+    const bundled = warning.bundledVersion ? `v${warning.bundledVersion}` : "the current one";
+    return {
+      message: "The engine is running an older Orchestra plugin",
+      detail: canRestart
+        ? `The engine loaded the Orchestra plugin ${loaded}, but this app ships ${bundled}: Claude Code may not be signed in. Restarting it takes a few seconds.`
+        : `The engine running on this machine was started outside Orchestra (for example by the Paseo app) and loaded the Orchestra plugin ${loaded}; this app ships ${bundled}. Until it restarts, Claude Code may not be signed in. Quit Paseo (or the app that started the engine) and reopen Orchestra.`,
+      canRestart,
+    };
+  }
+  return {
+    message: "Engine needs a restart to load the Orchestra plugin",
+    detail: canRestart
+      ? "The engine is running with an older configuration. Restarting it takes a few seconds."
+      : "The engine running on this machine was started outside Orchestra, so Orchestra will not restart it. Quit it (or the app that owns it) and reopen Orchestra.",
+    canRestart,
+  };
 }

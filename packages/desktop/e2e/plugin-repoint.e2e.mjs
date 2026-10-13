@@ -4,7 +4,9 @@
 // free port (never 6767), with no window and no dialog (the warning is recorded):
 //   1. cold start: the seed repoints the entry, the daemon Orchestra launches loads it;
 //   2. a daemon an earlier Orchestra launched with the old plugin: restarted, once;
-//   3. a desktop-managed daemon Orchestra did not launch: warned about, never restarted.
+//   3. a desktop-managed daemon Orchestra did not launch: warned about, never restarted;
+//   4. (macOS) a daemon an Orchestra <= 1.3.15 left, with no launch marker: recognised from
+//      its executable inside an `Orchestra*.app/Contents/` bundle, and restarted.
 // Run with `npm run test:e2e:plugin-repoint` (builds dist first).
 import { once } from "node:events";
 import assert from "node:assert/strict";
@@ -14,6 +16,7 @@ import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import net from "node:net";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { _electron as electron, expect } from "playwright/test";
 import { savePersistedConfig } from "@getpaseo/server/configuration";
@@ -218,6 +221,49 @@ try {
   assert.equal(await configuredPath(), bundledPlugin);
   await closeDesktop();
   console.log("PASS 3: a daemon Orchestra did not launch is warned about and never restarted");
+  await stopAny();
+
+  // 4. A daemon an Orchestra <= 1.3.15 launched: no marker, and the supervisor retitles
+  // itself ("Paseo Supervisor"), so only its executable says it is Orchestra's. The old
+  // Orchestra is a clone of the Electron app renamed into an `Orchestra*.app` bundle.
+  if (process.platform === "darwin") {
+    writeStaleConfig();
+    await unlink(path.join(home, "orchestra-daemon.json")).catch(() => {});
+    const electronBinary = createRequire(import.meta.url)("electron");
+    const electronApp = electronBinary.slice(0, electronBinary.indexOf(".app/") + ".app".length);
+    const oldApp = path.join(root, "Orchestra 1.3.15.app");
+    execFileSync("cp", ["-cR", electronApp, oldApp]);
+    const oldBinary = path.join(oldApp, electronBinary.slice(electronApp.length + 1));
+    const old = await startDaemonInstance({
+      home,
+      command: oldBinary,
+      args: [path.join(repo, "packages/server/dist/scripts/supervisor-entrypoint.js")],
+      env: { ...env, ELECTRON_RUN_AS_NODE: "1" },
+      mode: "deployment",
+      desktopManaged: true,
+      timeoutMs: 30_000,
+    });
+    const title = execFileSync("ps", ["-o", "command=", "-p", String(old.instance.pid)], {
+      encoding: "utf8",
+    }).trim();
+    console.log(`4. ps -o command= -> ${JSON.stringify(title)}`);
+    assert.equal(show("4. before", pluginLs()).version, "0.3.0");
+    await openDesktop();
+    const legacy = await orchestraBoot();
+    console.log("4. check:", JSON.stringify(legacy.check));
+    assert.notEqual((await readDaemonInstance(home)).pid, old.instance.pid);
+    assert.equal(legacy.check.action, "ok");
+    assert.equal(legacy.check.restarted, true);
+    assert.equal(legacy.warnings.length, 0);
+    assert.equal(show("4. after", pluginLs()).version, bundledVersion);
+    await desktop.evaluate(() => global.manager.stopDesktopDaemon("quit"));
+    await closeDesktop();
+    console.log(
+      "PASS 4: a marker-less daemon from an Orchestra bundle is recognised and restarted",
+    );
+  } else {
+    console.log("SKIP 4: the Orchestra-bundle executable case is macOS-only");
+  }
 
   // The app log of the three boots: the repoint and the restart, as main.ts would log them.
   const logs = execFileSync("find", [root, "-name", "*.log", "-path", "*Logs*"], {
@@ -239,6 +285,17 @@ try {
         entry.includes("loadedVersion: '0.3.0'"),
     ),
   );
+  if (process.platform === "darwin") {
+    assert.ok(
+      logs.some(
+        (entry) =>
+          entry.includes("older Orchestra plugin, restarting") &&
+          entry.includes("owner: 'orchestra'") &&
+          entry.includes("Orchestra 1.3.15.app/Contents/"),
+      ),
+      "case 4 was not classified from its executable",
+    );
+  }
 } finally {
   await closeDesktop().catch(() => {});
   await stopAny().catch((error) => console.error("cleanup: could not stop the daemon", error));
