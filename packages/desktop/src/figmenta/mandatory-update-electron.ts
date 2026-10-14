@@ -1,6 +1,7 @@
 import path from "node:path";
 import {
   app,
+  autoUpdater as electronAutoUpdater,
   BrowserWindow,
   dialog,
   ipcMain,
@@ -19,6 +20,7 @@ import {
   type MandatoryUpdateView,
 } from "./mandatory-update.js";
 import { ElectronUpdaterRuntime } from "./mandatory-update-runtime.js";
+import { startMacInstallProgress } from "./install-progress-mac.js";
 import { updateOverlayPageUrl } from "./update-overlay-page.js";
 import {
   isStartupSplashWindow,
@@ -266,6 +268,24 @@ export function startMandatoryUpdater(options: { beforeInstall: () => Promise<vo
     clearInterval: (handle) => clearInterval(handle as NodeJS.Timeout),
   });
   controller = updater;
+
+  // macOS: Squirrel's ShipIt swaps the bundle after Orchestra has quit and shows nothing;
+  // a detached panel covers the gap (install-progress-mac.ts). Only for the install the
+  // user started here, once. Windows shows the installer's own progress window (NSIS,
+  // build/installer.nsh).
+  if (process.platform === "darwin") {
+    let progressShown = false;
+    electronAutoUpdater.on("before-quit-for-update", () => {
+      const state = updater.getState();
+      if (progressShown || state.phase !== "installing") return;
+      progressShown = true;
+      startMacInstallProgress({
+        version: state.version,
+        executablePath: app.getPath("exe"),
+        log: logUpdate,
+      });
+    });
+  }
 
   ipcMain.handle("orchestra-update:get-state", (event) =>
     view.isOverlay(event.sender) ? view.getState() : null,
