@@ -20,7 +20,7 @@ import {
   type MandatoryUpdateView,
 } from "./mandatory-update.js";
 import { ElectronUpdaterRuntime } from "./mandatory-update-runtime.js";
-import { startMacInstallProgress } from "./install-progress-mac.js";
+import { INSTALL_PROGRESS_QUIT_SECONDS, startMacInstallProgress } from "./install-progress-mac.js";
 import { updateOverlayPageUrl } from "./update-overlay-page.js";
 import {
   isStartupSplashWindow,
@@ -274,11 +274,14 @@ export function startMandatoryUpdater(options: { beforeInstall: () => Promise<vo
   // user started here, once. Windows shows the installer's own progress window (NSIS,
   // build/installer.nsh).
   if (process.platform === "darwin") {
-    let progressShown = false;
+    // The event can arrive twice for one install (measured on 1.3.15): one panel per
+    // attempt, and a later attempt (after a failed relaunch) gets its own.
+    let progressShownAt = 0;
     electronAutoUpdater.on("before-quit-for-update", () => {
       const state = updater.getState();
-      if (progressShown || state.phase !== "installing") return;
-      progressShown = true;
+      if (state.phase !== "installing") return;
+      if (Date.now() - progressShownAt < INSTALL_PROGRESS_QUIT_SECONDS * 1000) return;
+      progressShownAt = Date.now();
       startMacInstallProgress({
         version: state.version,
         executablePath: app.getPath("exe"),

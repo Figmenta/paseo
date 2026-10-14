@@ -80,4 +80,9 @@ describe("ElectronUpdaterRuntime", () => {
     runtime.install("1.0.3");
     expect(fake.quitAndInstall).toHaveBeenCalledWith(false, true);
   });
+
+  it("keeps autoRunAppAfterInstall on: it is what passes --force-run to a non-silent install", () => {
+    const { fake } = runtimeFor("1.0.3", "1.0.2");
+    expect(fake.autoRunAppAfterInstall).toBe(true);
+  });
 });

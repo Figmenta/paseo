@@ -8,15 +8,15 @@ import path from "node:path";
 // of Orchestra itself: Orchestra has quit, and ShipIt refuses to install while an instance
 // of the target app is running. So it is a JavaScript-for-Automation script run by the
 // system's /usr/bin/osascript, detached from Orchestra. It closes when Orchestra is running
-// again from the same bundle path, when Orchestra never quits (no install happened), or
-// after a hard limit.
+// again from the same bundle path, or when Orchestra never quits (no install happened). If
+// Orchestra has not come back by the hard limit, it says so before closing.
 
 export const OSASCRIPT_PATH = "/usr/bin/osascript";
 
 /** Whole seconds the panel may stay up whatever happens. */
 export const INSTALL_PROGRESS_MAX_SECONDS = 120;
 /** Seconds to wait for the old Orchestra to quit before deciding no install is happening. */
-export const INSTALL_PROGRESS_QUIT_SECONDS = 60;
+export const INSTALL_PROGRESS_QUIT_SECONDS = 30;
 
 // argv: version, bundle path, max seconds, quit seconds, [png snapshot path, tests only].
 // Numbers are plain literals: JXA does not expose every Cocoa enum.
@@ -26,7 +26,7 @@ function run(argv) {
   var version = argv[0] || "";
   var bundlePath = String(argv[1] || "").replace(/\/+$/, "");
   var maxSeconds = Number(argv[2]) || 120;
-  var quitSeconds = Number(argv[3]) || 60;
+  var quitSeconds = Number(argv[3]) || 30;
   var snapshotPath = argv[4] || "";
 
   var app = $.NSApplication.sharedApplication;
@@ -48,10 +48,11 @@ function run(argv) {
     field.setFont(bold ? $.NSFont.boldSystemFontOfSize(size) : $.NSFont.systemFontOfSize(size));
     field.setFrame($.NSMakeRect(24, y, width - 48, size + 6));
     content.addSubview(field);
+    return field;
   }
-  label("Updating Orchestra", height - 42, 15, true);
-  label("Orchestra " + version + " is being installed.", height - 66, 13, false);
-  label("It will reopen by itself, this takes up to a minute.", height - 86, 13, false);
+  var title = label("Updating Orchestra", height - 42, 15, true);
+  var line1 = label("Orchestra " + version + " is being installed.", height - 66, 13, false);
+  var line2 = label("It will reopen by itself, this takes up to a minute.", height - 86, 13, false);
 
   var bar = $.NSProgressIndicator.alloc.initWithFrame($.NSMakeRect(24, 18, width - 48, 12));
   bar.setStyle(0); // bar
@@ -86,6 +87,7 @@ function run(argv) {
 
   var started = Date.now();
   var quitAt = null;
+  var back = false;
   var snapshotDone = false;
   while ((Date.now() - started) / 1000 < maxSeconds) {
     pump(0.25);
@@ -101,9 +103,19 @@ function run(argv) {
       if (!running) quitAt = Date.now();
       else if ((Date.now() - started) / 1000 > quitSeconds) break;
     } else if (running) {
+      back = true;
       pump(1.5); // the new Orchestra puts up its splash
       break;
     }
+  }
+  if (quitAt !== null && !back) {
+    // Orchestra quit but did not come back: say what to do instead of vanishing.
+    bar.stopAnimation(null);
+    bar.setHidden(true);
+    title.setStringValue("Orchestra did not reopen");
+    line1.setStringValue("Open Orchestra again from the Applications folder.");
+    line2.setStringValue("");
+    pump(20);
   }
   panel.orderOut(null);
   return "";
