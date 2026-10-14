@@ -78,9 +78,13 @@ export class ElectronUpdaterRuntime implements MandatoryUpdateRuntime {
   }
 
   install(_version: string): void {
-    // Silent (/S) and relaunch (--force-run) on Windows: the one-click NSIS installer
-    // restarts Orchestra itself (electron-builder.yml, nsis.oneClick). macOS ignores both
-    // flags and relaunches through Squirrel.
-    this.updater.quitAndInstall(true, true);
+    // Windows: NOT silent, so the one-click NSIS installer shows its progress window while
+    // it installs (silent left the screen empty for ~30 s and users thought Orchestra was
+    // broken). With isSilent false electron-updater ignores the second argument and passes
+    // --force-run from autoRunAppAfterInstall (set above, and tested): that is what makes
+    // the installer reopen Orchestra (electron-builder.yml, nsis.oneClick + runAfterFinish).
+    // macOS ignores both and relaunches through Squirrel; its progress panel is
+    // install-progress-mac.ts.
+    this.updater.quitAndInstall(false, true);
   }
 }

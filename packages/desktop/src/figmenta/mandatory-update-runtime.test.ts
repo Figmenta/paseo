@@ -75,9 +75,14 @@ describe("ElectronUpdaterRuntime", () => {
     await expect(runtime.check()).resolves.toBeNull();
   });
 
-  it("installs silently and asks the installer to relaunch Orchestra", () => {
+  it("installs with the installer's progress window and asks it to relaunch Orchestra", () => {
     const { fake, runtime } = runtimeFor("1.0.3", "1.0.2");
     runtime.install("1.0.3");
-    expect(fake.quitAndInstall).toHaveBeenCalledWith(true, true);
+    expect(fake.quitAndInstall).toHaveBeenCalledWith(false, true);
+  });
+
+  it("keeps autoRunAppAfterInstall on: it is what passes --force-run to a non-silent install", () => {
+    const { fake } = runtimeFor("1.0.3", "1.0.2");
+    expect(fake.autoRunAppAfterInstall).toBe(true);
   });
 });
