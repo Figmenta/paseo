@@ -99,6 +99,46 @@ export function fleetBaseEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return base;
 }
 
+/** What fd 0 of this process is, as far as the child's stdin goes. */
+export type StdinKind = "tty" | "pipe" | "file" | "none";
+
+export interface StdinStat {
+  isFIFO(): boolean;
+  isFile(): boolean;
+  isCharacterDevice(): boolean;
+}
+
+/** fd 0 from isatty(0) and fstat(0) (null when fstat fails). */
+export function classifyStdin(isTty: boolean, stat: StdinStat | null): StdinKind {
+  if (isTty) return "tty";
+  if (stat === null) return "none";
+  if (stat.isFIFO()) return "pipe";
+  if (stat.isFile()) return "file";
+  // A character device that is not a terminal: the NUL device Windows gives a GUI program in
+  // place of the console's input (measured in a console, Orchestra 1.3.17).
+  if (stat.isCharacterDevice()) return "none";
+  // Anything else is a redirect: on Windows isFIFO() is false for a pipe (mode 010000, measured).
+  return "pipe";
+}
+
+/**
+ * Windows: the child gets the console's own input (CONIN$) instead of fd 0. This CLI runs
+ * inside Orchestra.exe, a GUI program: Electron routes stdout and stderr to the terminal's
+ * console but never stdin (Chromium's RouteStdioToConsole), so fd 0 holds no handle, and Claude
+ * Code, which cannot fall back to the console on Windows, refuses to start ("stdin is not a
+ * terminal"). A pipe or a file on fd 0 is the person's own redirect and is kept. Only when the
+ * output goes to the console too ([false, true, true] measured): an automation that ignores
+ * stdin and captures the output keeps failing fast instead of waiting on the keyboard. A bare
+ * `< NUL` with the output on the console cannot be told apart, and gets the console.
+ */
+export function needsConsoleInput(
+  platform: NodeJS.Platform,
+  stdin: StdinKind,
+  outputOnConsole: boolean,
+): boolean {
+  return platform === "win32" && stdin === "none" && outputOnConsole;
+}
+
 /** cmd.exe runs a .cmd/.bat: an argument with a line break cannot reach it intact. */
 function isWindowsBatch(claude: string, platform: NodeJS.Platform): boolean {
   return platform === "win32" && /\.(cmd|bat)$/i.test(claude);

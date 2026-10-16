@@ -1,23 +1,72 @@
 import { spawn } from "node:child_process";
-import { accessSync, constants as fsConstants, realpathSync, statSync } from "node:fs";
+import {
+  accessSync,
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  openSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
+import { isatty } from "node:tty";
 import { Command } from "commander";
 import { connectToDaemon } from "../../utils/client.js";
 import { selectDaemonTarget } from "../../utils/daemon-target.js";
 import {
+  classifyStdin,
+  needsConsoleInput,
   runMaestroClaude,
   withoutLauncherEnv,
   type ChildHandle,
   type MaestroClaudeDeps,
   type SpawnRequest,
+  type StdinKind,
+  type StdinStat,
 } from "./maestro-claude.js";
 
+function stdinKind(): StdinKind {
+  let stat: StdinStat | null = null;
+  try {
+    stat = fstatSync(0);
+  } catch {
+    // no handle behind fd 0
+  }
+  return classifyStdin(isatty(0), stat);
+}
+
+// Node opens the console's input by its device path; a bare "CONIN$" is ENOENT (measured).
+const CONSOLE_INPUT = "\\\\.\\CONIN$";
+
+/** The console's input for the child (see needsConsoleInput), or null to inherit fd 0. */
+function openConsoleInput(): number | null {
+  if (!needsConsoleInput(process.platform, stdinKind(), isatty(1) || isatty(2))) return null;
+  try {
+    return openSync(CONSOLE_INPUT, "r+");
+  } catch {
+    return null;
+  }
+}
+
 function spawnChild(request: SpawnRequest): ChildHandle {
-  const child = spawn(request.command, request.args, {
-    env: request.env,
-    shell: false,
-    stdio: "inherit",
-    windowsVerbatimArguments: request.windowsVerbatimArguments,
-  });
+  const consoleInput = openConsoleInput();
+  let child: ReturnType<typeof spawn>;
+  try {
+    child = spawn(request.command, request.args, {
+      env: request.env,
+      shell: false,
+      stdio: [consoleInput ?? "inherit", "inherit", "inherit"],
+      windowsVerbatimArguments: request.windowsVerbatimArguments,
+    });
+  } finally {
+    // The child has its own copy of the handle once spawn returns.
+    if (consoleInput !== null) {
+      try {
+        closeSync(consoleInput);
+      } catch {
+        // a leaked handle is better than reporting a running claude as not started
+      }
+    }
+  }
   return {
     kill: (signal) => {
       child.kill(signal);
