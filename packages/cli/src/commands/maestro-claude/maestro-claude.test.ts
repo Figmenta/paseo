@@ -3,7 +3,9 @@ import {
   GOVERNED_FLAGS,
   MESSAGES,
   buildSpawnRequest,
+  classifyStdin,
   findGovernedFlag,
+  needsConsoleInput,
   resolveClaudeExecutable,
   runMaestroClaude,
   withoutLauncherEnv,
@@ -744,5 +746,45 @@ describe("createMaestroClaudeDeps: the launcher's env never reaches claude", () 
     expect(spawns).toHaveLength(1);
     for (const key of LAUNCHER_KEYS) expect(spawns[0]!.env).not.toHaveProperty(key);
     expect(process.env).toEqual(processEnvBefore);
+  });
+});
+
+describe("needsConsoleInput: Windows stdin through Orchestra.exe", () => {
+  it("gives the console's input on Windows when fd 0 holds no handle and the output is the console", () => {
+    expect(needsConsoleInput("win32", "none", true)).toBe(true);
+    expect(needsConsoleInput("win32", "tty", true)).toBe(false);
+    // A person's own redirect: `type notes.md | claude -p`, `claude -p < prompt.txt`.
+    expect(needsConsoleInput("win32", "pipe", true)).toBe(false);
+    expect(needsConsoleInput("win32", "file", true)).toBe(false);
+    // An automation that ignores stdin and captures the output keeps failing fast.
+    expect(needsConsoleInput("win32", "none", false)).toBe(false);
+    // macOS and Linux: Claude Code falls back to /dev/tty by itself.
+    expect(needsConsoleInput("darwin", "none", true)).toBe(false);
+    expect(needsConsoleInput("linux", "none", true)).toBe(false);
+  });
+});
+
+describe("classifyStdin", () => {
+  const stat = (kind: "fifo" | "file" | "char" | "other") => ({
+    isFIFO: () => kind === "fifo",
+    isFile: () => kind === "file",
+    isCharacterDevice: () => kind === "char",
+  });
+
+  it("a terminal is a terminal, whatever fstat says", () => {
+    expect(classifyStdin(true, stat("char"))).toBe("tty");
+  });
+
+  it("no handle, or a character device that is not a terminal, is no stdin", () => {
+    expect(classifyStdin(false, null)).toBe("none");
+    // What Orchestra.exe gets in place of the console's input (measured on Windows).
+    expect(classifyStdin(false, stat("char"))).toBe("none");
+  });
+
+  it("a pipe or a file is the person's redirect", () => {
+    expect(classifyStdin(false, stat("fifo"))).toBe("pipe");
+    expect(classifyStdin(false, stat("file"))).toBe("file");
+    // On Windows isFIFO() is false for a pipe into Orchestra.exe (measured).
+    expect(classifyStdin(false, stat("other"))).toBe("pipe");
   });
 });
