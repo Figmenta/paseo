@@ -98,6 +98,7 @@ import {
   type WorkspaceFileOpenRequest,
 } from "@/workspace/file-open";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
+import { buildEmbedFileClick, isEmbedMode, postToEmbedParent } from "@/figmenta/embed"; // Figmenta: file paths go to Orchestra
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { useForkAgent } from "@/hooks/use-fork-agent";
 import { isWeb } from "@/constants/platform";
@@ -496,6 +497,21 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       },
     );
 
+    // Figmenta: in the Orchestra frame a file path of a message goes to the page (Finder, or a
+    // copy), no file tab; folders and tool calls keep Paseo's own handling.
+    const handleMessagePathPress = useStableEvent(
+      (target: InlinePathTarget, disposition: OpenFileDisposition) => {
+        if (isEmbedMode()) {
+          const normalized = normalizeInlinePathTarget(target.path, context.cwd);
+          if (normalized?.file !== undefined || normalized === null) {
+            postToEmbedParent(buildEmbedFileClick(target, workspaceRoot));
+            return;
+          }
+        }
+        handleInlinePathPress(target, disposition);
+      },
+    );
+
     const handleToolCallOpenFile = useStableEvent((filePath: string) => {
       handleInlinePathPress({ raw: filePath, path: filePath }, "preferred");
     });
@@ -719,7 +735,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
             client={client}
             serverId={resolvedServerId}
             workspaceRoot={workspaceRoot}
-            onOpenWorkspaceFile={handleInlinePathPress}
+            onOpenWorkspaceFile={handleMessagePathPress}
             toast={toast}
           >
             <ChatFindExpansion messageId={getStreamItemMessageId(item)}>
@@ -740,7 +756,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
           </AssistantFileLinkResolverProvider>
         );
       },
-      [agentId, client, handleInlinePathPress, resolvedServerId, toast, workspaceRoot],
+      [agentId, client, handleMessagePathPress, resolvedServerId, toast, workspaceRoot],
     );
 
     const renderThoughtItem = useCallback(

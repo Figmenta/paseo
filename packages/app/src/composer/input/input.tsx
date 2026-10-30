@@ -52,6 +52,7 @@ import { getShortcutOs } from "@/utils/shortcut-platform";
 import type { MessageInputKeyboardActionKind } from "@/keyboard/actions";
 import { isImeComposingKeyboardEvent } from "@/utils/keyboard-ime";
 import { isWeb } from "@/constants/platform";
+import { embedEnterSends } from "@/figmenta/embed";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { useComposerKeyboardScope } from "@/composer/keyboard-scope";
 import { RenderProfile } from "@/utils/render-profiler";
@@ -1139,6 +1140,13 @@ function extractErrorMessage(error: unknown): string | null {
   return null;
 }
 
+// Figmenta: in the Orchestra frame Enter sends at any width (the Live column is under `md`),
+// touch screens excepted. Out here because one more branch inside MessageInput passes oxlint's
+// complexity cap.
+function submitsOnEnter(isCompact: boolean): boolean {
+  return isWeb && (!isCompact || embedEnterSends());
+}
+
 export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
   function MessageInput(props, ref) {
     const {
@@ -1594,7 +1602,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
     );
 
     const shouldHandleWebKeyPress = isWeb;
-    const shouldSubmitOnEnter = isWeb && !isCompact;
+    const shouldSubmitOnEnter = submitsOnEnter(isCompact);
 
     function handleDesktopKeyPress(event: WebTextInputKeyPressEvent) {
       if (!shouldHandleWebKeyPress) return;

@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  buildEmbedFileClick,
   DEFAULT_COMPOSER_LOCK_LABEL,
+  embedEnterSends,
   EMBED_MODELS_ALLOW_DEFAULT_ID,
   EMBED_READY_TYPE,
   installEmbedBridge,
@@ -900,5 +902,354 @@ describe("maestro.models.allow modes and efforts", () => {
 
     expect(readEmbedModelsAllow("a1")?.modes).toEqual(["auto"]);
     expect(readEmbedModelsAllow("a1")?.efforts).toEqual(["low"]);
+  });
+});
+
+describe("frame events to the parent (contract notes-maestro §10.1)", () => {
+  const BRIDGE_FLAG = "__figmentaEmbedBridgeInstalled";
+  let parentPost: ReturnType<typeof vi.fn>;
+
+  function freshDocument(search: string): void {
+    delete (window as unknown as Record<string, unknown>)[BRIDGE_FLAG];
+    window.sessionStorage.clear();
+    setLocation(search);
+    resetEmbedModeCache();
+  }
+
+  function box(x: number, y: number, w: number, h: number): DOMRect {
+    return { x, y, left: x, top: y, width: w, height: h, right: x + w, bottom: y + h } as DOMRect;
+  }
+
+  function byId<T extends HTMLElement>(id: string): T {
+    const element = document.getElementById(id);
+    if (!element) throw new Error(`#${id} missing`);
+    return element as T;
+  }
+
+  /** What the page received: everything but the ready of the install. */
+  function posted(): unknown[] {
+    return parentPost.mock.calls.map((call) => call[0]);
+  }
+
+  /** Seen at the end of the bubble, then cancelled: jsdom cannot follow a link. */
+  let seenPrevented: boolean | undefined;
+  function stopNavigation(event: Event): void {
+    seenPrevented = event.defaultPrevented;
+    event.preventDefault();
+  }
+
+  function mouse(type: "click" | "contextmenu", target: Element, init: MouseEventInit = {}) {
+    const event = new MouseEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      clientX: 40,
+      clientY: 12,
+      button: type === "contextmenu" ? 2 : 0,
+      ...init,
+    });
+    seenPrevented = undefined;
+    target.dispatchEvent(event);
+    return { defaultPrevented: seenPrevented ?? event.defaultPrevented };
+  }
+
+  function escape(): KeyboardEvent {
+    const event = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    (document.activeElement ?? document.body).dispatchEvent(event);
+    return event;
+  }
+
+  beforeEach(() => {
+    // Shaped like the fork's DOM: assistant-file-links/link.tsx writes a `display: contents`
+    // <a href> around the Pressable; message.tsx tags the assistant message by testID.
+    document.body.innerHTML = `
+      <div data-testid="assistant-message">
+        <div>See <a id="web" href="https://example.com/doc" title="Doc" style="display: contents"><div id="web-press"><span id="web-text">  Example
+          doc </span></div></a>
+        and <a id="file" href="ROOT/notes/file.md"><div id="file-press">ROOT/notes/file.md</div></a>
+        and <a id="mail" href="mailto:a@b.c"><span id="mail-text">mail</span></a></div>
+      </div>
+      <div data-testid="user-message"><a href="https://example.com/user"><span id="user-text">user</span></a></div>
+      <textarea id="composer"></textarea>
+      <input id="search" />
+      <div id="editable" contenteditable="true" tabindex="0"><span id="inside-editable">x</span></div>
+      <div id="frozen" contenteditable="false" tabindex="0"></div>
+    `;
+    parentPost = vi.fn();
+    vi.spyOn(window, "parent", "get").mockReturnValue({
+      postMessage: parentPost,
+    } as unknown as Window);
+    vi.spyOn(byId("web-press"), "getBoundingClientRect").mockReturnValue(box(30, 5, 100, 18));
+    freshDocument("?embed=1");
+    installEmbedBridge();
+    parentPost.mockClear();
+    window.addEventListener("click", stopNavigation);
+  });
+
+  afterEach(() => {
+    window.removeEventListener("click", stopNavigation);
+    (document.activeElement as HTMLElement | null)?.blur?.();
+    document.body.innerHTML = "";
+    vi.restoreAllMocks();
+  });
+
+  it("a left click on an http link of an assistant message goes to the page, not to the link", () => {
+    const reachedLink = vi.fn();
+    byId("web-press").addEventListener("click", reachedLink);
+
+    const event = mouse("click", byId("web-text"));
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(reachedLink).not.toHaveBeenCalled();
+    expect(parentPost).toHaveBeenCalledTimes(1);
+    expect(parentPost).toHaveBeenCalledWith(
+      {
+        type: "maestro.link.click",
+        href: "https://example.com/doc",
+        text: "Example doc",
+        role: "assistant",
+        x: 40,
+        y: 12,
+        rect: { x: 30, y: 5, w: 100, h: 18 },
+      },
+      window.location.origin,
+    );
+  });
+
+  it("takes the link's own box when it has one", () => {
+    vi.spyOn(byId("web"), "getBoundingClientRect").mockReturnValue(box(1, 2, 3, 4));
+
+    mouse("click", byId("web-text"));
+
+    expect(posted()).toEqual([expect.objectContaining({ rect: { x: 1, y: 2, w: 3, h: 4 } })]);
+  });
+
+  it("a right click on the same link sends the contextmenu message, and no browser menu", () => {
+    const event = mouse("contextmenu", byId("web-text"), { clientX: 7, clientY: 9 });
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(posted()).toEqual([
+      {
+        type: "maestro.link.contextmenu",
+        href: "https://example.com/doc",
+        text: "Example doc",
+        role: "assistant",
+        x: 7,
+        y: 9,
+        rect: { x: 30, y: 5, w: 100, h: 18 },
+      },
+    ]);
+  });
+
+  it("file paths and other schemes pass untouched: view.tsx handles the paths", () => {
+    const reachedLink = vi.fn();
+    byId("file-press").addEventListener("click", reachedLink);
+
+    const fileClick = mouse("click", byId("file-press"));
+    const fileMenu = mouse("contextmenu", byId("file-press"));
+    const mailClick = mouse("click", byId("mail-text"));
+
+    expect(fileClick.defaultPrevented).toBe(false);
+    expect(fileMenu.defaultPrevented).toBe(false);
+    expect(mailClick.defaultPrevented).toBe(false);
+    expect(reachedLink).toHaveBeenCalledTimes(1);
+    expect(posted()).toEqual([]);
+  });
+
+  it("an http link outside an assistant message passes untouched", () => {
+    const event = mouse("click", byId("user-text"));
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(posted()).toEqual([]);
+  });
+
+  it("a pointerdown anywhere in the frame tells the page, and is not cancelled", () => {
+    const event = new Event("pointerdown", { bubbles: true, cancelable: true });
+    byId("user-text").dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(posted()).toEqual([{ type: "maestro.frame.pointerdown" }]);
+  });
+
+  it("Escape with no field focused goes to the page", () => {
+    escape();
+
+    expect(posted()).toEqual([{ type: "maestro.frame.escape" }]);
+  });
+
+  it("Escape in a textarea, an input or a contenteditable stays in the field", () => {
+    for (const id of ["composer", "search", "editable"]) {
+      byId(id).focus();
+      expect(document.activeElement?.id).toBe(id);
+      escape();
+    }
+
+    expect(posted()).toEqual([]);
+  });
+
+  it('contenteditable="false" is not a field', () => {
+    byId("frozen").focus();
+    escape();
+
+    expect(posted()).toEqual([{ type: "maestro.frame.escape" }]);
+  });
+
+  it("Escape already handled in the frame stays there", () => {
+    byId("user-text").addEventListener("keydown", (event) => event.preventDefault(), { once: true });
+    byId("user-text").dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    );
+
+    expect(posted()).toEqual([]);
+  });
+
+  it("Escape with a modal of the frame open stays in the frame", () => {
+    const modal = document.createElement("div");
+    modal.setAttribute("aria-modal", "true");
+    document.body.appendChild(modal);
+    escape();
+    modal.remove();
+    escape();
+
+    expect(posted()).toEqual([{ type: "maestro.frame.escape" }]);
+  });
+
+  it("other keys send nothing", () => {
+    document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+
+    expect(posted()).toEqual([]);
+  });
+
+  it("a second install in a new document does not double the messages", () => {
+    freshDocument("?embed=1");
+    installEmbedBridge();
+    parentPost.mockClear();
+
+    mouse("click", byId("web-text"));
+    escape();
+
+    expect(posted().map((m) => (m as { type: string }).type)).toEqual([
+      "maestro.link.click",
+      "maestro.frame.escape",
+    ]);
+  });
+
+  it("outside the embed nothing is intercepted and nothing is sent", () => {
+    freshDocument("");
+
+    const click = mouse("click", byId("web-text"));
+    const menu = mouse("contextmenu", byId("web-text"));
+    byId("user-text").dispatchEvent(new Event("pointerdown", { bubbles: true }));
+    escape();
+
+    expect(click.defaultPrevented).toBe(false);
+    expect(menu.defaultPrevented).toBe(false);
+    expect(posted()).toEqual([]);
+  });
+});
+
+describe("buildEmbedFileClick", () => {
+  const root = "/Users/fhg/vault";
+
+  it("keeps the absolute path Paseo resolved and gives it relative to the root", () => {
+    expect(
+      buildEmbedFileClick({ raw: "ROOT/a/b.md", path: "/Users/fhg/vault/ROOT/a/b.md" }, root),
+    ).toEqual({
+      type: "maestro.file.click",
+      path: "/Users/fhg/vault/ROOT/a/b.md",
+      rel: "ROOT/a/b.md",
+      raw: "ROOT/a/b.md",
+    });
+  });
+
+  it("reads a root with trailing slashes the same", () => {
+    expect(buildEmbedFileClick({ raw: "x", path: "/Users/fhg/vault/x.md" }, `${root}//`).rel).toBe(
+      "x.md",
+    );
+  });
+
+  it("an absolute path outside the root has no rel", () => {
+    expect(buildEmbedFileClick({ raw: "/etc/hosts", path: "/etc/hosts" }, root)).toEqual({
+      type: "maestro.file.click",
+      path: "/etc/hosts",
+      rel: null,
+      raw: "/etc/hosts",
+    });
+    expect(buildEmbedFileClick({ raw: "v", path: "/Users/fhg/vault-2/v.md" }, root).rel).toBeNull();
+    expect(buildEmbedFileClick({ raw: "r", path: root }, root).rel).toBeNull();
+  });
+
+  it("joins a relative path to an absolute root", () => {
+    expect(buildEmbedFileClick({ raw: "src/a.ts", path: "./src/../src/a.ts" }, root)).toEqual({
+      type: "maestro.file.click",
+      path: "/Users/fhg/vault/src/a.ts",
+      rel: "src/a.ts",
+      raw: "src/a.ts",
+    });
+  });
+
+  it("leaves unresolvable paths null, with the raw text", () => {
+    const cases: Array<[string, string | null | undefined]> = [
+      ["~/notes/a.md", root],
+      ["ROOT/a.md", ""],
+      ["ROOT/a.md", null],
+      ["ROOT/a.md", "relative/root"],
+      ["../outside.md", root],
+      ["", root],
+    ];
+    for (const [path, workspaceRoot] of cases) {
+      expect(buildEmbedFileClick({ raw: "as written", path }, workspaceRoot)).toEqual({
+        type: "maestro.file.click",
+        path: null,
+        rel: null,
+        raw: "as written",
+      });
+    }
+  });
+});
+
+describe("embedEnterSends", () => {
+  function pointer(coarse: boolean | null): void {
+    if (coarse === null) {
+      vi.spyOn(window, "matchMedia", "get").mockReturnValue(
+        undefined as unknown as typeof window.matchMedia,
+      );
+      return;
+    }
+    vi.spyOn(window, "matchMedia", "get").mockReturnValue(
+      ((query: string) => ({ matches: query === "(pointer: coarse)" && coarse })) as unknown as typeof window.matchMedia,
+    );
+  }
+
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    resetEmbedModeCache();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("sends on Enter in the frame with a mouse", () => {
+    setLocation("?embed=1");
+    pointer(false);
+    expect(embedEnterSends()).toBe(true);
+  });
+
+  it("keeps Enter for the new line on a touch screen", () => {
+    setLocation("?embed=1");
+    pointer(true);
+    expect(embedEnterSends()).toBe(false);
+  });
+
+  it("sends when the browser cannot tell the pointer", () => {
+    setLocation("?embed=1");
+    pointer(null);
+    expect(embedEnterSends()).toBe(true);
+  });
+
+  it("changes nothing outside the frame", () => {
+    setLocation("");
+    pointer(false);
+    expect(embedEnterSends()).toBe(false);
   });
 });
