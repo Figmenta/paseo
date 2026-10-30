@@ -10,6 +10,7 @@ import {
   isOrchestraTopFrame,
   nodeRevealFs,
   parseRevealInput,
+  PICKER_DECLINED_QUIET_MS,
   registerReveal,
   resolveVaultPath,
   REVEAL_CHANNEL,
@@ -180,7 +181,7 @@ describe("resolveVaultPath", () => {
     const linkRoot = path.join(base, "vault-link");
     await expect(
       resolveVaultPath(
-        input({ path: path.join(vault, "ROOT", "notes", "a.md") }),
+        input({ path: await real(vault, "ROOT", "notes", "a.md") }),
         linkRoot,
         nodeRevealFs,
       ),
@@ -201,6 +202,57 @@ describe("resolveVaultPath", () => {
     await expect(
       resolveVaultPath(input({ raw: "ROOT/notes/a.md" }), path.join(base, "gone"), nodeRevealFs),
     ).resolves.toEqual({ reason: "no_vault" });
+  });
+
+  it.each([
+    ["a Windows UNC path", "\\\\fileserver\\share\\ROOT\\a.md"],
+    ["a // path", "//fileserver/share/ROOT/a.md"],
+  ])("refuses %s before touching the disk", async (_label, unc) => {
+    const fs = {
+      realpath: vi.fn(async (target: string) => target),
+      exists: vi.fn(async () => true),
+    };
+    await expect(
+      resolveVaultPath(input({ path: unc, rel: "ROOT/a.md", raw: "ROOT/a.md" }), "/v", fs),
+    ).resolves.toEqual({ reason: "bad_path" });
+    expect(fs.exists).not.toHaveBeenCalled();
+    expect(fs.realpath.mock.calls).toEqual([["/v"]]);
+  });
+
+  it("never looks up an absolute path outside the vault, and falls back to rel", async () => {
+    const fs = {
+      realpath: vi.fn(async (target: string) => target),
+      exists: vi.fn(async () => true),
+    };
+    await expect(
+      resolveVaultPath(input({ path: "/Volumes/nas/ROOT/a.md", rel: "ROOT/a.md" }), "/v", fs),
+    ).resolves.toEqual({ abs: "/v/ROOT/a.md" });
+    expect(fs.exists.mock.calls).toEqual([["/v/ROOT/a.md"]]);
+    expect(fs.realpath.mock.calls).toEqual([["/v"], ["/v/ROOT/a.md"]]);
+  });
+
+  it("stops at an existing path that resolves outside the vault instead of trying rel", async () => {
+    await expect(
+      resolveVaultPath(
+        input({
+          path: path.join(vault, "ROOT", "link-out.md"),
+          rel: "ROOT/notes/a.md",
+          raw: "ROOT/notes/a.md",
+        }),
+        vault,
+        nodeRevealFs,
+      ),
+    ).resolves.toEqual({ reason: "outside_vault" });
+  });
+
+  it("moves on to rel when the path under the root does not exist", async () => {
+    await expect(
+      resolveVaultPath(
+        input({ path: path.join(vault, "ROOT", "missing.md"), rel: "ROOT/notes/a.md" }),
+        vault,
+        nodeRevealFs,
+      ),
+    ).resolves.toEqual({ abs: await real(vault, "ROOT", "notes", "a.md") });
   });
 
   it("uses the injected filesystem only", async () => {
@@ -377,6 +429,24 @@ describe("createRevealHandler", () => {
     pick(vault);
     await expect(Promise.all([first, second])).resolves.toEqual([{ ok: true }, { ok: true }]);
     expect(d.chooseVaultRoot).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not reopen a cancelled picker for a minute", async () => {
+    let clock = 1_000_000;
+    const d = { ...deps(null, null), now: () => clock };
+    const handler = createRevealHandler(d);
+    const click = () => handler(event({}), { path: null, rel: null, raw: "ROOT/notes/a.md" });
+
+    await expect(click()).resolves.toEqual({ ok: false, reason: "no_vault" });
+    clock += PICKER_DECLINED_QUIET_MS - 1;
+    await expect(click()).resolves.toEqual({ ok: false, reason: "no_vault" });
+    expect(d.chooseVaultRoot).toHaveBeenCalledTimes(1);
+
+    clock += 1;
+    d.chooseVaultRoot.mockImplementation(async () => vault);
+    await expect(click()).resolves.toEqual({ ok: true });
+    expect(d.chooseVaultRoot).toHaveBeenCalledTimes(2);
+    expect(d.saveVaultRoot).toHaveBeenCalledWith(vault);
   });
 
   it("does not reveal a file outside the vault", async () => {

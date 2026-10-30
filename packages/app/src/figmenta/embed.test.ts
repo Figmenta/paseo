@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildEmbedFileClick,
   DEFAULT_COMPOSER_LOCK_LABEL,
+  embedEnterSends,
   EMBED_MODELS_ALLOW_DEFAULT_ID,
   EMBED_READY_TYPE,
   installEmbedBridge,
@@ -930,6 +931,13 @@ describe("frame events to the parent (contract notes-maestro §10.1)", () => {
     return parentPost.mock.calls.map((call) => call[0]);
   }
 
+  /** Seen at the end of the bubble, then cancelled: jsdom cannot follow a link. */
+  let seenPrevented: boolean | undefined;
+  function stopNavigation(event: Event): void {
+    seenPrevented = event.defaultPrevented;
+    event.preventDefault();
+  }
+
   function mouse(type: "click" | "contextmenu", target: Element, init: MouseEventInit = {}) {
     const event = new MouseEvent(type, {
       bubbles: true,
@@ -939,8 +947,9 @@ describe("frame events to the parent (contract notes-maestro §10.1)", () => {
       button: type === "contextmenu" ? 2 : 0,
       ...init,
     });
+    seenPrevented = undefined;
     target.dispatchEvent(event);
-    return event;
+    return { defaultPrevented: seenPrevented ?? event.defaultPrevented };
   }
 
   function escape(): KeyboardEvent {
@@ -973,9 +982,11 @@ describe("frame events to the parent (contract notes-maestro §10.1)", () => {
     freshDocument("?embed=1");
     installEmbedBridge();
     parentPost.mockClear();
+    window.addEventListener("click", stopNavigation);
   });
 
   afterEach(() => {
+    window.removeEventListener("click", stopNavigation);
     (document.activeElement as HTMLElement | null)?.blur?.();
     document.body.innerHTML = "";
     vi.restoreAllMocks();
@@ -1082,6 +1093,26 @@ describe("frame events to the parent (contract notes-maestro §10.1)", () => {
     expect(posted()).toEqual([{ type: "maestro.frame.escape" }]);
   });
 
+  it("Escape already handled in the frame stays there", () => {
+    byId("user-text").addEventListener("keydown", (event) => event.preventDefault(), { once: true });
+    byId("user-text").dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+    );
+
+    expect(posted()).toEqual([]);
+  });
+
+  it("Escape with a modal of the frame open stays in the frame", () => {
+    const modal = document.createElement("div");
+    modal.setAttribute("aria-modal", "true");
+    document.body.appendChild(modal);
+    escape();
+    modal.remove();
+    escape();
+
+    expect(posted()).toEqual([{ type: "maestro.frame.escape" }]);
+  });
+
   it("other keys send nothing", () => {
     document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
 
@@ -1173,5 +1204,52 @@ describe("buildEmbedFileClick", () => {
         raw: "as written",
       });
     }
+  });
+});
+
+describe("embedEnterSends", () => {
+  function pointer(coarse: boolean | null): void {
+    if (coarse === null) {
+      vi.spyOn(window, "matchMedia", "get").mockReturnValue(
+        undefined as unknown as typeof window.matchMedia,
+      );
+      return;
+    }
+    vi.spyOn(window, "matchMedia", "get").mockReturnValue(
+      ((query: string) => ({ matches: query === "(pointer: coarse)" && coarse })) as unknown as typeof window.matchMedia,
+    );
+  }
+
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    resetEmbedModeCache();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("sends on Enter in the frame with a mouse", () => {
+    setLocation("?embed=1");
+    pointer(false);
+    expect(embedEnterSends()).toBe(true);
+  });
+
+  it("keeps Enter for the new line on a touch screen", () => {
+    setLocation("?embed=1");
+    pointer(true);
+    expect(embedEnterSends()).toBe(false);
+  });
+
+  it("sends when the browser cannot tell the pointer", () => {
+    setLocation("?embed=1");
+    pointer(null);
+    expect(embedEnterSends()).toBe(true);
+  });
+
+  it("changes nothing outside the frame", () => {
+    setLocation("");
+    pointer(false);
+    expect(embedEnterSends()).toBe(false);
   });
 });

@@ -76,14 +76,15 @@ function isVaultRelative(value: string): boolean {
 }
 
 /**
- * Where in the vault the page's path points, tried in order: `path` when it is absolute, then
- * `root/rel`, then `root/raw` when `raw` is a relative `ROOT/…` or `DMS/…` path.
- * The first candidate that exists and whose real path (symlinks followed) stays under the root's
- * real path wins, and that real path is what gets revealed. Any `..` segment is refused outright
- * (`bad_path`), never normalized away. An absolute `path` written through another route to the
- * vault (macOS `/var` → `/private/var`) is still taken when its real path is under the root.
- * `not_found` only when a candidate under the root is missing and none escaped through a
- * symlink; every other miss is `outside_vault`.
+ * Where in the vault the page's path points, tried in order: `path` when it is absolute and under
+ * the root (as chosen or as resolved), then `root/rel`, then `root/raw` when `raw` is a relative
+ * `ROOT/…` or `DMS/…` path. The disk is never touched for anything outside the vault, and a
+ * UNC or `//` path is refused before anything else (on Windows a lookup would open an SMB
+ * connection that hands out the user's NTLM hash). Any `..` segment is refused outright, never
+ * normalized away. The first candidate that exists decides: its real path (symlinks followed)
+ * under the root's real path is what gets revealed; outside it, the answer is `outside_vault`
+ * and no later candidate is tried (one with the same name inside the vault is another file).
+ * No candidate at all → `outside_vault`; none of them exists → `not_found`.
  */
 export async function resolveVaultPath(
   input: RevealInput,
@@ -100,47 +101,41 @@ export async function resolveVaultPath(
     return { reason: "no_vault" };
   }
 
-  // `under` = lexically below the root as written or as resolved: a miss there is `not_found`.
-  const candidates: Array<{ target: string; under: boolean }> = [];
+  const candidates: string[] = [];
   if (input.path !== null) {
-    if (hasParentSegment(input.path)) return { reason: "bad_path" };
-    if (path.isAbsolute(input.path)) {
-      candidates.push({
-        target: path.normalize(input.path),
-        under: isInside(input.path, root) || isInside(input.path, realRoot),
-      });
+    if (hasParentSegment(input.path) || /^[\\/]{2}/.test(input.path)) {
+      return { reason: "bad_path" };
+    }
+    if (
+      path.isAbsolute(input.path) &&
+      (isInside(input.path, root) || isInside(input.path, realRoot))
+    ) {
+      candidates.push(path.normalize(input.path));
     }
   }
   if (input.rel !== null) {
     if (path.isAbsolute(input.rel) || hasParentSegment(input.rel)) return { reason: "bad_path" };
-    candidates.push({ target: path.join(root, input.rel), under: true });
+    candidates.push(path.join(root, input.rel));
   }
   if (isVaultRelative(input.raw)) {
     if (hasParentSegment(input.raw)) return { reason: "bad_path" };
-    candidates.push({ target: path.join(root, input.raw), under: true });
+    candidates.push(path.join(root, input.raw));
+  }
+  if (candidates.length === 0) {
+    return { reason: "outside_vault" };
   }
 
-  let escaped = false;
-  let missingUnder = false;
   for (const candidate of candidates) {
-    if (!(await fs.exists(candidate.target))) {
-      missingUnder ||= candidate.under;
-      continue;
-    }
+    if (!(await fs.exists(candidate))) continue;
     let real: string;
     try {
-      real = await fs.realpath(candidate.target);
+      real = await fs.realpath(candidate);
     } catch {
-      missingUnder ||= candidate.under;
       continue;
     }
-    if (!isInside(real, realRoot)) {
-      escaped = true;
-      continue;
-    }
-    return { abs: real };
+    return isInside(real, realRoot) ? { abs: real } : { reason: "outside_vault" };
   }
-  return { reason: missingUnder && !escaped ? "not_found" : "outside_vault" };
+  return { reason: "not_found" };
 }
 
 export interface RevealFs extends VaultFs {
@@ -194,19 +189,30 @@ export interface RevealDeps<E extends RevealEvent = RevealEvent> {
   chooseVaultRoot(event: E): Promise<string | null>;
   showItemInFolder(abs: string): void;
   fs?: RevealFs;
+  now?: () => number;
 }
+
+/** After the person cancels the picker, clicks answer `no_vault` this long without reopening it. */
+export const PICKER_DECLINED_QUIET_MS = 60_000;
 
 export function createRevealHandler<E extends RevealEvent>(
   deps: RevealDeps<E>,
 ): (event: E, value: unknown) => Promise<RevealResult> {
   const fs = deps.fs ?? nodeRevealFs;
+  const now = deps.now ?? Date.now;
   // Two clicks while the picker is open share it instead of stacking a second one.
   let choosing: Promise<string | null> | null = null;
+  // A cancelled picker does not come back on every click: the page may retry in a loop.
+  let declinedAt: number | null = null;
 
   const chooseAndSave = async (event: E): Promise<string | null> => {
     const chosen = await deps.chooseVaultRoot(event);
-    if (chosen === null || !path.isAbsolute(chosen)) return null;
+    if (chosen === null || !path.isAbsolute(chosen)) {
+      declinedAt = now();
+      return null;
+    }
     await deps.saveVaultRoot(chosen);
+    declinedAt = null;
     return chosen;
   };
 
@@ -222,6 +228,13 @@ export function createRevealHandler<E extends RevealEvent>(
     // A root that is missing, or no longer a folder (moved, renamed), is asked for again.
     let root = await deps.getVaultRoot();
     if (root === null || !(await fs.isDirectory(root))) {
+      if (
+        choosing === null &&
+        declinedAt !== null &&
+        now() - declinedAt < PICKER_DECLINED_QUIET_MS
+      ) {
+        return { ok: false, reason: "no_vault" };
+      }
       choosing ??= chooseAndSave(event).finally(() => {
         choosing = null;
       });

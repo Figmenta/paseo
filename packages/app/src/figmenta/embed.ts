@@ -699,9 +699,21 @@ function isTextEntry(element: Element | null): boolean {
 
 function handleEmbedKeyDown(event: KeyboardEvent): void {
   if (!isEmbedMode() || event.key !== "Escape") return;
+  // Already spent in the frame, or a modal of the frame open (the full-screen mermaid viewer
+  // closes on Escape): the page's ladder stays put.
+  if (event.defaultPrevented || document.querySelector('[aria-modal="true"]')) return;
   // An Escape in a field belongs to the field (the composer's own handling).
   if (isTextEntry(document.activeElement)) return;
   postToEmbedParent({ type: EMBED_FRAME_ESCAPE_TYPE });
+}
+
+/**
+ * Enter sends from the composer at any width in the frame (the Live column is under `md`), but
+ * not on a touch screen: there Enter is the only way to a new line. Read by composer/input.
+ */
+export function embedEnterSends(): boolean {
+  if (!isEmbedMode()) return false;
+  return !window.matchMedia?.("(pointer: coarse)").matches;
 }
 
 /** Module-level handlers: a second install adds nothing, the DOM keeps one of each. */
