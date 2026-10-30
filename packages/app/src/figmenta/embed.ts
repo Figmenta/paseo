@@ -15,6 +15,7 @@ import { useSyncExternalStore } from "react";
 import { UnistylesRuntime } from "react-native-unistyles";
 import { isWeb } from "@/constants/platform";
 import { THEME_TO_UNISTYLES } from "@/styles/theme";
+import { isAbsolutePath } from "@/utils/path";
 import {
   applyEmbedLauncherMessage,
   EMBED_LAUNCHER_MESSAGE_TYPE,
@@ -91,6 +92,13 @@ export function resetEmbedModeCache(): void {
 // One goes back out, to the parent, same origin: `{ type: "maestro.embed.ready" }`, once per
 // document, as soon as the listener is up. The listener is installed by a React effect, after the
 // frame's `load`, so what Orchestra posts at `load` is lost: the ready is its cue to post again.
+// The rest go out the same way (contract notes-maestro §10.1, Orchestra `paseo/frameBridge.ts`):
+//   { type: "maestro.link.click" | "maestro.link.contextmenu", href, text, role, x, y, rect }
+//                                  an http(s) link of an assistant message; the page shows its
+//                                  card or its menu, the frame opens nothing
+//   { type: "maestro.file.click", path, rel, raw }  a file path of a message (agent-stream/view.tsx)
+//   { type: "maestro.frame.pointerdown" }      any press in the frame: the page closes cards, menus
+//   { type: "maestro.frame.escape" }           Escape with no field focused: the page's Esc ladder
 // The theme also arrives as `?theme=dark|light` on the first URL, latched like
 // `?embed=1` because the router rewrites the query away.
 // ---------------------------------------------------------------------------
@@ -510,17 +518,201 @@ function handleEmbedMessage(event: MessageEvent): void {
   }
 }
 
-/** The one message the frame sends: "my listener is up, post your per-document state now". */
+/** The first message the frame sends: "my listener is up, post your per-document state now". */
 export const EMBED_READY_TYPE = "maestro.embed.ready";
+/** Left click on an http(s) link of an assistant message: the page shows its card, no new tab. */
+export const EMBED_LINK_CLICK_TYPE = "maestro.link.click";
+/** Right click on the same links: the page shows its menu, not the browser's. */
+export const EMBED_LINK_CONTEXTMENU_TYPE = "maestro.link.contextmenu";
+/** Click on a file path of a message: the page opens it (Finder, or a copy), not a Paseo tab. */
+export const EMBED_FILE_CLICK_TYPE = "maestro.file.click";
+/** Any pointerdown in the frame: the page closes its cards and menus. */
+export const EMBED_FRAME_POINTERDOWN_TYPE = "maestro.frame.pointerdown";
+/** Escape with no field focused: the page climbs its Esc ladder. */
+export const EMBED_FRAME_ESCAPE_TYPE = "maestro.frame.escape";
+
+/** Relative to the frame: the page adds the iframe's own box. */
+export interface EmbedLinkRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface EmbedLinkMessage {
+  type: typeof EMBED_LINK_CLICK_TYPE | typeof EMBED_LINK_CONTEXTMENU_TYPE;
+  href: string;
+  text: string;
+  role: "assistant";
+  x: number;
+  y: number;
+  rect: EmbedLinkRect;
+}
+
+export interface EmbedFileClickMessage {
+  type: typeof EMBED_FILE_CLICK_TYPE;
+  /** Absolute on the daemon's machine; null when this side cannot resolve it. */
+  path: string | null;
+  /** Relative to the workspace root, when the path is under it. */
+  rel: string | null;
+  /** The text as written in the message. */
+  raw: string;
+}
+
+export type EmbedOutboundMessage =
+  | { type: typeof EMBED_READY_TYPE }
+  | EmbedLinkMessage
+  | EmbedFileClickMessage
+  | { type: typeof EMBED_FRAME_POINTERDOWN_TYPE }
+  | { type: typeof EMBED_FRAME_ESCAPE_TYPE };
 
 /** To the parent, same origin, never "*". Outside a frame the parent is this window: ignored. */
-function announceEmbedReady(): void {
+export function postToEmbedParent(message: EmbedOutboundMessage): void {
   try {
-    window.parent.postMessage({ type: EMBED_READY_TYPE }, window.location.origin);
+    window.parent.postMessage(message, window.location.origin);
   } catch (error) {
-    // An opaque origin ("null") is not a valid target: nobody to tell, the load post stays.
-    console.warn("[Figmenta] maestro.embed.ready not posted", error);
+    // An opaque origin ("null") is not a valid target: nobody to tell.
+    console.warn(`[Figmenta] ${message.type} not posted`, error);
   }
+}
+
+function announceEmbedReady(): void {
+  postToEmbedParent({ type: EMBED_READY_TYPE });
+}
+
+/**
+ * The `maestro.file.click` for a path a message links. `path` is the target as Paseo resolved it
+ * (absolute), or a relative one joined to an absolute workspace root; `~/…`, a relative path with
+ * no root, or one that climbs above the root stays null: the daemon's machine is not this one.
+ */
+export function buildEmbedFileClick(
+  target: { raw: string; path: string },
+  workspaceRoot: string | null | undefined,
+): EmbedFileClickMessage {
+  const root = trimTrailingSlashes(workspaceRoot?.trim() ?? "");
+  const path = resolveDaemonPath(target.path.trim(), root);
+  return {
+    type: EMBED_FILE_CLICK_TYPE,
+    path,
+    rel: path !== null ? relativeUnderRoot(path, root) : null,
+    raw: target.raw,
+  };
+}
+
+function trimTrailingSlashes(value: string): string {
+  const trimmed = value.replace(/\/+$/, "");
+  return trimmed || (value.startsWith("/") ? "/" : "");
+}
+
+function resolveDaemonPath(value: string, root: string): string | null {
+  if (!value) return null;
+  if (isAbsolutePath(value)) return value;
+  if (value === "~" || value.startsWith("~/") || !isAbsolutePath(root)) return null;
+  const segments: string[] = [];
+  for (const segment of value.split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      if (segments.length === 0) return null;
+      segments.pop();
+      continue;
+    }
+    segments.push(segment);
+  }
+  if (segments.length === 0) return root;
+  return `${root === "/" ? "" : root}/${segments.join("/")}`;
+}
+
+function relativeUnderRoot(path: string, root: string): string | null {
+  if (!isAbsolutePath(root)) return null;
+  const prefix = root === "/" ? "/" : `${root}/`;
+  return path.length > prefix.length && path.startsWith(prefix) ? path.slice(prefix.length) : null;
+}
+
+const ASSISTANT_MESSAGE_SELECTOR = '[data-testid="assistant-message"]';
+const WEB_HREF = /^https?:\/\//i;
+
+/** The http(s) link of an assistant message the event landed in; file paths and the rest pass. */
+function assistantWebLink(target: EventTarget | null): HTMLAnchorElement | null {
+  if (!(target instanceof Node)) return null;
+  const element = target instanceof Element ? target : target.parentElement;
+  const anchor = element?.closest("a[href]");
+  if (!(anchor instanceof HTMLAnchorElement)) return null;
+  // The attribute as written: `anchor.href` would turn a relative file path into an http URL.
+  if (!WEB_HREF.test(anchor.getAttribute("href") ?? "")) return null;
+  return anchor.closest(ASSISTANT_MESSAGE_SELECTOR) ? anchor : null;
+}
+
+/**
+ * The link's box. The `<a>` is `display: contents` (assistant-file-links/link.tsx), which gives it
+ * no box of its own: then the union of its children's boxes stands in.
+ */
+function linkRect(anchor: Element): EmbedLinkRect {
+  const own = anchor.getBoundingClientRect();
+  let left = Infinity;
+  let top = Infinity;
+  let right = -Infinity;
+  let bottom = -Infinity;
+  if (own.width === 0 && own.height === 0) {
+    for (const child of Array.from(anchor.children)) {
+      const box = child.getBoundingClientRect();
+      if (box.width === 0 && box.height === 0) continue;
+      left = Math.min(left, box.left);
+      top = Math.min(top, box.top);
+      right = Math.max(right, box.right);
+      bottom = Math.max(bottom, box.bottom);
+    }
+  }
+  if (left === Infinity) return { x: own.left, y: own.top, w: own.width, h: own.height };
+  return { x: left, y: top, w: right - left, h: bottom - top };
+}
+
+function handleEmbedLinkEvent(event: MouseEvent): void {
+  if (!isEmbedMode()) return;
+  if (event.type === "click" && event.button !== 0) return;
+  const anchor = assistantWebLink(event.target);
+  if (!anchor) return;
+  // Before the React root: the link's Pressable would otherwise reach window.open.
+  event.preventDefault();
+  event.stopPropagation();
+  postToEmbedParent({
+    type: event.type === "contextmenu" ? EMBED_LINK_CONTEXTMENU_TYPE : EMBED_LINK_CLICK_TYPE,
+    href: anchor.getAttribute("href") ?? "",
+    text: (anchor.textContent ?? "").replace(/\s+/g, " ").trim(),
+    role: "assistant",
+    x: event.clientX,
+    y: event.clientY,
+    rect: linkRect(anchor),
+  });
+}
+
+function handleEmbedPointerDown(): void {
+  if (!isEmbedMode()) return;
+  postToEmbedParent({ type: EMBED_FRAME_POINTERDOWN_TYPE });
+}
+
+function isTextEntry(element: Element | null): boolean {
+  if (!element) return false;
+  if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) return true;
+  const editable = element.closest("[contenteditable]");
+  return editable !== null && editable.getAttribute("contenteditable") !== "false";
+}
+
+function handleEmbedKeyDown(event: KeyboardEvent): void {
+  if (!isEmbedMode() || event.key !== "Escape") return;
+  // An Escape in a field belongs to the field (the composer's own handling).
+  if (isTextEntry(document.activeElement)) return;
+  postToEmbedParent({ type: EMBED_FRAME_ESCAPE_TYPE });
+}
+
+/** Module-level handlers: a second install adds nothing, the DOM keeps one of each. */
+function installEmbedFrameEvents(): void {
+  if (typeof document === "undefined") return;
+  // Capture, on the document: ahead of the React root and of the link's own press handler.
+  document.addEventListener("click", handleEmbedLinkEvent, true);
+  document.addEventListener("contextmenu", handleEmbedLinkEvent, true);
+  document.addEventListener("pointerdown", handleEmbedPointerDown, { capture: true, passive: true });
+  // Bubble: a frame component that consumes its Escape stops it before it gets here.
+  document.addEventListener("keydown", handleEmbedKeyDown);
 }
 
 /**
@@ -537,5 +729,6 @@ export function installEmbedBridge(): void {
   const theme = readEmbedTheme();
   if (theme) applyEmbedTheme(theme);
   window.addEventListener("message", handleEmbedMessage);
+  installEmbedFrameEvents();
   announceEmbedReady();
 }

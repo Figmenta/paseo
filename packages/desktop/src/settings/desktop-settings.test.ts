@@ -86,6 +86,7 @@ describe("desktop-settings", () => {
         manageBuiltInDaemon: true,
         keepRunningAfterQuit: false,
       },
+      vault: { root: null },
     });
   });
 
@@ -108,6 +109,7 @@ describe("desktop-settings", () => {
         manageBuiltInDaemon: true,
         keepRunningAfterQuit: false,
       },
+      vault: { root: null },
     });
     expect(files).toEqual(["desktop-settings.json"]);
   });
@@ -275,6 +277,7 @@ describe("desktop-settings", () => {
         manageBuiltInDaemon: false,
         keepRunningAfterQuit: false,
       },
+      vault: { root: null },
     });
     expect(ignoredSecondMigration).toEqual(migrated);
   });
@@ -317,6 +320,7 @@ describe("desktop-settings", () => {
       releaseChannel: "beta",
       notifications: { playSound: false },
       daemon: { manageBuiltInDaemon: true, keepRunningAfterQuit: false },
+      vault: { root: null },
     });
   });
 
@@ -362,5 +366,38 @@ describe("desktop-settings", () => {
 
     expect(persisted.settings.releaseChannel).toBe("stable");
     expect(persisted.settings.tray).toEqual({ enabled: true });
+  });
+
+  // Figmenta fork (contratto notes-maestro §10.5): the vault folder of the Finder channel.
+  it("keeps the vault root set by setVaultRoot, and patch() cannot change it", async () => {
+    const userDataPath = await createTempUserDataDir();
+    directories.add(userDataPath);
+    const store = createDesktopSettingsStore({ userDataPath });
+    const root = path.join(userDataPath, "vault");
+
+    expect((await store.get()).vault).toEqual({ root: null });
+    expect((await store.setVaultRoot(root)).vault).toEqual({ root });
+    expect((await store.patch({ vault: { root: "/elsewhere" } })).vault).toEqual({ root });
+
+    const reloaded = createDesktopSettingsStore({ userDataPath });
+    expect((await reloaded.get()).vault).toEqual({ root });
+    await expect(reloaded.setVaultRoot("relative/vault")).rejects.toThrow("absolute");
+    expect((await reloaded.setVaultRoot(null)).vault).toEqual({ root: null });
+  });
+
+  it.each([
+    ["a relative root", { root: "vault" }],
+    ["a non-string root", { root: 7 }],
+    ["a non-object vault", "vault"],
+  ])("reads %s back as no vault", async (_label, vault) => {
+    const userDataPath = await createTempUserDataDir();
+    directories.add(userDataPath);
+    await writeFile(
+      settingsFilePath(userDataPath),
+      JSON.stringify({ version: 1, settings: { vault }, migrations: {} }),
+    );
+    const store = createDesktopSettingsStore({ userDataPath });
+
+    expect((await store.get()).vault).toEqual({ root: null });
   });
 });

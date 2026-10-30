@@ -18,6 +18,7 @@ function createStoreMock(): DesktopSettingsStore {
         keepRunningAfterQuit: true,
       },
     })),
+    setVaultRoot: vi.fn(async () => DEFAULT_DESKTOP_SETTINGS),
   };
 }
 

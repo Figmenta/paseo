@@ -4,8 +4,13 @@ import { contextBridge, ipcRenderer } from "electron";
 // exposed `paseoDesktop` — the whole `paseo:invoke` command surface, dialogs, the browser
 // automation bridge — to whatever document the window loaded. That is safe for a bundled
 // local app and unacceptable for a remote origin: it would hand the desktop command set to
-// anything that ever renders in this window. Orchestra gets read-only facts and nothing it
-// can call: the page sends no IPC at all, the app only pushes the Claude Code status to it.
+// anything that ever renders in this window. Orchestra gets read-only facts and, with ONE
+// exception, nothing it can call: the app pushes the Claude Code status to it, and the page
+// sends no IPC except `orchestraDesktopActions.revealInVault` (contratto notes-maestro §10.5,
+// decided 2026-10-30), which asks the app to show a vault file in the Finder. The main process
+// answers that channel only for Orchestra's own top frame and only for an existing file inside
+// the vault folder the person chose (figmenta/reveal.ts); preload-sandbox.test.ts pins this
+// surface, so a second exposure fails the test until it is decided the same way.
 //
 // The preload still runs inside Electron's sandbox and is tsc-compiled (not bundled), so it
 // MUST NOT import anything but "electron" (preload-sandbox.test.ts guards this).
@@ -17,6 +22,8 @@ const CLAUDE_CODE_STATUS_CHANNEL = "orchestra-desktop:claude-code";
 const CLAUDE_CODE_STATUS_GET_CHANNEL = "orchestra-desktop:claude-code:get";
 /** Dispatched on `window` after every check, with the new `claudeCode` as `detail`. */
 const CLAUDE_CODE_EVENT = "orchestra-desktop:claude-code";
+// figmenta/reveal.ts: REVEAL_CHANNEL (not imported: see above).
+const REVEAL_CHANNEL = "orchestra-desktop:reveal";
 
 function readArgument(prefix: string): string {
   const value = process.argv.find((argument) => argument.startsWith(prefix));
@@ -107,4 +114,22 @@ ipcRenderer.on(CLAUDE_CODE_STATUS_CHANNEL, (_event, status: ClaudeCodeStatus) =>
     },
     args: [status, CLAUDE_CODE_EVENT],
   });
+});
+
+// figmenta/reveal.ts: RevealInput and RevealResult (not imported: see above). The input goes
+// through as the page gave it: the main process validates it and trusts nothing in it.
+interface RevealInput {
+  path: string | null;
+  rel: string | null;
+  raw: string;
+}
+type RevealResult =
+  | { ok: true }
+  | { ok: false; reason: "no_vault" | "outside_vault" | "not_found" | "bad_path" };
+
+// The one call the page can make (see the top of this file). A separate global, so
+// `window.orchestraDesktop` stays the read-only object it has always been.
+contextBridge.exposeInMainWorld("orchestraDesktopActions", {
+  revealInVault: (input: RevealInput): Promise<RevealResult> =>
+    ipcRenderer.invoke(REVEAL_CHANNEL, input) as Promise<RevealResult>,
 });

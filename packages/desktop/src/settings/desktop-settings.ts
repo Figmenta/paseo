@@ -15,6 +15,12 @@ export interface DesktopSettings {
     manageBuiltInDaemon: boolean;
     keepRunningAfterQuit: boolean;
   };
+  // Figmenta fork (contratto notes-maestro §10.5): the vault folder the Finder channel reveals
+  // files from (figmenta/reveal.ts). Absolute, or null until the person picks it. Written only by
+  // setVaultRoot, after the folder picker: the generic patch() ignores it.
+  vault: {
+    root: string | null;
+  };
 }
 
 interface DesktopSettingsPatch {
@@ -27,6 +33,7 @@ export interface DesktopSettingsStore {
   get(): Promise<DesktopSettings>;
   patch(patch: unknown): Promise<DesktopSettings>;
   migrateLegacyRendererSettings(legacySettings: unknown): Promise<DesktopSettings>;
+  setVaultRoot(root: string | null): Promise<DesktopSettings>;
 }
 
 export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
@@ -37,6 +44,9 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   daemon: {
     manageBuiltInDaemon: true,
     keepRunningAfterQuit: false,
+  },
+  vault: {
+    root: null,
   },
 };
 
@@ -57,11 +67,22 @@ const DaemonSchema = z
   })
   .catch(() => ({ ...DEFAULT_DESKTOP_SETTINGS.daemon }));
 
+const VaultSchema = z
+  .looseObject({
+    root: z
+      .string()
+      .refine((value) => path.isAbsolute(value))
+      .nullable()
+      .catch(DEFAULT_DESKTOP_SETTINGS.vault.root),
+  })
+  .catch(() => ({ ...DEFAULT_DESKTOP_SETTINGS.vault }));
+
 const DesktopSettingsSchema = z
   .looseObject({
     releaseChannel: ReleaseChannelSchema.catch(DEFAULT_DESKTOP_SETTINGS.releaseChannel),
     notifications: NotificationsSchema,
     daemon: DaemonSchema,
+    vault: VaultSchema,
   })
   .catch(() => buildDefaultSettings());
 
@@ -108,6 +129,7 @@ function buildDefaultSettings(): StoredDesktopSettings {
     releaseChannel: DEFAULT_DESKTOP_SETTINGS.releaseChannel,
     notifications: { ...DEFAULT_DESKTOP_SETTINGS.notifications },
     daemon: { ...DEFAULT_DESKTOP_SETTINGS.daemon },
+    vault: { ...DEFAULT_DESKTOP_SETTINGS.vault },
   };
 }
 
@@ -130,6 +152,7 @@ function toDesktopSettings(stored: StoredDesktopSettings): DesktopSettings {
       manageBuiltInDaemon: stored.daemon.manageBuiltInDaemon,
       keepRunningAfterQuit: stored.daemon.keepRunningAfterQuit,
     },
+    vault: { root: stored.vault.root },
   };
 }
 
@@ -319,6 +342,16 @@ export function createDesktopSettingsStore({
           legacyRendererSettingsImported: true,
         },
       });
+      return toDesktopSettings(next);
+    },
+
+    async setVaultRoot(root: string | null): Promise<DesktopSettings> {
+      if (root !== null && !path.isAbsolute(root)) {
+        throw new Error("vault.root must be an absolute path");
+      }
+      const current = await loadDocument();
+      const next = { ...current.settings, vault: { ...current.settings.vault, root } };
+      await persistDocument({ ...current, settings: next });
       return toDesktopSettings(next);
     },
   };

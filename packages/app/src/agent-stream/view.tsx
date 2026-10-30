@@ -98,6 +98,7 @@ import {
   type WorkspaceFileOpenRequest,
 } from "@/workspace/file-open";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
+import { buildEmbedFileClick, isEmbedMode, postToEmbedParent } from "@/figmenta/embed"; // Figmenta: file paths go to Orchestra
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { useForkAgent } from "@/hooks/use-fork-agent";
 import { isWeb } from "@/constants/platform";
@@ -438,6 +439,12 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
 
     const handleInlinePathPress = useStableEvent(
       (target: InlinePathTarget, disposition: OpenFileDisposition) => {
+        // Figmenta: in the Orchestra frame the page opens the path (Finder, or a copy), no file tab.
+        if (isEmbedMode()) {
+          postToEmbedParent(buildEmbedFileClick(target, workspaceRoot));
+          return;
+        }
+
         if (!target.path) {
           return;
         }

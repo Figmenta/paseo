@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
+import { REVEAL_CHANNEL } from "./figmenta/reveal.js";
+
 // The preload runs inside Electron's sandbox and is tsc-compiled (not bundled), so at
 // runtime it may only load Electron's sandbox allowlist. Any other module (local or
 // third-party) emits a require() that the sandbox rejects synchronously, aborting the
@@ -104,4 +106,66 @@ describe("preload sandbox safety", () => {
 
   // Figmenta fork: the browser-profile partition assertion went with the bridge — the
   // Orchestra preload exposes no browser surface, so there is nothing to keep in sync.
+});
+
+// Figmenta fork: what the remote Orchestra page can reach through preload.ts, pinned. The
+// page gets the read-only `window.orchestraDesktop` (built with executeInMainWorld) and ONE
+// callable global, `orchestraDesktopActions`, whose only IPC is the reveal channel
+// (contratto notes-maestro §10.5). Anything added here is a new door into the app from a
+// remote origin: this test fails until that is decided and the expectation updated with it.
+function preloadIpcSurface(source: string): { exposed: string[]; ipc: string[] } {
+  const sourceFile = ts.createSourceFile("preload.ts", source, ts.ScriptTarget.Latest, true);
+  const constants = new Map<string, string>();
+  const collectConstants = (node: ts.Node): void => {
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.initializer &&
+      ts.isStringLiteralLike(node.initializer)
+    ) {
+      constants.set(node.name.text, node.initializer.text);
+    }
+    ts.forEachChild(node, collectConstants);
+  };
+  collectConstants(sourceFile);
+
+  const text = (node: ts.Expression | undefined): string => {
+    if (node && ts.isStringLiteralLike(node)) return node.text;
+    if (node && ts.isIdentifier(node)) return constants.get(node.text) ?? `<${node.text}>`;
+    return "<dynamic>";
+  };
+  const exposed: string[] = [];
+  const ipc: string[] = [];
+  const collectCalls = (node: ts.Node): void => {
+    if (
+      ts.isCallExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      ts.isIdentifier(node.expression.expression)
+    ) {
+      const owner = node.expression.expression.text;
+      const method = node.expression.name.text;
+      if (owner === "contextBridge" && method === "exposeInMainWorld") {
+        exposed.push(text(node.arguments[0]));
+      }
+      if (owner === "ipcRenderer") {
+        ipc.push(`${method} ${text(node.arguments[0])}`);
+      }
+    }
+    ts.forEachChild(node, collectCalls);
+  };
+  collectCalls(sourceFile);
+  return { exposed: exposed.sort(), ipc: ipc.sort() };
+}
+
+describe("preload surface", () => {
+  it("exposes only orchestraDesktopActions, whose only call is the reveal channel", () => {
+    expect(preloadIpcSurface(readFileSync(preloadPath, "utf8"))).toEqual({
+      exposed: ["orchestraDesktopActions"],
+      ipc: [
+        `invoke ${REVEAL_CHANNEL}`,
+        "on orchestra-desktop:claude-code",
+        "sendSync orchestra-desktop:claude-code:get",
+      ],
+    });
+  });
 });

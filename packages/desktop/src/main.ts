@@ -134,6 +134,7 @@ import {
   isStartupSplashWindow,
   showStartupSplash,
 } from "./figmenta/startup-splash-electron.js";
+import { registerReveal } from "./figmenta/reveal.js";
 import { registerBrowserAutomationIpc } from "./features/browser-automation/ipc.js";
 import { BrowserKeyboard } from "./features/browser-keyboard/index.js";
 import {
@@ -702,10 +703,14 @@ function getWorkAreasPrimaryFirst(): Electron.Rectangle[] {
 }
 
 // Figmenta fork: the shared webPreferences for every window that shows the remote
-// Orchestra page — the main window and any same-origin popup it opens. `webviewTag` is
-// off: nothing in Orchestra uses <webview>, and leaving it on gives a remote document a
-// tag that can host another renderer.
-function orchestraWebPreferences(): Electron.WebPreferences {
+// Orchestra page — the main window and any same-origin popup it opens. `webviewTag` gives a
+// remote document a tag that can host another renderer, so it is on ONLY in the main window
+// (contratto notes-maestro §10.2: a Google Doc or Slides note is a <webview> on the
+// `persist:paseo-browser` partition, where the person signs in to Google once). There the
+// `will-attach-webview` guard in createWindow admits that partition and http(s) only, and
+// strips the guest down (no node, sandbox, no preload of the page's choosing). A popup has no
+// such guard, so it keeps `webviewTag: false`.
+function orchestraWebPreferences({ webviewTag }: { webviewTag: boolean }): Electron.WebPreferences {
   return {
     preload: getPreloadPath(),
     additionalArguments: [
@@ -715,7 +720,7 @@ function orchestraWebPreferences(): Electron.WebPreferences {
     ],
     contextIsolation: true,
     nodeIntegration: false,
-    webviewTag: false,
+    webviewTag,
   };
 }
 
@@ -753,7 +758,7 @@ async function createWindow(
     ...getMainWindowChromeOptions({
       mode: DESKTOP_WINDOW_CHROME_MODE,
     }),
-    webPreferences: orchestraWebPreferences(),
+    webPreferences: orchestraWebPreferences({ webviewTag: true }),
   });
   applyDesktopWindowChromeMode({ win: mainWindow, mode: DESKTOP_WINDOW_CHROME_MODE });
 
@@ -871,7 +876,7 @@ function installOrchestraWindowGuards(win: BrowserWindow): void {
         action: "allow",
         overrideBrowserWindowOptions: {
           backgroundColor: ORCHESTRA_BACKGROUND_COLOR,
-          webPreferences: orchestraWebPreferences(),
+          webPreferences: orchestraWebPreferences({ webviewTag: false }),
         },
       };
     }
@@ -1085,8 +1090,25 @@ function showDaemonSeedWarning(warning: DaemonSeedWarning): void {
     });
 }
 
+// Figmenta fork (contratto notes-maestro §10.2): the person signs in to Google inside the
+// <webview> of a Google Doc or Slides note, and Google turns sign-ins away from browsers it
+// calls "not secure" — an embedded Electron user agent among them. [ASSUNZIONE] of the
+// contract, measured only in the smoke on the app: the same user agent without the
+// `Electron/<v>` token and without the app-name token (the one between "(KHTML, like Gecko)"
+// and "Chrome/") reads as plain Chrome and is let in. The client hints (Sec-CH-UA) still name
+// Chromium, not Google Chrome. If Google refuses anyway, the note shows its "Open in a new tab"
+// text and the webview stays for the sites that need no sign-in.
+function chromeUserAgent(userAgent: string): string {
+  return userAgent
+    .replace(/\s+Electron\/\S+/g, "")
+    .replace(/(\(KHTML, like Gecko\))[^()]*?(\s+Chrome\/)/, "$1$2");
+}
+
 function installOrchestraSessionPolicies(): void {
   const defaultSession = session.defaultSession;
+
+  const browserSession = session.fromPartition(PASEO_BROWSER_PROFILE_PARTITION);
+  browserSession.setUserAgent(chromeUserAgent(browserSession.getUserAgent()));
 
   defaultSession.setPermissionRequestHandler((contents, permission, callback, details) => {
     const requestingUrl = details?.requestingUrl || contents?.getURL() || "";
@@ -1209,6 +1231,30 @@ async function bootstrap(): Promise<void> {
   ipcMain.handle("paseo:opener:openUrl", (_event, value: unknown) => openExternalUrl(value));
   registerEditorTargetHandlers();
   registerBrowserAutomationIpc();
+  // Figmenta fork (contratto notes-maestro §10.5): the one channel the Orchestra page calls
+  // (preload.ts `orchestraDesktopActions.revealInVault`); figmenta/reveal.ts answers only
+  // Orchestra's top frame and only for a file inside the vault folder chosen here.
+  registerReveal(ipcMain, {
+    getVaultRoot: async () => (await getDesktopSettingsStore().get()).vault.root,
+    saveVaultRoot: async (root) => {
+      await getDesktopSettingsStore().setVaultRoot(root);
+      log.info("[orchestra] vault folder chosen", { root });
+    },
+    chooseVaultRoot: async (event) => {
+      const options: Electron.OpenDialogOptions = {
+        title: "Choose the vault folder",
+        message: "File paths in Maestro are shown from this folder.",
+        buttonLabel: "Use This Folder",
+        properties: ["openDirectory"],
+      };
+      const win = BrowserWindow.fromWebContents(event.sender);
+      const result = win
+        ? await dialog.showOpenDialog(win, options)
+        : await dialog.showOpenDialog(options);
+      return result.canceled ? null : (result.filePaths[0] ?? null);
+    },
+    showItemInFolder: (abs) => shell.showItemInFolder(abs),
+  });
 
   // In-app "Open in new window": opens a window that lands on the given project
   // via the same open-project flow as a CLI launch (no move, no ownership).
