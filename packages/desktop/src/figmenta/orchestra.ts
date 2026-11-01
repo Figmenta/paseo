@@ -4,6 +4,7 @@
 // policy decisions (which origin may navigate, which permission is granted, what the
 // seeded `~/.paseo/config.json` looks like) are unit-testable without Electron.
 
+import { notePath, noteRouteSlug } from "./orchestra-links.js";
 import { compareVersions } from "./semver.js";
 
 export const DEFAULT_ORCHESTRA_URL = "https://orchestra.figmenta.site";
@@ -77,6 +78,28 @@ export function orchestraOrigin(orchestraUrl: string = ORCHESTRA_URL): string {
 export function isOrchestraOrigin(url: string, orchestraUrl: string = ORCHESTRA_URL): boolean {
   const origin = safeOrigin(url);
   return origin !== null && origin === orchestraOrigin(orchestraUrl);
+}
+
+/**
+ * The page of a note opened by an `orchestra://notes/<slug>` link (contratto notes-site
+ * §10): its route on the Orchestra ORIGIN, never another one, with exactly one slash
+ * between them. `notePath` throws on a slug that is not valid.
+ */
+export function orchestraNoteUrl(slug: string, orchestraUrl: string = ORCHESTRA_URL): string {
+  return `${orchestraOrigin(orchestraUrl)}${notePath(slug)}`;
+}
+
+/**
+ * What a new Orchestra window loads. The note route of an `orchestra:` link that opened
+ * the app goes to that note; any other route — the Paseo routes of `paseo:` links, which
+ * this window has no page for — and no route at all give `orchestraUrl`, as before.
+ */
+export function orchestraWindowUrl(
+  initialRoute: string | null | undefined,
+  orchestraUrl: string = ORCHESTRA_URL,
+): string {
+  const slug = noteRouteSlug(initialRoute);
+  return slug === null ? orchestraUrl : orchestraNoteUrl(slug, orchestraUrl);
 }
 
 /**

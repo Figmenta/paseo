@@ -105,10 +105,21 @@ import {
   isOrchestraOrigin,
   ORCHESTRA_BACKGROUND_COLOR,
   ORCHESTRA_PLUGIN_ID,
-  ORCHESTRA_URL,
+  orchestraNoteUrl,
+  orchestraWindowUrl,
   permissionPolicy,
   titleBarInset,
 } from "./figmenta/orchestra.js";
+import {
+  findOrchestraLinkArg,
+  ignoredLinkFields,
+  isOrchestraLink,
+  notePath,
+  noteRouteSlug,
+  ORCHESTRA_LINK_SCHEME,
+  parseOrchestraLink,
+  parseOrchestraLinkFromArgv,
+} from "./figmenta/orchestra-links.js";
 import {
   restartOrchestraDaemon,
   seedOrchestraDaemonConfig,
@@ -362,6 +373,17 @@ let pendingOpenProjectPath = parseOpenProjectPathFromArgv({
   isDefaultApp: process.defaultApp,
 });
 let pendingAgentNavigation = parseAgentDeepLinkFromArgv(process.argv);
+// Figmenta fork (contratto notes-site §10): an `orchestra:` link that starts the app arrives
+// in argv on Windows and Linux (on macOS through `open-url`). Logged by bootstrap once this
+// process holds the single-instance lock: a second instance shares main.log and quits.
+const coldOrchestraLinkArg = findOrchestraLinkArg(process.argv);
+const coldOrchestraLink = parseOrchestraLinkFromArgv(process.argv);
+// A note link that arrived before the first Orchestra window: that window opens on it.
+let pendingNoteSlug: string | null = coldOrchestraLink?.slug ?? null;
+// The windows createWindow made (Orchestra popups and the splash, setup and update windows are
+// not in it): the only ones a note link may navigate.
+const orchestraWindows = new Set<BrowserWindow>();
+let noteWindowCreation: Promise<void> | null = null;
 
 // Each window pulls its own pending open-project path on mount, keyed by
 // webContents id, so deep-linked windows (second-instance launches, the
@@ -730,12 +752,14 @@ async function createWindow(
 
   const webContentsId = mainWindow.webContents.id;
   options.onCreated?.(webContentsId);
+  orchestraWindows.add(mainWindow);
   mainWindow.webContents.on("did-start-navigation", (_event, _url, isSameDocument, isMainFrame) => {
     if (isMainFrame && !isSameDocument) {
       agentNavigationInbox.windowLoading(webContentsId);
     }
   });
   mainWindow.on("closed", () => {
+    orchestraWindows.delete(mainWindow);
     options.onClosed?.(webContentsId);
     agentNavigationInbox.removeWindow(webContentsId);
     unregisterPaseoBrowserHost(webContentsId);
@@ -809,8 +833,14 @@ async function createWindow(
 
   // Figmenta fork: the main window IS the remote Orchestra web app. The bundled
   // Expo export and the `paseo://app` handler stay registered for deep links only,
-  // so `options.initialRoute` (a Paseo route) is meaningless here and is ignored.
-  await mainWindow.loadURL(ORCHESTRA_URL);
+  // so a Paseo `options.initialRoute` is meaningless here and is ignored. The one route
+  // honoured is the note route of an `orchestra://notes/<slug>` link (contratto notes-site
+  // §10), on the Orchestra origin (figmenta/orchestra.ts `orchestraWindowUrl`).
+  const initialNoteSlug = noteRouteSlug(options.initialRoute);
+  if (initialNoteSlug !== null) {
+    log.info("[deep-link] navigate", { path: notePath(initialNoteSlug) });
+  }
+  await mainWindow.loadURL(orchestraWindowUrl(options.initialRoute));
   return mainWindow;
 }
 
@@ -941,8 +971,65 @@ function receiveAgentDeepLink(input: string): void {
   });
 }
 
+// Figmenta fork (contratto notes-site §10): `orchestra://notes/<slug>` opens the note in an
+// existing Orchestra window (the focused one, else a visible one, else any), restored, shown
+// and focused; with none open (macOS keeps running without windows) it opens the primary
+// window on the note.
+function pickOrchestraWindow(): BrowserWindow | null {
+  const live = [...orchestraWindows].filter((win) => !win.isDestroyed());
+  const focused = BrowserWindow.getFocusedWindow();
+  if (focused && live.includes(focused)) return focused;
+  return live.find((win) => win.isVisible()) ?? live[0] ?? null;
+}
+
+async function openNoteInOrchestra(slug: string): Promise<void> {
+  const win = pickOrchestraWindow();
+  if (!win) {
+    if (!noteWindowCreation) {
+      // createWindow logs the navigation and loads the note.
+      noteWindowCreation = desktopWindowOwner
+        .openPrimary({ initialRoute: notePath(slug) })
+        .finally(() => {
+          noteWindowCreation = null;
+        });
+      await noteWindowCreation;
+      return;
+    }
+    await noteWindowCreation;
+    await openNoteInOrchestra(slug);
+    return;
+  }
+  log.info("[deep-link] navigate", { path: notePath(slug) });
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+  await win.loadURL(orchestraNoteUrl(slug));
+}
+
+function receiveNoteLink(slug: string): void {
+  if (bootstrapIsComplete) {
+    void openNoteInOrchestra(slug).catch((error) => {
+      log.error("[deep-link] failed to open the note", error);
+    });
+    return;
+  }
+  // Before the first window: bootstrap opens it on this note, or — when the link lands after
+  // bootstrap took the pending one — navigates to it as soon as the bootstrap completes.
+  pendingNoteSlug = slug;
+}
+
 app.on("open-url", (event, url) => {
   event.preventDefault();
+  if (isOrchestraLink(url)) {
+    const link = parseOrchestraLink(url);
+    if (!link) {
+      log.warn("[deep-link] ignored", ignoredLinkFields(url));
+      return;
+    }
+    log.info("[deep-link] open-url", { slug: link.slug, cold: !bootstrapIsComplete });
+    receiveNoteLink(link.slug);
+    return;
+  }
   receiveAgentDeepLink(url);
 });
 
@@ -959,6 +1046,20 @@ function setupSingleInstanceLock(): boolean {
   }
 
   app.on("second-instance", (_event, commandLine) => {
+    // Figmenta fork (contratto notes-site §10): an `orchestra:` link (Windows, Linux) opens the
+    // note in an existing window; valid or not, it never reaches the Paseo flows below.
+    const noteLink = parseOrchestraLinkFromArgv(commandLine);
+    if (noteLink) {
+      log.info("[deep-link] second-instance", { slug: noteLink.slug });
+      receiveNoteLink(noteLink.slug);
+      return;
+    }
+    const otherOrchestraLink = findOrchestraLinkArg(commandLine);
+    if (otherOrchestraLink !== null) {
+      log.warn("[deep-link] ignored", ignoredLinkFields(otherOrchestraLink));
+      return;
+    }
+
     const agentTarget = parseAgentDeepLinkFromArgv(commandLine);
     if (agentTarget) {
       void bootstrapComplete
@@ -1148,6 +1249,23 @@ async function bootstrap(): Promise<void> {
     return;
   }
 
+  // Figmenta fork (contratto notes-site §10): the packaged app answers `orchestra:` links. On
+  // Windows this is the only registration (HKCU; electron-builder's `protocols` covers macOS
+  // and Linux); on macOS it makes Orchestra the scheme's default handler.
+  if (app.isPackaged) {
+    const registered = app.setAsDefaultProtocolClient(ORCHESTRA_LINK_SCHEME);
+    if (registered) {
+      log.info("[deep-link] protocol client", { scheme: ORCHESTRA_LINK_SCHEME });
+    } else {
+      log.warn("[deep-link] protocol client not registered", { scheme: ORCHESTRA_LINK_SCHEME });
+    }
+  }
+  if (coldOrchestraLink) {
+    log.info("[deep-link] open-url", { slug: coldOrchestraLink.slug, cold: true });
+  } else if (coldOrchestraLinkArg !== null) {
+    log.warn("[deep-link] ignored", ignoredLinkFields(coldOrchestraLinkArg));
+  }
+
   await app.whenReady();
   // Figmenta fork: on screen before anything else starts (engine, site), until the first
   // Orchestra window has loaded. A second instance never gets here: it quit above.
@@ -1282,11 +1400,20 @@ async function bootstrap(): Promise<void> {
     new Promise((resolve) => setTimeout(resolve, 5_000)),
   ]);
 
-  // The first window of the session restores and persists saved geometry.
+  // The first window of the session restores and persists saved geometry. A note link that
+  // started the app gives its route, the one createWindow honours (Figmenta fork).
+  const initialNoteSlug = pendingNoteSlug;
+  pendingNoteSlug = null;
   const initialAgentNavigation = pendingAgentNavigation;
   pendingAgentNavigation = null;
+  let initialRoute: string | null = null;
+  if (initialNoteSlug !== null) {
+    initialRoute = notePath(initialNoteSlug);
+  } else if (initialAgentNavigation) {
+    initialRoute = buildAgentDeepLinkRoute(initialAgentNavigation);
+  }
   await desktopWindowOwner.openPrimary({
-    initialRoute: initialAgentNavigation ? buildAgentDeepLinkRoute(initialAgentNavigation) : null,
+    initialRoute,
     pendingProjectPath: pendingOpenProjectPath,
   });
   pendingOpenProjectPath = null;
@@ -1298,6 +1425,14 @@ async function bootstrap(): Promise<void> {
   // second-instance launches that arrived during cold start.
   bootstrapIsComplete = true;
   resolveBootstrapComplete();
+
+  if (pendingNoteSlug !== null) {
+    const slug = pendingNoteSlug;
+    pendingNoteSlug = null;
+    void openNoteInOrchestra(slug).catch((error) => {
+      log.error("[deep-link] failed to open the queued note", error);
+    });
+  }
 
   if (pendingAgentNavigation) {
     const target = pendingAgentNavigation;
@@ -1313,7 +1448,11 @@ async function bootstrap(): Promise<void> {
 }
 
 void runDesktopStartup({
-  hasPendingGuiLaunchRequest: Boolean(pendingOpenProjectPath || pendingAgentNavigation),
+  // Figmenta fork: an `orchestra:` URL in argv (Windows/Linux cold start) is a GUI launch,
+  // valid or not; read as CLI arguments it would run `paseo orchestra://…` and exit.
+  hasPendingGuiLaunchRequest: Boolean(
+    pendingOpenProjectPath || pendingAgentNavigation || coldOrchestraLinkArg !== null,
+  ),
   runCliPassthroughIfRequested,
   inheritLoginShellEnv,
   bootstrapGui: bootstrap,
