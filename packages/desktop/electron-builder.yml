@@ -9,6 +9,12 @@ protocols:
   - name: Orchestra agent link
     schemes:
       - paseo
+  # Figmenta fork (contratto notes-site §10): `orchestra://notes/<slug>` from the notes host.
+  # Declared for macOS (Info.plist) and Linux (.desktop); Windows registers it at runtime
+  # with app.setAsDefaultProtocolClient (src/main.ts).
+  - name: Orchestra link
+    schemes:
+      - orchestra
 # Figmenta fork: fails the build when the private plugin was not synced into
 # figmenta-plugin/ or is not the version in figmenta-plugin.version.
 beforePack: ./scripts/figmenta-plugin-guard.js
