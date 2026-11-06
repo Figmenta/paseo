@@ -18,6 +18,7 @@ import {
 } from "@/runtime/host-runtime";
 import { useSessionStore, type SessionState } from "@/stores/session-store";
 import { useUsageSetting } from "./setting";
+import { isEmbedMode } from "@/figmenta/embed"; // Figmenta: embed gate
 import { usageCopy } from "./copy";
 import {
   replaceReport,
@@ -215,7 +216,8 @@ export function useHostReportsUsage(serverId: string): boolean {
   const isConnected = useHostRuntimeIsConnected(serverId);
   const isSupported = useSessionStore((state) => supportsUsage(state.sessions[serverId]));
   const setting = useUsageSetting(serverId);
-  return isConnected && isSupported && setting.enabled;
+  // Figmenta: embed gate — the seat's account usage is not shown in the embed.
+  return isConnected && isSupported && setting.enabled && !isEmbedMode();
 }
 
 /** Every host with whether it is connected and reports usage, in host order. */

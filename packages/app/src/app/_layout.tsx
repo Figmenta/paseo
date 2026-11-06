@@ -8,7 +8,13 @@ import { BottomSheetModalProvider } from "@gorhom/bottom-sheet";
 import { PortalProvider } from "@gorhom/portal";
 import { LucideProvider } from "lucide-react-native";
 import * as Linking from "expo-linking";
-import { Stack, useNavigationContainerRef, usePathname, useRouter } from "expo-router";
+import {
+  Stack,
+  useNavigationContainerRef,
+  usePathname,
+  useRootNavigationState,
+  useRouter,
+} from "expo-router";
 import {
   createContext,
   type ReactNode,
@@ -59,6 +65,13 @@ import {
   resolveDesktopSidebarVisibility,
 } from "@/components/desktop-sidebar-layout";
 import { isNative, isWeb } from "@/constants/platform";
+import {
+  installEmbedBridge,
+  isEmbedMode,
+  lastAgentRoute,
+  rememberAgentRoute,
+  shouldBlockEmbedRoute,
+} from "@/figmenta/embed";
 import { HorizontalScrollProvider } from "@/contexts/horizontal-scroll-context";
 import { SessionProvider } from "@/contexts/session-context";
 import { SidebarCalloutProvider } from "@/contexts/sidebar-callout-context";
@@ -578,10 +591,33 @@ function SidebarChrome({
   const isCompactLayout = useIsCompactFormFactor();
   const isMobileActive = useIsMobilePanelActive("agent-list");
   const isDesktopOpen = usePanelStore((state) => state.desktop.agentListOpen);
-  const active = visible && (isCompactLayout ? isMobileActive : isDesktopOpen);
+  // Figmenta embed mode: Orchestra draws the session list itself (docs/FIGMENTA.md).
+  const embedded = isEmbedMode();
+  const embedPathname = usePathname();
+  const embedRouter = useRouter();
+  const embedNavigationKey = useRootNavigationState()?.key;
+  useEffect(() => {
+    if (embedded) installEmbedBridge();
+  }, [embedded]);
+  useEffect(() => {
+    if (embedded) rememberAgentRoute(embedPathname);
+  }, [embedded, embedPathname]);
+  // The guard may only navigate once the Root Layout is mounted: an iframe that
+  // lands straight on /settings would otherwise replace before the navigator
+  // exists ("Attempted to navigate before mounting the Root Layout component").
+  useEffect(() => {
+    if (!embedded || !embedNavigationKey) return;
+    if (!shouldBlockEmbedRoute(embedPathname)) return;
+    if (embedRouter.canGoBack()) {
+      embedRouter.back();
+      return;
+    }
+    embedRouter.replace(lastAgentRoute() ?? "/");
+  }, [embedded, embedNavigationKey, embedPathname, embedRouter]);
+  const active = !embedded && visible && (isCompactLayout ? isMobileActive : isDesktopOpen);
   return (
     <SidebarModelProvider active={active}>
-      {mounted ? <LeftSidebar active={active} /> : null}
+      {mounted && !embedded ? <LeftSidebar active={active} /> : null}
       <WorkspaceShortcutTargetsSubscriber enabled={keyboardShortcutsEnabled} />
     </SidebarModelProvider>
   );

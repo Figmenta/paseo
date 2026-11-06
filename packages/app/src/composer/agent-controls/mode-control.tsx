@@ -69,6 +69,11 @@ export interface AgentModeControlValue {
   selectedModeId: string | null | undefined;
   onSelectMode: (modeId: string) => void;
   disabled?: boolean;
+  /**
+   * Figmenta embed (`maestro.models.allow` `modes`, docs/FIGMENTA.md): the agent's current mode
+   * when `modeOptions` leaves it out, so the trigger names it instead of the first option.
+   */
+  selectedModeFallback?: AgentMode | null;
 }
 
 function normalizeSearchQuery(value: string): string {
@@ -82,6 +87,7 @@ export function AgentModeControl({
   selectedModeId,
   onSelectMode,
   disabled = false,
+  selectedModeFallback = null,
   surface = "toolbar",
   onClose,
 }: AgentModeControlValue & { surface?: "toolbar" | "sheet"; onClose?: () => void }) {
@@ -98,8 +104,10 @@ export function AgentModeControl({
 
   const selectedMode = useMemo(() => {
     if (modeOptions.length === 0) return null;
-    return modeOptions.find((m) => m.id === selectedModeId) ?? modeOptions[0];
-  }, [modeOptions, selectedModeId]);
+    return (
+      modeOptions.find((m) => m.id === selectedModeId) ?? selectedModeFallback ?? modeOptions[0]
+    );
+  }, [modeOptions, selectedModeFallback, selectedModeId]);
 
   const Icon = getAgentModeIcon(provider, selectedMode?.id ?? "", providerDefinitions);
   const iconColor = theme.colors.foregroundMuted;

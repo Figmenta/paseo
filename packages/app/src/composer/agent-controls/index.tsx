@@ -82,6 +82,8 @@ import { ComposerControlLayoutProvider } from "@/composer/agent-controls/layout-
 import { ComposerToolbarGlyph } from "@/composer/agent-controls/glyph";
 import { AgentControlTrigger } from "@/composer/agent-controls/control";
 import { CompactModelSheet } from "@/composer/agent-controls/model-sheet";
+import { useEmbedDraftModelsAllowMenu, useEmbedModelsAllowMenu } from "@/figmenta/models-allow";
+import { narrowModeIds, useEmbedAgentModesEfforts } from "@/figmenta/modes-efforts";
 import {
   useAgentProfileEditor,
   useAgentProfilePicker,
@@ -131,6 +133,17 @@ interface ControlledAgentControlsProps {
   modeControl?: AgentModeControlValue | null;
   modelSelectorServerId?: string | null;
   isCompactLayout?: boolean;
+  /**
+   * Figmenta embed (`maestro.models.allow` with `hidden: true`, docs/FIGMENTA.md): no model
+   * selector, desktop or compact; the compact form factor falls back to the toolbar so effort
+   * and permission mode, which live inside the model sheet there, stay reachable.
+   */
+  hideModelSelector?: boolean;
+  /**
+   * Figmenta embed (`maestro.models.allow` `efforts`, docs/FIGMENTA.md): the label of the agent's
+   * current effort when `thinkingOptions` leaves it out, so the trigger names it.
+   */
+  thinkingFallbackLabel?: string;
 }
 
 export interface DraftAgentControlsProps {
@@ -327,6 +340,23 @@ function buildFallbackModelSelectorProviders(
   ];
 }
 
+/**
+ * The compact form factor puts the model, effort and mode in one sheet opened from the model
+ * trigger. Figmenta embed: without a model selector (`hideModelSelector`, docs/FIGMENTA.md) there
+ * is no such trigger, so the toolbar layout is used, where effort and mode have their own.
+ */
+function resolveModelSelectorLayout(input: {
+  canPickModel: boolean;
+  hideModelSelector: boolean | undefined;
+  isCompact: boolean;
+}): { canSelectModel: boolean; modelSheetLayout: boolean } {
+  const hidden = input.hideModelSelector === true;
+  return {
+    canSelectModel: input.canPickModel && !hidden,
+    modelSheetLayout: input.isCompact && !hidden,
+  };
+}
+
 function makeBadgePressableStyle(
   baseStyle: StyleProp<ViewStyle>,
   disabledStyle: StyleProp<ViewStyle>,
@@ -502,6 +532,8 @@ function ControlledAgentControls({
   modeControl,
   modelSelectorServerId = null,
   isCompactLayout,
+  hideModelSelector,
+  thinkingFallbackLabel,
 }: ControlledAgentControlsProps) {
   const { theme } = useUnistyles();
   const { t } = useTranslation();
@@ -522,7 +554,11 @@ function ControlledAgentControls({
   const canSelectProvider = Boolean(
     onSelectProvider && providerOptions && providerOptions.length > 0,
   );
-  const canSelectModel = Boolean(onSelectModel);
+  const { canSelectModel, modelSheetLayout } = resolveModelSelectorLayout({
+    canPickModel: Boolean(onSelectModel),
+    hideModelSelector,
+    isCompact,
+  });
   const canSelectThinking = Boolean(
     onSelectThinkingOption && thinkingOptions && thinkingOptions.length > 0,
   );
@@ -539,7 +575,9 @@ function ControlledAgentControls({
   const displayThinking = findOptionLabel(
     formattedThinkingOptions,
     selectedThinkingOptionId,
-    formattedThinkingOptions[0]?.label ?? t("agentControls.thinking.unknown"),
+    thinkingFallbackLabel ??
+      formattedThinkingOptions[0]?.label ??
+      t("agentControls.thinking.unknown"),
   );
 
   const hasAnyControl = resolveHasAnyControl({
@@ -734,7 +772,7 @@ function ControlledAgentControls({
   return (
     <ComposerControlLayoutProvider value={layoutContextValue}>
       <View style={styles.container} onLayout={handleLayout}>
-        {!isCompact ? (
+        {!modelSheetLayout ? (
           <DesktopAgentControlsContent
             provider={provider}
             providerOptions={providerOptions}
@@ -1561,9 +1599,7 @@ export const AgentControls = memo(function AgentControls({
   );
   const client = useSessionStore((state) => state.sessions[serverId]?.client ?? null);
   const toast = useToast();
-  const modeControl = useLiveAgentModeControl(serverId, agentId);
-  const commandCenterModes = toCommandCenterModes(modeControl);
-  const modeProviderDefinitions = getModeProviderDefinitions(modeControl);
+  const liveModeControl = useLiveAgentModeControl(serverId, agentId);
 
   const {
     entries: snapshotEntries,
@@ -1607,17 +1643,29 @@ export const AgentControls = memo(function AgentControls({
     runtimeThinkingOptionId: agent?.runtimeThinkingOptionId,
     explicitThinkingOptionId: agent?.thinkingOptionId,
   });
+  // Figmenta embed: Orchestra's `modes` and `efforts` narrow this agent's mode and effort menus,
+  // the command center's mode, plan-mode and thinking groups, and the modes a profile may apply;
+  // without a list all of them are untouched (docs/FIGMENTA.md).
+  const embedModesEfforts = useEmbedAgentModesEfforts({
+    agentId,
+    modeControl: liveModeControl,
+    thinkingOptions: modelSelection.thinkingOptions,
+    selectedThinkingId: modelSelection.selectedThinkingId,
+  });
+  const modeControl = embedModesEfforts.modeControl;
+  const commandCenterModes = toCommandCenterModes(modeControl);
+  const modeProviderDefinitions = getModeProviderDefinitions(modeControl);
 
   const modelOptions = useMemo<AgentControlOption[]>(() => {
     return (models ?? []).map((model) => ({ id: model.id, label: model.label }));
   }, [models]);
 
   const thinkingOptions = useMemo<AgentControlOption[]>(() => {
-    return (modelSelection.thinkingOptions ?? []).map((option) => ({
+    return (embedModesEfforts.thinkingOptions ?? []).map((option) => ({
       id: option.id,
       label: formatThinkingOptionLabel(option),
     }));
-  }, [modelSelection.thinkingOptions]);
+  }, [embedModesEfforts.thinkingOptions]);
 
   const agentProvider = agent?.provider;
   const activeModelId = modelSelection.activeModelId;
@@ -1652,8 +1700,8 @@ export const AgentControls = memo(function AgentControls({
   // can apply to it.
   const profileProviders = useMemo(() => (agentProvider ? [agentProvider] : []), [agentProvider]);
   const profileModeIds = useMemo(
-    () => resolveSnapshotModeIds(snapshotSelectedEntry),
-    [snapshotSelectedEntry],
+    () => narrowModeIds(resolveSnapshotModeIds(snapshotSelectedEntry), embedModesEfforts.modes),
+    [embedModesEfforts.modes, snapshotSelectedEntry],
   );
   const profileTarget = useMemo<AgentProfileApplyTarget>(
     () => ({ kind: "agent", agentId, availableModeIds: profileModeIds }),
@@ -1663,6 +1711,14 @@ export const AgentControls = memo(function AgentControls({
     serverId,
     availableProviders: profileProviders,
     target: profileTarget,
+  });
+  // Figmenta embed: Orchestra's `maestro.models.allow` narrows this agent's menu and the
+  // command center's model group, or hides both (`hidden`); without a message both are
+  // untouched (docs/FIGMENTA.md).
+  const embedModelMenu = useEmbedModelsAllowMenu({
+    agentId,
+    providers: agentModelSelectorProviders,
+    profiles: agentProfiles,
   });
   const handleEditAgentProfiles = useEditAgentProfilesNavigation(serverId, agentProfiles !== null);
   const profileEditor = useAgentProfileEditor(serverId);
@@ -1733,13 +1789,13 @@ export const AgentControls = memo(function AgentControls({
       provider: agentProvider,
       providerDefinitions: modeProviderDefinitions,
       models: {
-        providers: agentModelSelectorProviders,
+        providers: embedModelMenu.providers,
         selectedProvider: agentProvider,
         selectedModelId: activeModelId,
         select: handleSelectCommandCenterModel,
       },
       thinking: {
-        options: modelSelection.thinkingOptions,
+        options: embedModesEfforts.thinkingOptions,
         selectedId: modelSelection.selectedThinkingId,
         select: handleSelectThinkingOption,
       },
@@ -1753,15 +1809,15 @@ export const AgentControls = memo(function AgentControls({
       activeModelId,
       agent?.features,
       agentId,
-      agentModelSelectorProviders,
       agentProvider,
       commandCenterModes,
+      embedModelMenu.providers,
+      embedModesEfforts.thinkingOptions,
       handleSelectCommandCenterModel,
       handleSelectThinkingOption,
       handleSetFeature,
       modeProviderDefinitions,
       modelSelection.selectedThinkingId,
-      modelSelection.thinkingOptions,
       serverId,
     ],
   );
@@ -1795,11 +1851,11 @@ export const AgentControls = memo(function AgentControls({
       {profileEditor.element}
       <ControlledAgentControls
         provider={agent.provider}
-        modelSelectorProviders={agentModelSelectorProviders}
+        modelSelectorProviders={embedModelMenu.providers}
         modelOptions={modelOptions}
         selectedModelId={modelSelection.activeModelId ?? undefined}
         onSelectModel={handleSelectModel}
-        agentProfiles={agentProfiles}
+        agentProfiles={embedModelMenu.profiles}
         onApplyAgentProfile={agentProfiles?.applyProfile}
         onEditAgentProfiles={handleEditAgentProfiles}
         onCreateAgentProfile={profileActions.create}
@@ -1818,6 +1874,8 @@ export const AgentControls = memo(function AgentControls({
         modeControl={modeControl}
         modelSelectorServerId={serverId}
         isCompactLayout={isCompactLayout}
+        hideModelSelector={embedModelMenu.hidden}
+        thinkingFallbackLabel={embedModesEfforts.thinkingFallbackLabel}
       />
     </>
   );
@@ -1892,6 +1950,13 @@ export function DraftAgentControls({
   );
   const profileEditor = useAgentProfileEditor(modelSelectorServerId);
   const profileActions = resolveAgentProfileEditorActions(agentProfiles !== null, profileEditor);
+  // Figmenta embed: a draft has no agentId Orchestra could name, so the person's default
+  // (`maestro.models.allow` with agentId "*") narrows its menu or hides it (`hidden`), desktop and
+  // compact; without a default it is untouched (docs/FIGMENTA.md).
+  const embedModelMenu = useEmbedDraftModelsAllowMenu({
+    providers: modelSelectorProviders,
+    profiles: agentProfiles,
+  });
 
   const modeControl = useMemo<AgentModeControlValue | null>(
     () =>
@@ -1913,13 +1978,13 @@ export function DraftAgentControls({
       {profileEditor.element}
       <ControlledAgentControls
         provider={selectedProvider ?? ""}
-        modelSelectorProviders={modelSelectorProviders}
+        modelSelectorProviders={embedModelMenu.providers}
         modelOptions={modelOptions}
         selectedModelId={selectedModel}
         onSelectModel={onSelectModel}
         onSelectProviderAndModel={onSelectProviderAndModel}
         isModelLoading={isAllModelsLoading}
-        agentProfiles={agentProfiles}
+        agentProfiles={embedModelMenu.profiles}
         onApplyAgentProfile={agentProfiles?.applyProfile}
         onEditAgentProfiles={handleEditAgentProfiles}
         onCreateAgentProfile={profileActions.create}
@@ -1937,6 +2002,7 @@ export function DraftAgentControls({
         modeControl={modeControl}
         modelSelectorServerId={modelSelectorServerId}
         isCompactLayout={isCompactLayout}
+        hideModelSelector={embedModelMenu.hidden}
       />
     </>
   );

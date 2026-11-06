@@ -1,3 +1,4 @@
+import { EmbedDraftGate } from "@/figmenta/launcher-closed-notice"; // Figmenta: launcher gate
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { Button } from "@/components/ui/button";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
@@ -364,7 +365,12 @@ function DraftPanel() {
 export function AgentConversationPanel() {
   const { target } = usePaneContext();
   if (target.kind === "draft") {
-    return <DraftPanel />;
+    // Figmenta: launcher gate — a restored draft creates an agent: not in a locked embed.
+    return (
+      <EmbedDraftGate draftId={target.draftId}>
+        <DraftPanel />
+      </EmbedDraftGate>
+    );
   }
   if (target.kind === "agent") {
     return <AgentPanel />;
@@ -1127,6 +1133,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
       serverId,
       agentId,
     }),
+    agentId,
   });
   // Stabilize the agentInputDraft object identity so that memo(AgentComposerSection) can bail out
   // when only toast state changes (which does not affect any draft field).

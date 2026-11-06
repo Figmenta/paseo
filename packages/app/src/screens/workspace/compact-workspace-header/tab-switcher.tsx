@@ -18,6 +18,7 @@ import {
   type WorkspaceTabMenuLabels,
 } from "@/screens/workspace/workspace-tab-menu";
 import type { WorkspaceTabDescriptor } from "@/screens/workspace/workspace-tabs-types";
+import { useEmbedLauncherLocked } from "@/figmenta/launcher-lock"; // Figmenta: launcher gate
 
 // The trigger draws at 32pt beside its island neighbours, so only vertical slop is free.
 const TAB_SWITCHER_TRIGGER_HIT_SLOP = { top: 8, bottom: 8 } as const;
@@ -350,31 +351,34 @@ export const MobileWorkspaceTabSwitcher = memo(function MobileWorkspaceTabSwitch
     onCreateTerminal();
   }, [onCreateTerminal]);
 
+  const embedLauncherLocked = useEmbedLauncherLocked(); // Figmenta: launcher gate
+  // Figmenta: launcher gate — New agent / New terminal open tabs: no footer in a locked embed.
   const footer = useMemo(
-    () => (
-      <View style={styles.tabSwitcherFooter}>
-        <Button
-          testID="workspace-tab-switcher-new-agent"
-          style={styles.tabSwitcherFooterButton}
-          variant="secondary"
-          leftIcon={SquarePen}
-          onPress={handleNewAgent}
-        >
-          {t("workspace.header.actions.newAgent")}
-        </Button>
-        <Button
-          testID="workspace-tab-switcher-new-terminal"
-          style={styles.tabSwitcherFooterButton}
-          variant="secondary"
-          leftIcon={SquareTerminal}
-          disabled={createTerminalDisabled}
-          onPress={handleNewTerminal}
-        >
-          {t("workspace.header.actions.newTerminal")}
-        </Button>
-      </View>
-    ),
-    [createTerminalDisabled, handleNewAgent, handleNewTerminal, t],
+    () =>
+      embedLauncherLocked ? null : (
+        <View style={styles.tabSwitcherFooter}>
+          <Button
+            testID="workspace-tab-switcher-new-agent"
+            style={styles.tabSwitcherFooterButton}
+            variant="secondary"
+            leftIcon={SquarePen}
+            onPress={handleNewAgent}
+          >
+            {t("workspace.header.actions.newAgent")}
+          </Button>
+          <Button
+            testID="workspace-tab-switcher-new-terminal"
+            style={styles.tabSwitcherFooterButton}
+            variant="secondary"
+            leftIcon={SquareTerminal}
+            disabled={createTerminalDisabled}
+            onPress={handleNewTerminal}
+          >
+            {t("workspace.header.actions.newTerminal")}
+          </Button>
+        </View>
+      ),
+    [createTerminalDisabled, embedLauncherLocked, handleNewAgent, handleNewTerminal, t],
   );
 
   const renderTabOption = useCallback(

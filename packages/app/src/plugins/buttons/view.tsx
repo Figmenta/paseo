@@ -25,6 +25,7 @@ import {
   type MenuPageDefinition,
 } from "@/components/ui/menu";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
+import { isEmbedMode } from "@/figmenta/embed"; // Figmenta: embed gate
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import { HEADER_CONTROL_HEIGHT } from "@/components/ui/control-geometry";
 import {
@@ -553,9 +554,15 @@ function useButtons(serverId: string, workspaceId: string, agentId: string | nul
     pluginButtonStore.getSnapshot,
     pluginButtonStore.getSnapshot,
   );
+  // Figmenta: embed gate — Orchestra draws the chrome: no plugin header buttons, composer pills
+  // or workspace-menu rows in the embed.
+  const embedded = isEmbedMode();
   return useMemo(
-    () => entries.filter((entry) => buttonMatches(entry, serverId, workspaceId, agentId)),
-    [entries, serverId, workspaceId, agentId],
+    () =>
+      embedded
+        ? []
+        : entries.filter((entry) => buttonMatches(entry, serverId, workspaceId, agentId)),
+    [embedded, entries, serverId, workspaceId, agentId],
   );
 }
 

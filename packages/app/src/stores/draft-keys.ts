@@ -1,10 +1,12 @@
 import { generateMessageId } from "@/types/stream";
+import { noteSessionDraftId } from "@/figmenta/launcher-lock"; // Figmenta: launcher gate
 
 export const NEW_WORKSPACE_DRAFT_KEY = "new-workspace";
 const NEW_WORKSPACE_FORK_DRAFT_PREFIX = `${NEW_WORKSPACE_DRAFT_KEY}:draft:`;
 
 export function generateDraftId(): string {
-  return `draft_${generateMessageId()}`;
+  // Figmenta: launcher gate — drafts born in this page (/clear, fork) stay usable when locked.
+  return noteSessionDraftId(`draft_${generateMessageId()}`);
 }
 
 export function buildNewWorkspaceDraftKey(draftId?: string): string {

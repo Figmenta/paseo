@@ -1,3 +1,5 @@
+import { isLauncherActionBlocked } from "@/figmenta/launcher-lock"; // Figmenta: launcher gate
+
 export type KeyboardActionScope = "global" | "message-input" | "sidebar" | "workspace";
 
 export type WorkspacePanelTarget = "changes" | "files" | "pull-request";
@@ -148,6 +150,8 @@ export function createKeyboardActionDispatcher() {
     },
 
     dispatch(action: KeyboardActionDefinition): boolean {
+      // Figmenta: launcher gate — in embed, no handler opens tabs/agents/terminals until allowed.
+      if (isLauncherActionBlocked(action.id)) return false;
       const candidates = Array.from(handlers.values())
         .filter((handler) => handler.actions.includes(action.id))
         .filter((handler) => handler.enabled)

@@ -3,6 +3,7 @@ import { watchdog } from "@/watchdog";
 import { createHostChannelTransport } from "@getpaseo/client/internal/hosts";
 import type { OwnedSubscription } from "@getpaseo/client";
 import type { HostDirectory } from "@getpaseo/protocol/hosts";
+import { canCreateEmbedTerminal } from "@/figmenta/launcher-lock"; // Figmenta: launcher gate
 import { useSyncExternalStore, useMemo } from "react";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import equal from "fast-deep-equal/es6";
@@ -91,6 +92,7 @@ import {
 import { projectIconCache } from "@/projects/icon-cache";
 import { createPerformanceTrace } from "@/performance/native-trace";
 import { revokePushNotifications } from "@/push-notifications";
+import { isEmbedMode, readEmbedComposerLock, subscribeToEmbedComposerLock } from "@/figmenta/embed";
 import { createAppWebSocketFactory } from "./websocket-factory";
 
 export type HostRuntimeConnectionStatus = "idle" | "connecting" | "online" | "offline" | "error";
@@ -593,6 +595,7 @@ function createDefaultDeps(
         createPluginClientBundleStore: createHostPluginClientBundleStore,
         ...(host.password ? { password: host.password } : {}),
         localCredential: () => readDesktopManagedLocalCredential(connection),
+        canCreateTerminal: canCreateEmbedTerminal, // Figmenta: launcher gate
       } satisfies Omit<DaemonClientConfig, "url">;
       if (connection.type === "routed") {
         const origin = resolveOrigin(connection.originServerId);
@@ -1653,6 +1656,11 @@ export class HostRuntimeStore {
     this.storage = input?.storage ?? AsyncStorage;
     this.replicaCache = new ReplicaCache(input?.replicaRowStore ?? createReplicaRowStore());
     this.revokePushNotifications = input?.revokePushNotifications ?? revokePushNotifications;
+    // Figmenta embed (docs/FIGMENTA.md): a queue held back by a composer lock leaves
+    // when the lock falls. Outside the embed no lock ever arrives and this never fires.
+    subscribeToEmbedComposerLock((agentId) =>
+      this.drainQueuedAgentMessageAfterEmbedUnlock(agentId),
+    );
   }
 
   // --- Host registry ---
@@ -2458,6 +2466,8 @@ export class HostRuntimeStore {
     this.hostObservations.delete(serverId);
     const host = this.hosts.find((candidate) => candidate.serverId === serverId);
     if (
+      // Figmenta: embed gate — the frame stays on its own host: no routed hosts added or fetched.
+      isEmbedMode() ||
       !client?.isConnected ||
       !client.getLastServerInfoMessage()?.features?.connectedHosts ||
       host?.connections.some((connection) => connection.type === "routed")
@@ -2561,6 +2571,8 @@ export class HostRuntimeStore {
   }
 
   drainQueuedAgentMessage(serverId: string, agentId: string): void {
+    // Figmenta embed: a locked composer sends nothing, its queue included. The row stays.
+    if (readEmbedComposerLock(agentId) !== null) return;
     const drainKey = `${serverId}:${agentId}`;
     if (this.queuedAgentDrainInFlight.has(drainKey)) return;
     const store = useSessionStore.getState();
@@ -2614,6 +2626,17 @@ export class HostRuntimeStore {
       .finally(() => {
         this.queuedAgentDrainInFlight.delete(drainKey);
       });
+  }
+
+  // Called on every lock change; the drain itself refuses while the lock holds. After an
+  // unlock, the turn end that should have drained the queue may be past: drain on every
+  // host this store runs where the agent sits idle. A running agent drains at turn end.
+  private drainQueuedAgentMessageAfterEmbedUnlock(agentId: string): void {
+    for (const serverId of this.directorySyncByServer.keys()) {
+      const session = useSessionStore.getState().sessions[serverId];
+      const agent = session?.agents.get(agentId) ?? session?.agentDetails.get(agentId);
+      if (agent?.turn.phase === "idle") this.drainQueuedAgentMessage(serverId, agentId);
+    }
   }
 
   applyAgentTurnLiveness(

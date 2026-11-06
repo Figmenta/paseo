@@ -25,6 +25,7 @@ import {
   type PanelIconProps,
   type PanelPresentation,
 } from "@/panels/panel-registry";
+import { useEmbedLauncherLocked } from "@/figmenta/launcher-lock"; // Figmenta: launcher gate
 import {
   getTerminalProfileIcon,
   resolveTerminalProfiles,
@@ -108,6 +109,7 @@ export function useWorkspaceTabLaunchCatalog(input: {
   const { config } = useDaemonConfig(serverId);
   const plugins = useInstalledPlugins();
   const isCompact = useIsCompactFormFactor();
+  const embedLauncherLocked = useEmbedLauncherLocked(); // Figmenta: launcher gate
 
   const launchSelection = useCallback(
     (selection: NewTabSelection) => (destination: WorkspaceTabLaunchDestination) => {
@@ -119,7 +121,7 @@ export function useWorkspaceTabLaunchCatalog(input: {
     router.push(buildSettingsHostSectionRoute(serverId, "terminals") as Href);
   }, [router, serverId]);
 
-  return useMemo(() => {
+  const catalog = useMemo(() => {
     const changesPresentation = getLaunchPresentation("changes_tree");
     const diffPresentation = getLaunchPresentation("working_diff");
     const filesPresentation = getLaunchPresentation("files");
@@ -264,6 +266,11 @@ export function useWorkspaceTabLaunchCatalog(input: {
     serverId,
     t,
   ]);
+  // Figmenta: launcher gate — embedded and not allowed: nothing to launch (new_tab, «+», rail).
+  return embedLauncherLocked ? EMPTY_LAUNCH_CATALOG : catalog;
 }
+
+// Figmenta: launcher gate
+const EMPTY_LAUNCH_CATALOG: readonly WorkspaceTabLaunchGroup[] = Object.freeze([]);
 
 export { getBuiltInLaunchOrder } from "./internal/catalog";

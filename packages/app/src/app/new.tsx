@@ -7,6 +7,8 @@ import {
 } from "@/composer/editing-session";
 import { NewWorkspaceScreen } from "@/screens/new-workspace-screen";
 import { buildNewWorkspaceDraftKey } from "@/stores/draft-keys";
+import { useEmbedLauncherLocked } from "@/figmenta/launcher-lock"; // Figmenta: launcher gate
+import { EmbedSessionClosedNotice } from "@/figmenta/launcher-closed-notice"; // Figmenta: launcher gate
 
 /** New workspace drafts share one editing-session home, keyed like a tab by draft. */
 const NEW_WORKSPACE_SESSIONS_KEY = "new-workspace";
@@ -31,11 +33,13 @@ export default function NewWorkspaceRoute() {
     projectId ?? null,
     draftId ?? null,
   ]);
+  const embedLauncherLocked = useEmbedLauncherLocked(); // Figmenta: launcher gate
 
   // The shell remounts this route when the viewport crosses the compact breakpoint;
   // the draft's editing session (fullscreen, retained caret) lives above the shell.
   const draftKey = buildNewWorkspaceDraftKey(draftId);
   const sessionTabIds = useMemo(() => [draftKey], [draftKey]);
+  if (embedLauncherLocked) return <EmbedSessionClosedNotice />; // Figmenta: launcher gate
 
   return (
     <HostRouteBootstrapBoundary>

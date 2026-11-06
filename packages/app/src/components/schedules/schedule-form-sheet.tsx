@@ -46,6 +46,8 @@ import { useSessionStore } from "@/stores/session-store";
 import { buildScheduleProjectTargets } from "@/schedules/schedule-project-targets";
 import { useScheduleFormModel } from "@/schedules/use-schedule-form-model";
 import { useScheduleFormProviderSnapshot } from "@/schedules/use-schedule-form-provider-snapshot";
+import { useEmbedDraftModelsAllowMenu } from "@/figmenta/models-allow";
+import { useEmbedScheduleModesEfforts } from "@/figmenta/modes-efforts";
 import type {
   ScheduleFormDisplay,
   ScheduleFormHost,
@@ -589,24 +591,41 @@ function ScheduleTargetFields({
     return null;
   }, [selectedHost, state.selectedServerId]);
   const projectOptions = state.projectOptions;
+  // Figmenta embed: a schedule creates a new agent, so its model menu follows Orchestra's
+  // person-level default ("*"), like a draft; hidden = no model field at all (docs/FIGMENTA.md).
+  const embedModelMenu = useEmbedDraftModelsAllowMenu({
+    providers: state.modelSelectorProviders,
+    profiles: null,
+  });
+  const showModelField = state.disclosure.showModelField && !embedModelMenu.hidden;
+  // Figmenta embed: the Mode and Thinking fields list only what the person's default ("*") allows,
+  // and the form's selection is moved into those lists, like a draft's (docs/FIGMENTA.md).
+  const embedModesEfforts = useEmbedScheduleModesEfforts({
+    modeOptions: state.modeOptions,
+    selectedMode: state.selectedMode,
+    onSelectMode: model.setSessionMode,
+    thinkingOptions: state.availableThinkingOptions,
+    selectedThinkingOptionId: state.selectedThinkingOptionId,
+    onSelectThinking: model.setThinking,
+  });
   const modeOptions = useMemo<SelectFieldOption<string>[]>(
     () =>
-      state.modeOptions.map((option) => ({
+      embedModesEfforts.modeOptions.map((option) => ({
         id: option.id,
         value: option.id,
         label: option.label,
       })),
-    [state.modeOptions],
+    [embedModesEfforts.modeOptions],
   );
   const thinkingOptions = useMemo<SelectFieldOption<string>[]>(
     () =>
-      state.availableThinkingOptions.map((option) => ({
+      embedModesEfforts.thinkingOptions.map((option) => ({
         id: option.id,
         value: option.id,
         label: formatThinkingOptionLabel(option),
         testID: buildThinkingOptionTestId(option.id),
       })),
-    [state.availableThinkingOptions],
+    [embedModesEfforts.thinkingOptions],
   );
   const handleSelectHost = useCallback(
     (nextServerId: string) => {
@@ -739,10 +758,10 @@ function ScheduleTargetFields({
         />
       ) : null}
 
-      {state.disclosure.showModelField ? (
+      {showModelField ? (
         <Field label="Model">
           <CombinedModelSelector
-            providers={state.modelSelectorProviders}
+            providers={embedModelMenu.providers}
             selectedProvider={state.selectedProvider ?? ""}
             selectedModel={state.selectedModel}
             onSelect={handleSelectModel}

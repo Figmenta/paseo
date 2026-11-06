@@ -36,6 +36,7 @@ import {
   type AgentProfileSeed,
 } from "@/agent-profiles";
 import type { SheetHeader } from "@/components/adaptive-modal-sheet";
+import { isEmbedMode } from "@/figmenta/embed";
 import { Button } from "@/components/ui/button";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -90,6 +91,9 @@ function ProviderSettingsAction({
     if (!serverId) return;
     useProviderSettingsStore.getState().open({ serverId, provider, overlayParentLayer });
   }, [overlayParentLayer, provider, serverId]);
+
+  // Figmenta embed: no Paseo settings surface is reachable (docs/FIGMENTA.md).
+  if (isEmbedMode()) return null;
 
   return (
     <Pressable
@@ -706,12 +710,15 @@ function ModelRow({
   const handlePointerEnter = useCallback(() => setIsHovered(true), []);
   const handlePointerLeave = useCallback(() => setIsHovered(false), []);
 
+  // Figmenta embed: profile creation lives in Paseo settings (docs/FIGMENTA.md).
+  const embedded = isEmbedMode();
+
   const profileAction = useMemo(() => {
     if (row.modelId.length === 0) {
       return null;
     }
     if (profiledRows.length === 0) {
-      if (!onCreateProfile) {
+      if (embedded || !onCreateProfile) {
         return null;
       }
       return (
@@ -754,6 +761,7 @@ function ModelRow({
       </ModelRowProfileAction>
     );
   }, [
+    embedded,
     handleCreateProfile,
     handleEditProfile,
     handleEditProfiles,
@@ -923,6 +931,7 @@ function AgentProfilesPickerSection({
 
 function CreateAgentProfileRow({ onPress }: { onPress: () => void }) {
   const { t } = useTranslation();
+  const embedded = isEmbedMode();
   const leadingSlot = useMemo(
     () => (
       <View testID="model-profiles-create-icon">
@@ -931,6 +940,8 @@ function CreateAgentProfileRow({ onPress }: { onPress: () => void }) {
     ),
     [],
   );
+  // Figmenta embed: profile creation lives in Paseo settings (docs/FIGMENTA.md).
+  if (embedded) return null;
   return (
     <ModelBrowserRow
       label={t("modelSelector.createProfile")}
