@@ -389,15 +389,17 @@ export function loadedPluginIsOutdated(
 }
 
 /**
- * Whose daemon holds ~/.paseo/paseo.pid:
- *  - "this-app": this Orchestra process launched it;
- *  - "orchestra": a desktop-managed daemon an earlier Orchestra launched — the instance
- *    named in `orchestra-daemon.json` (written by every Orchestra launch since 1.3.16), or
- *    a supervisor whose executable is an Orchestra install (what earlier versions launched);
- *  - "foreign": anything else — a daemon started by hand, or by an installed Paseo.app
- *    for its own sessions. Never restarted by Orchestra.
+ * Whose daemon holds ~/.paseo/paseo.pid (contratto-1321 §4.3, see classifyEngineHolder):
+ *  - "this-app": this Orchestra process launched it (rule 0);
+ *  - "orchestra": the instance an earlier Orchestra launched, named in
+ *    `orchestra-daemon.json` (rule 2) — ours to restart;
+ *  - "orchestra-other": a supervisor on an Orchestra executable or under an Orchestra
+ *    folder (rules 3 and 4: another install, the 2.x line, a private runtime) — reused,
+ *    never stopped;
+ *  - "foreign": anything else — Paseo, a daemon started by hand, an unreadable executable.
+ *    Never restarted by the seed check (the engine supervisor alone replaces a Paseo one).
  */
-export type DaemonOwner = "this-app" | "orchestra" | "foreign";
+export type DaemonOwner = "this-app" | "orchestra" | "orchestra-other" | "foreign";
 
 export interface DaemonLockInfo {
   pid: number;
@@ -454,19 +456,112 @@ export function isOrchestraExecutable(executable: string | null | undefined): bo
   return ORCHESTRA_EXECUTABLE_NAMES.has(base);
 }
 
+const PASEO_EXECUTABLE_NAMES = new Set(["paseo.exe", "paseo helper", "paseo"]);
+const PASEO_INSTALL_FOLDER = /\/(programs\/paseo|opt\/paseo|usr\/lib\/paseo)\//;
+
+/**
+ * Is this executable an installed Paseo (contratto-1321 §4.3 rule 5)? Anything inside a
+ * `Paseo.app` bundle, or an executable named `Paseo.exe`, `Paseo Helper` or `paseo`
+ * inside Paseo's own install folder (`\Programs\Paseo\` on Windows, `/opt/paseo/` or
+ * `/usr/lib/paseo/` on Linux). A bare name without its folder is not enough: what is
+ * recognised here may be stopped, so the rule is narrow on purpose.
+ */
+export function isPaseoExecutable(executable: string | null | undefined): boolean {
+  if (!executable) return false;
+  const normalized = executable.replace(/\\/g, "/");
+  if (normalized.includes("/Paseo.app/")) return true;
+  const lower = normalized.toLowerCase();
+  const slash = lower.lastIndexOf("/");
+  if (slash < 0) return false;
+  if (!PASEO_EXECUTABLE_NAMES.has(lower.slice(slash + 1))) return false;
+  return PASEO_INSTALL_FOLDER.test(lower.slice(0, slash + 1));
+}
+
+function underFolder(path: string, folder: string | undefined, child: string): boolean {
+  if (!folder?.trim()) return false;
+  const base = folder.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  return path.startsWith(`${base}/${child}/`);
+}
+
+/**
+ * Is this executable under a folder Orchestra keeps its own runtimes in (contratto-1321
+ * §4.3 rule 4: the 2.x line, a private engine runtime)? macOS `…/Application
+ * Support/Orchestra/`, Windows `%LOCALAPPDATA%\Orchestra\` or `%APPDATA%\Orchestra\`,
+ * Linux `~/.config/Orchestra/`. Case-insensitive, either slash.
+ */
+export function isUnderOrchestraFolder(
+  executable: string | null | undefined,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  if (!executable) return false;
+  const lower = executable.replace(/\\/g, "/").toLowerCase();
+  if (lower.includes("/application support/orchestra/")) return true;
+  if (underFolder(lower, env.LOCALAPPDATA, "orchestra")) return true;
+  if (underFolder(lower, env.APPDATA, "orchestra")) return true;
+  if (/\/appdata\/(local|roaming)\/orchestra\//.test(lower)) return true;
+  if (underFolder(lower, env.HOME, ".config/orchestra")) return true;
+  return lower.includes("/.config/orchestra/");
+}
+
+/**
+ * The §4.3 classification of the supervisor S that holds the port (its pid lock already
+ * checked alive and with the serverId the port answers with). The number is the rule:
+ *  0 — S is the instance this process launched (`ownedLaunch`): ours;
+ *  2 — S is the instance named in `orchestra-daemon.json` (pid AND startedAt): ours, from
+ *      an earlier run;
+ *  3 — S runs on an Orchestra executable: Orchestra, not ours, never stopped;
+ *  4 — S runs under an Orchestra folder: as 3;
+ *  5 — S runs on an installed Paseo: foreign, replaced;
+ *  6 — anything else, an unreadable executable included: never stopped.
+ * (Rule 1 does not exist: the numbering follows the contract.)
+ */
+export type EngineHolderRule = 0 | 2 | 3 | 4 | 5 | 6;
+
+export function classifyEngineHolder(input: {
+  lock: { pid: number; startedAt: string };
+  ownedLaunch: { pid: number; startedAt: string } | null;
+  marker: { pid?: unknown; startedAt?: unknown } | null;
+  executable: string | null;
+  env?: Record<string, string | undefined>;
+}): EngineHolderRule {
+  const { lock, ownedLaunch, marker, executable } = input;
+  if (ownedLaunch && ownedLaunch.pid === lock.pid && ownedLaunch.startedAt === lock.startedAt) {
+    return 0;
+  }
+  if (marker && marker.pid === lock.pid && marker.startedAt === lock.startedAt) return 2;
+  if (isOrchestraExecutable(executable)) return 3;
+  if (isUnderOrchestraFolder(executable, input.env)) return 4;
+  if (isPaseoExecutable(executable)) return 5;
+  return 6;
+}
+
+const OWNER_BY_RULE: Record<EngineHolderRule, DaemonOwner> = {
+  0: "this-app",
+  2: "orchestra",
+  3: "orchestra-other",
+  4: "orchestra-other",
+  5: "foreign",
+  6: "foreign",
+};
+
 export function classifyDaemonOwner(input: {
   spawnedByThisApp: boolean;
   lock: DaemonLockInfo | null;
   marker: { pid?: unknown; startedAt?: unknown } | null;
   executable: string | null;
+  ownedLaunch?: { pid: number; startedAt: string } | null;
 }): DaemonOwner {
-  if (input.spawnedByThisApp) return "this-app";
   const lock = input.lock;
-  if (!lock || lock.desktopManaged !== true) return "foreign";
-  if (input.marker && input.marker.pid === lock.pid && input.marker.startedAt === lock.startedAt) {
-    return "orchestra";
-  }
-  return isOrchestraExecutable(input.executable) ? "orchestra" : "foreign";
+  if (!lock) return input.spawnedByThisApp ? "this-app" : "foreign";
+  const ownedLaunch = input.ownedLaunch ?? (input.spawnedByThisApp ? lock : null);
+  return OWNER_BY_RULE[
+    classifyEngineHolder({ lock, ownedLaunch, marker: input.marker, executable: input.executable })
+  ];
+}
+
+/** Rules 0 and 2: an engine this app may stop (`--force` included) and restart. */
+export function isOwnEngineOwner(owner: DaemonOwner): boolean {
+  return owner === "this-app" || owner === "orchestra";
 }
 
 export type DaemonSeedAction = "ok" | "restart" | "warn";
@@ -484,7 +579,7 @@ export function planDaemonSeedAction(input: {
   alreadyRestarted: boolean;
 }): DaemonSeedAction {
   if (input.corsOk && input.pluginRunning && !input.pluginOutdated) return "ok";
-  if (input.pluginOutdated && input.owner !== "foreign" && !input.alreadyRestarted) {
+  if (input.pluginOutdated && isOwnEngineOwner(input.owner) && !input.alreadyRestarted) {
     return "restart";
   }
   return "warn";
@@ -501,7 +596,7 @@ export function daemonSeedWarningText(warning: {
   loadedVersion: string | null;
   bundledVersion: string | null;
 }): { message: string; detail: string; canRestart: boolean } {
-  const canRestart = warning.owner !== "foreign";
+  const canRestart = isOwnEngineOwner(warning.owner);
   if (warning.kind === "plugin-outdated") {
     const loaded = warning.loadedVersion ? `v${warning.loadedVersion}` : "an older version";
     const bundled = warning.bundledVersion ? `v${warning.bundledVersion}` : "the current one";
@@ -509,7 +604,7 @@ export function daemonSeedWarningText(warning: {
       message: "The engine is running an older Orchestra plugin",
       detail: canRestart
         ? `The engine loaded the Orchestra plugin ${loaded}, but this app ships ${bundled}: Claude Code may not be signed in. Restarting it takes a few seconds.`
-        : `The engine running on this machine was started outside Orchestra (for example by the Paseo app) and loaded the Orchestra plugin ${loaded}; this app ships ${bundled}. Until it restarts, Claude Code may not be signed in. Quit Paseo (or the app that started the engine) and reopen Orchestra.`,
+        : `The engine running on this machine was started outside Orchestra and loaded the Orchestra plugin ${loaded}; this app ships ${bundled}. Until it restarts, Claude Code may not be signed in. Quit the app that started it and reopen Orchestra.`,
       canRestart,
     };
   }

@@ -6,12 +6,14 @@
 import { execFileSync } from "node:child_process";
 import { copyFileSync, readFileSync, readlinkSync } from "node:fs";
 import path from "node:path";
-import { net } from "electron";
+import { app, net } from "electron";
 import log from "electron-log/main";
 import { resolvePaseoHome, writeFileAtomic } from "@getpaseo/server";
 import { readDaemonInstance } from "@getpaseo/server/daemon-control";
 import {
   listDaemonPlugins,
+  ownedLaunchInstance,
+  readOrchestraLaunchMarker,
   startDaemon,
   stopDesktopDaemon,
   wasDaemonSpawnedByThisApp,
@@ -21,7 +23,7 @@ import {
   corsAllowsOrchestra,
   loadedPluginIsOutdated,
   loadedPluginPath,
-  ORCHESTRA_DAEMON_MARKER_FILENAME,
+  ORCHESTRA_PLUGIN_ID,
   ORCHESTRA_URL,
   parseProcessExecutable,
   planDaemonSeedAction,
@@ -185,19 +187,6 @@ export function processExecutable(pid: number): string | null {
   return null;
 }
 
-function readLaunchMarker(home: string): { pid?: unknown; startedAt?: unknown } | null {
-  try {
-    const parsed = JSON.parse(
-      readFileSync(path.join(home, ORCHESTRA_DAEMON_MARKER_FILENAME), "utf-8"),
-    ) as unknown;
-    return parsed !== null && typeof parsed === "object"
-      ? (parsed as { pid?: unknown; startedAt?: unknown })
-      : null;
-  } catch {
-    return null;
-  }
-}
-
 async function resolveDaemonOwner(): Promise<{
   owner: DaemonOwner;
   lock: DaemonLockInfo | null;
@@ -213,8 +202,9 @@ async function resolveDaemonOwner(): Promise<{
   const executable = lock ? processExecutable(lock.pid) : null;
   const owner = classifyDaemonOwner({
     spawnedByThisApp: wasDaemonSpawnedByThisApp(),
+    ownedLaunch: ownedLaunchInstance(),
     lock,
-    marker: readLaunchMarker(home),
+    marker: readOrchestraLaunchMarker(home),
     executable,
   });
   return { owner, lock, executable };
@@ -350,4 +340,33 @@ export async function verifyOrchestraDaemonSeed(input: {
     bundledVersion,
   });
   return check;
+}
+
+/** The plugin this app ships: as main.ts resolves it (this module sits one level down). */
+function bundledOrchestraPluginPath(): string {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, "plugins", ORCHESTRA_PLUGIN_ID)
+    : path.resolve(__dirname, "../../figmenta-plugin");
+}
+
+/**
+ * The seed check for the engine supervisor (contratto-1321 §4.1): the same check, with a
+ * `warn` that shows nothing — no dialog about the engine any more. A restart the check
+ * makes (an outdated plugin on our own engine) the supervisor counts as one of its
+ * attempts. true = the engine runs with the Orchestra seed.
+ */
+export async function verifySeedQuiet(
+  input: { listen?: string | null; pluginPath?: string } = {},
+): Promise<boolean> {
+  try {
+    const check = await verifyOrchestraDaemonSeed({
+      listen: input.listen ?? null,
+      pluginPath: input.pluginPath ?? bundledOrchestraPluginPath(),
+      warn: () => {},
+    });
+    return check.action === "ok";
+  } catch (error) {
+    log.error("[orchestra] daemon seed check failed", error);
+    return false;
+  }
 }

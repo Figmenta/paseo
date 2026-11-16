@@ -99,13 +99,12 @@ import {
 } from "./daemon/quit-lifecycle.js";
 import { runDesktopStartup } from "./desktop-startup.js";
 import {
-  daemonSeedWarningText,
   isAllowedNavigation,
   ORCHESTRA_COPYRIGHT,
   isOrchestraOrigin,
   ORCHESTRA_BACKGROUND_COLOR,
   ORCHESTRA_PLUGIN_ID,
-  orchestraNoteUrl,
+  orchestraOrigin,
   orchestraWindowUrl,
   permissionPolicy,
   titleBarInset,
@@ -114,18 +113,23 @@ import {
   findOrchestraLinkArg,
   ignoredLinkFields,
   isOrchestraLink,
-  notePath,
-  noteRouteSlug,
   ORCHESTRA_LINK_SCHEME,
+  orchestraLinkFromRoute,
+  orchestraLinkPath,
   parseOrchestraLink,
   parseOrchestraLinkFromArgv,
+  type OrchestraLink,
 } from "./figmenta/orchestra-links.js";
+import { seedOrchestraDaemonConfig, verifySeedQuiet } from "./figmenta/orchestra-daemon-seed.js";
+import { createEngineSupervisor } from "./figmenta/engine-supervisor.js";
 import {
-  restartOrchestraDaemon,
-  seedOrchestraDaemonConfig,
-  verifyOrchestraDaemonSeed,
-  type DaemonSeedWarning,
-} from "./figmenta/orchestra-daemon-seed.js";
+  ENGINE_RESTART_CHANNEL,
+  ENGINE_STATUS_CHANNEL,
+  ENGINE_STATUS_GET_CHANNEL,
+  type EngineSupervisor,
+} from "./figmenta/engine-status.js";
+import { createOrchestraTray } from "./tray.js";
+import { shouldHideOnClose } from "./tray-policy.js";
 import {
   offerMoveToApplicationsFolder,
   startMandatoryUpdater,
@@ -140,7 +144,6 @@ import {
 } from "./figmenta/claude-code-setup-electron.js";
 import {
   adoptFirstOrchestraWindow,
-  dismissStartupSplash,
   isStartupSplashWindow,
   showStartupSplash,
 } from "./figmenta/startup-splash-electron.js";
@@ -378,12 +381,31 @@ let pendingAgentNavigation = parseAgentDeepLinkFromArgv(process.argv);
 // process holds the single-instance lock: a second instance shares main.log and quits.
 const coldOrchestraLinkArg = findOrchestraLinkArg(process.argv);
 const coldOrchestraLink = parseOrchestraLinkFromArgv(process.argv);
-// A note link that arrived before the first Orchestra window: that window opens on it.
-let pendingNoteSlug: string | null = coldOrchestraLink?.slug ?? null;
+// A link (note or Maestro) that arrived before the first Orchestra window: that window opens on it.
+let pendingOrchestraLink: OrchestraLink | null = coldOrchestraLink;
 // The windows createWindow made (Orchestra popups and the splash, setup and update windows are
 // not in it): the only ones a note link may navigate.
 const orchestraWindows = new Set<BrowserWindow>();
-let noteWindowCreation: Promise<void> | null = null;
+let linkWindowCreation: Promise<void> | null = null;
+// Figmenta fork (contratto-1321 §4.4): the main window is the first window of the session
+// (desktopWindowOwner.openPrimary). On Windows and Linux closing it only hides it, unless the
+// app is quitting: `appQuitting` turns true in before-quit and before-quit-for-update.
+let mainOrchestraWindow: BrowserWindow | null = null;
+let appQuitting = false;
+// Contratto-1321 §4.1: the supervisor of our engine, created by bootstrap.
+let engineSupervisor: EngineSupervisor | null = null;
+
+/** What the log says about a link: the slug of a note, the id of a Maestro link. */
+function linkLogFields(link: OrchestraLink): Record<string, string | null> {
+  return link.kind === "note" ? { slug: link.slug } : { maestro: link.id };
+}
+
+/** The URL a valid link opens: the note route through orchestra.ts, the Maestro route here. */
+function orchestraLinkUrl(link: OrchestraLink): string {
+  return link.kind === "note"
+    ? orchestraWindowUrl(orchestraLinkPath(link))
+    : `${orchestraOrigin()}${orchestraLinkPath(link)}`;
+}
 
 // Each window pulls its own pending open-project path on mount, keyed by
 // webContents id, so deep-linked windows (second-instance launches, the
@@ -753,6 +775,7 @@ async function createWindow(
   const webContentsId = mainWindow.webContents.id;
   options.onCreated?.(webContentsId);
   orchestraWindows.add(mainWindow);
+  trackMainOrchestraWindow(mainWindow, restoreWindowState);
   mainWindow.webContents.on("did-start-navigation", (_event, _url, isSameDocument, isMainFrame) => {
     if (isMainFrame && !isSameDocument) {
       agentNavigationInbox.windowLoading(webContentsId);
@@ -833,15 +856,40 @@ async function createWindow(
 
   // Figmenta fork: the main window IS the remote Orchestra web app. The bundled
   // Expo export and the `paseo://app` handler stay registered for deep links only,
-  // so a Paseo `options.initialRoute` is meaningless here and is ignored. The one route
-  // honoured is the note route of an `orchestra://notes/<slug>` link (contratto notes-site
-  // §10), on the Orchestra origin (figmenta/orchestra.ts `orchestraWindowUrl`).
-  const initialNoteSlug = noteRouteSlug(options.initialRoute);
-  if (initialNoteSlug !== null) {
-    log.info("[deep-link] navigate", { path: notePath(initialNoteSlug) });
-  }
-  await mainWindow.loadURL(orchestraWindowUrl(options.initialRoute));
+  // so a Paseo `options.initialRoute` is meaningless here and is ignored. The routes
+  // honoured are those of an `orchestra:` link: the note route of `orchestra://notes/<slug>`
+  // (contratto notes-site §10) and `/maestro[/<id>]` of `orchestra://maestro[/<id>]`
+  // (contratto-1321 §4.6), on the Orchestra origin.
+  await mainWindow.loadURL(initialWindowUrl(options.initialRoute));
   return mainWindow;
+}
+
+function initialWindowUrl(route: string | null | undefined): string {
+  const link = orchestraLinkFromRoute(route);
+  if (link === null) return orchestraWindowUrl(null);
+  log.info("[deep-link] navigate", { path: orchestraLinkPath(link) });
+  return orchestraLinkUrl(link);
+}
+
+// Contratto-1321 §4.4: the first window of the session (restoreWindowState) is the main one.
+// On Windows and Linux its close button hides it, unless the app is quitting.
+function trackMainOrchestraWindow(win: BrowserWindow, restoreWindowState: boolean): void {
+  if (!restoreWindowState) return;
+  if (mainOrchestraWindow !== null && !mainOrchestraWindow.isDestroyed()) return;
+  mainOrchestraWindow = win;
+  win.on("close", (event) => {
+    const hide = shouldHideOnClose({
+      platform: process.platform,
+      appQuitting,
+      isMainWindow: win === mainOrchestraWindow,
+    });
+    if (!hide) return;
+    event.preventDefault();
+    win.hide();
+  });
+  win.on("closed", () => {
+    if (mainOrchestraWindow === win) mainOrchestraWindow = null;
+  });
 }
 
 // Figmenta fork: a window pointed at a remote origin needs its own navigation
@@ -982,40 +1030,59 @@ function pickOrchestraWindow(): BrowserWindow | null {
   return live.find((win) => win.isVisible()) ?? live[0] ?? null;
 }
 
-async function openNoteInOrchestra(slug: string): Promise<void> {
-  const win = pickOrchestraWindow();
+// Contratto-1321 §4.6: a Maestro link goes to the main window, shown and focused even when it
+// is hidden in the system tray; with no main window, to the window a note link would use.
+function pickLinkWindow(link: OrchestraLink): BrowserWindow | null {
+  if (link.kind === "maestro" && mainOrchestraWindow && !mainOrchestraWindow.isDestroyed()) {
+    return mainOrchestraWindow;
+  }
+  return pickOrchestraWindow();
+}
+
+async function openLinkInOrchestra(link: OrchestraLink): Promise<void> {
+  const win = pickLinkWindow(link);
   if (!win) {
-    if (!noteWindowCreation) {
-      // createWindow logs the navigation and loads the note.
-      noteWindowCreation = desktopWindowOwner
-        .openPrimary({ initialRoute: notePath(slug) })
+    if (!linkWindowCreation) {
+      // createWindow logs the navigation and loads the link's route.
+      linkWindowCreation = desktopWindowOwner
+        .openPrimary({ initialRoute: orchestraLinkPath(link) })
         .finally(() => {
-          noteWindowCreation = null;
+          linkWindowCreation = null;
         });
-      await noteWindowCreation;
+      await linkWindowCreation;
       return;
     }
-    await noteWindowCreation;
-    await openNoteInOrchestra(slug);
+    await linkWindowCreation;
+    await openLinkInOrchestra(link);
     return;
   }
-  log.info("[deep-link] navigate", { path: notePath(slug) });
+  log.info("[deep-link] navigate", { path: orchestraLinkPath(link) });
   if (win.isMinimized()) win.restore();
   win.show();
   win.focus();
-  await win.loadURL(orchestraNoteUrl(slug));
+  await win.loadURL(orchestraLinkUrl(link));
 }
 
-function receiveNoteLink(slug: string): void {
+function receiveOrchestraLink(link: OrchestraLink): void {
   if (bootstrapIsComplete) {
-    void openNoteInOrchestra(slug).catch((error) => {
-      log.error("[deep-link] failed to open the note", error);
+    void openLinkInOrchestra(link).catch((error) => {
+      log.error("[deep-link] failed to open the link", error);
     });
     return;
   }
-  // Before the first window: bootstrap opens it on this note, or — when the link lands after
+  // Before the first window: bootstrap opens it on this link, or — when the link lands after
   // bootstrap took the pending one — navigates to it as soon as the bootstrap completes.
-  pendingNoteSlug = slug;
+  pendingOrchestraLink = link;
+}
+
+// Contratto-1321 §4.4: show and focus the main window, also when it is hidden in the tray.
+function showMainOrchestraWindow(): boolean {
+  const win = mainOrchestraWindow;
+  if (!win || win.isDestroyed()) return false;
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+  return true;
 }
 
 app.on("open-url", (event, url) => {
@@ -1026,8 +1093,8 @@ app.on("open-url", (event, url) => {
       log.warn("[deep-link] ignored", ignoredLinkFields(url));
       return;
     }
-    log.info("[deep-link] open-url", { slug: link.slug, cold: !bootstrapIsComplete });
-    receiveNoteLink(link.slug);
+    log.info("[deep-link] open-url", { ...linkLogFields(link), cold: !bootstrapIsComplete });
+    receiveOrchestraLink(link);
     return;
   }
   receiveAgentDeepLink(url);
@@ -1046,12 +1113,13 @@ function setupSingleInstanceLock(): boolean {
   }
 
   app.on("second-instance", (_event, commandLine) => {
-    // Figmenta fork (contratto notes-site §10): an `orchestra:` link (Windows, Linux) opens the
-    // note in an existing window; valid or not, it never reaches the Paseo flows below.
-    const noteLink = parseOrchestraLinkFromArgv(commandLine);
-    if (noteLink) {
-      log.info("[deep-link] second-instance", { slug: noteLink.slug });
-      receiveNoteLink(noteLink.slug);
+    // Figmenta fork (contratto notes-site §10, contratto-1321 §4.6): an `orchestra:` link
+    // (Windows, Linux) opens the note or Maestro in an existing window; valid or not, it never
+    // reaches the Paseo flows below.
+    const orchestraLink = parseOrchestraLinkFromArgv(commandLine);
+    if (orchestraLink) {
+      log.info("[deep-link] second-instance", linkLogFields(orchestraLink));
+      receiveOrchestraLink(orchestraLink);
       return;
     }
     const otherOrchestraLink = findOrchestraLinkArg(commandLine);
@@ -1074,6 +1142,19 @@ function setupSingleInstanceLock(): boolean {
       isDefaultApp: false,
     });
     log.info("[open-project] second-instance openProjectPath:", openProjectPath);
+    // Figmenta fork (contratto-1321 §4.4): relaunching Orchestra with nothing to open brings
+    // back the main window, also from the system tray, instead of opening a second one.
+    if (openProjectPath === null) {
+      void bootstrapComplete
+        .then(() => {
+          if (showMainOrchestraWindow()) return undefined;
+          return desktopWindowOwner.openAdditional({ pendingProjectPath: null });
+        })
+        .catch((error) => {
+          log.error("[window] failed to show the main window from second-instance", error);
+        });
+      return;
+    }
     // Relaunching the app (CLI `paseo [path]`, double-click, etc.) opens a new
     // window rather than focusing the existing one. Wait for bootstrap (not just
     // app.whenReady) so the protocol + IPC handlers exist before the window loads.
@@ -1101,57 +1182,42 @@ function resolveOrchestraPluginPath(): string {
 }
 
 // In Paseo the renderer asks for the daemon over IPC. The Orchestra page is remote and
-// has no such bridge, so the main process starts it. startDaemon() returns an already
-// running daemon untouched: a daemon Federico started by hand keeps its own lifecycle.
-// The check after it (figmenta/orchestra-daemon-seed.ts) restarts, once and without
-// asking, a daemon an Orchestra launched that still runs an older plugin.
-async function startOrchestraDaemon(): Promise<void> {
-  let listen: string | null = null;
-  try {
-    const status = await startDaemon();
-    listen = status.listen;
-    log.info("[orchestra] daemon ready", {
-      status: status.status,
-      listen,
-      spawnedByThisApp: wasDaemonSpawnedByThisApp(),
-    });
-  } catch (error) {
-    log.error("[orchestra] failed to start the local daemon", error);
-    return;
-  }
-  await verifyOrchestraDaemonSeed({
-    listen,
-    pluginPath: resolveOrchestraPluginPath(),
-    warn: showDaemonSeedWarning,
-  });
-}
+// has no such bridge, so the main process starts it. Since 1.3.21 the engine supervisor
+// (figmenta/engine-supervisor.ts, contratto-1321 §4.1, §4.3) owns the start: it classifies
+// what holds the port, starts our engine through daemon-manager's startDaemon(), checks the
+// seed without any dialog, keeps it healthy and reports it to the page as
+// window.orchestraDesktop.engine.
+let ownEngineListen: string | null = null;
 
-function showDaemonSeedWarning(warning: DaemonSeedWarning): void {
-  // The owner the check measured, not "did THIS process spawn it": a daemon an earlier
-  // Orchestra launched is ours to restart too (figmenta/orchestra.ts, classifyDaemonOwner).
-  const text = daemonSeedWarningText(warning);
-  // Figmenta fork: the startup splash floats above every window; the warning goes first.
-  dismissStartupSplash("engine warning");
-  void dialog
-    .showMessageBox({
-      type: "warning",
-      title: APP_NAME,
-      message: text.message,
-      detail: text.detail,
-      buttons: text.canRestart ? ["Restart engine", "Later"] : ["OK"],
-      defaultId: 0,
-      cancelId: text.canRestart ? 1 : 0,
-      noLink: true,
-    })
-    .then(async (result) => {
-      if (!text.canRestart || result.response !== 0) return undefined;
-      const listen = await restartOrchestraDaemon(warning.owner, warning.instance);
-      log.info("[orchestra] engine restart on request", { restarted: listen !== null, listen });
-      return undefined;
-    })
-    .catch((error: unknown) => {
-      log.error("[orchestra] failed to show the engine warning", error);
-    });
+function startEngineSupervisor(): EngineSupervisor {
+  const supervisor = createEngineSupervisor({
+    startOwnEngine: async () => {
+      const status = await startDaemon();
+      ownEngineListen = status.listen;
+      log.info("[orchestra] daemon ready", {
+        status: status.status,
+        listen: status.listen,
+        spawnedByThisApp: wasDaemonSpawnedByThisApp(),
+      });
+    },
+    verifySeed: () =>
+      verifySeedQuiet({ listen: ownEngineListen, pluginPath: resolveOrchestraPluginPath() }),
+    log: (message, extra) => {
+      if (extra === undefined) log.info(message);
+      else log.info(message, extra);
+    },
+  });
+  ipcMain.on(ENGINE_STATUS_GET_CHANNEL, (event) => {
+    event.returnValue = supervisor.status();
+  });
+  ipcMain.handle(ENGINE_RESTART_CHANNEL, async () => ({ ok: await supervisor.restartNow() }));
+  supervisor.onChange((status) => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (win.isDestroyed() || win.webContents.isDestroyed()) continue;
+      win.webContents.send(ENGINE_STATUS_CHANNEL, status);
+    }
+  });
+  return supervisor;
 }
 
 // Figmenta fork (contratto notes-maestro §10.2): the person signs in to Google inside the
@@ -1261,7 +1327,7 @@ async function bootstrap(): Promise<void> {
     }
   }
   if (coldOrchestraLink) {
-    log.info("[deep-link] open-url", { slug: coldOrchestraLink.slug, cold: true });
+    log.info("[deep-link] open-url", { ...linkLogFields(coldOrchestraLink), cold: true });
   } else if (coldOrchestraLinkArg !== null) {
     log.warn("[deep-link] ignored", ignoredLinkFields(coldOrchestraLinkArg));
   }
@@ -1382,6 +1448,8 @@ async function bootstrap(): Promise<void> {
   // upstream does before an update.
   startMandatoryUpdater({
     beforeInstall: async () => {
+      // Contratto-1321 §4.4: no restart attempt may race the install.
+      engineSupervisor?.stop();
       if (wasDaemonSpawnedByThisApp() && isDesktopManagedDaemonRunningSync()) {
         await stopDesktopDaemonViaCli("app_update");
       }
@@ -1389,8 +1457,28 @@ async function bootstrap(): Promise<void> {
   });
 
   installOrchestraSessionPolicies();
+  // Contratto-1321 §4.4: Windows and Linux keep Orchestra in the system tray, from `ready` on.
+  // Before the first window exists bootstrap is about to open it: the tray has nothing to do.
+  createOrchestraTray({
+    openOrchestra: () => {
+      if (showMainOrchestraWindow() || !bootstrapIsComplete) return;
+      void desktopWindowOwner.openPrimary().catch((error) => {
+        log.error("[tray] failed to open Orchestra", error);
+      });
+    },
+    quit: () => app.quit(),
+  });
   await seedOrchestraDaemonConfig({ pluginPath: resolveOrchestraPluginPath() });
-  await startOrchestraDaemon();
+  engineSupervisor = startEngineSupervisor();
+  // The first attempt gets at most 10 s before the window opens: replacing a foreign engine
+  // or a slow launch keeps going in the background, and the page says "Maestro is starting".
+  await Promise.race([
+    engineSupervisor.start().catch((error: unknown) => {
+      // The supervisor keeps trying on its own backoff: the window opens all the same.
+      log.error("[orchestra] the engine supervisor failed to start", error);
+    }),
+    new Promise((resolve) => setTimeout(resolve, 10_000)),
+  ]);
   // Figmenta fork: Claude Code is checked again every 30 minutes and on wake, updated in the
   // background when it falls below what this build requires, and reported to the page as
   // window.orchestraDesktop.claudeCode. The first measurement is ready before the window opens
@@ -1400,15 +1488,15 @@ async function bootstrap(): Promise<void> {
     new Promise((resolve) => setTimeout(resolve, 5_000)),
   ]);
 
-  // The first window of the session restores and persists saved geometry. A note link that
-  // started the app gives its route, the one createWindow honours (Figmenta fork).
-  const initialNoteSlug = pendingNoteSlug;
-  pendingNoteSlug = null;
+  // The first window of the session restores and persists saved geometry. An `orchestra:`
+  // link that started the app gives its route, the one createWindow honours (Figmenta fork).
+  const initialLink = pendingOrchestraLink;
+  pendingOrchestraLink = null;
   const initialAgentNavigation = pendingAgentNavigation;
   pendingAgentNavigation = null;
   let initialRoute: string | null = null;
-  if (initialNoteSlug !== null) {
-    initialRoute = notePath(initialNoteSlug);
+  if (initialLink !== null) {
+    initialRoute = orchestraLinkPath(initialLink);
   } else if (initialAgentNavigation) {
     initialRoute = buildAgentDeepLinkRoute(initialAgentNavigation);
   }
@@ -1426,11 +1514,11 @@ async function bootstrap(): Promise<void> {
   bootstrapIsComplete = true;
   resolveBootstrapComplete();
 
-  if (pendingNoteSlug !== null) {
-    const slug = pendingNoteSlug;
-    pendingNoteSlug = null;
-    void openNoteInOrchestra(slug).catch((error) => {
-      log.error("[deep-link] failed to open the queued note", error);
+  if (pendingOrchestraLink !== null) {
+    const link = pendingOrchestraLink;
+    pendingOrchestraLink = null;
+    void openLinkInOrchestra(link).catch((error) => {
+      log.error("[deep-link] failed to open the queued link", error);
     });
   }
 
@@ -1496,8 +1584,18 @@ const quitLifecycle = createQuitLifecycle({
 
 // electron-updater forwards this event through Electron's built-in autoUpdater.
 electronAutoUpdater.on("before-quit-for-update", () => {
+  // Contratto-1321 §4.4: first the supervisor, then a quit the hidden window cannot veto.
+  engineSupervisor?.stop();
+  appQuitting = true;
   log.info("[auto-updater] before-quit-for-update", { currentVersion: app.getVersion() });
   quitLifecycle.handleBeforeQuitForUpdate();
+});
+// Contratto-1321 §4.4: the first before-quit handler, prepended ahead of those the modules
+// registered at import. The supervisor stops before anything else (no restart may race the
+// quit), and from here the main window closes for real.
+app.prependListener("before-quit", () => {
+  engineSupervisor?.stop();
+  appQuitting = true;
 });
 // Figmenta fork: `orchestra_session` is a persistent cookie (Max-Age 7 days), so
 // Chromium keeps it across launches on its own. Chromium's cookie store writes are

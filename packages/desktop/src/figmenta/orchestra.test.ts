@@ -17,8 +17,11 @@ import {
   loadedPluginPath,
   loadedPluginIsOutdated,
   classifyDaemonOwner,
+  classifyEngineHolder,
   daemonSeedWarningText,
   isOrchestraExecutable,
+  isPaseoExecutable,
+  isUnderOrchestraFolder,
   parseProcessExecutable,
   planDaemonSeedAction,
   type PluginVersionProbe,
@@ -384,13 +387,44 @@ describe("classifyDaemonOwner", () => {
     ).toBe("this-app");
   });
 
-  it("an Orchestra launch is recognised by the marker or by an Orchestra executable", () => {
+  it("this app's launch is the instance it acquired, not any lock", () => {
+    const owned = { pid: lock.pid, startedAt: lock.startedAt };
+    expect(
+      classifyDaemonOwner({
+        spawnedByThisApp: true,
+        ownedLaunch: owned,
+        lock,
+        marker: null,
+        executable: null,
+      }),
+    ).toBe("this-app");
+    expect(
+      classifyDaemonOwner({
+        spawnedByThisApp: true,
+        ownedLaunch: { pid: 1, startedAt: lock.startedAt },
+        lock,
+        marker: null,
+        executable: PASEO_EXE,
+      }),
+    ).toBe("foreign");
+  });
+
+  it("the marker names an earlier Orchestra launch (ours); an Orchestra executable is not ours", () => {
     expect(
       classifyDaemonOwner({
         spawnedByThisApp: false,
         lock,
         marker: { pid: lock.pid, startedAt: lock.startedAt },
         executable: PASEO_EXE,
+      }),
+    ).toBe("orchestra");
+    // desktopManaged does not tell Orchestra from Paseo (contratto-1321 §2): not consulted.
+    expect(
+      classifyDaemonOwner({
+        spawnedByThisApp: false,
+        lock: { ...lock, desktopManaged: false },
+        marker: { pid: lock.pid, startedAt: lock.startedAt },
+        executable: null,
       }),
     ).toBe("orchestra");
     expect(
@@ -400,7 +434,7 @@ describe("classifyDaemonOwner", () => {
         marker: null,
         executable: ORCHESTRA_EXE,
       }),
-    ).toBe("orchestra");
+    ).toBe("orchestra-other");
   });
 
   it("a Paseo.app daemon, a hand-started one, or a stale marker is foreign", () => {
@@ -416,16 +450,113 @@ describe("classifyDaemonOwner", () => {
       }),
     ).toBe("foreign");
     expect(
-      classifyDaemonOwner({
-        spawnedByThisApp: false,
-        lock: { ...lock, desktopManaged: false },
-        marker: { pid: lock.pid, startedAt: lock.startedAt },
-        executable: ORCHESTRA_EXE,
-      }),
-    ).toBe("foreign");
-    expect(
       classifyDaemonOwner({ spawnedByThisApp: false, lock: null, marker: null, executable: null }),
     ).toBe("foreign");
+  });
+});
+
+// contratto-1321 §4.3: the rules, in their order, for the supervisor S holding the port.
+describe("classifyEngineHolder", () => {
+  const lock = { pid: 4242, startedAt: "2026-11-16T08:00:00.000Z" };
+  const PASEO_EXE =
+    "/Applications/Paseo.app/Contents/Frameworks/Paseo Helper.app/Contents/MacOS/Paseo Helper";
+  const ORCHESTRA_EXE =
+    "/Applications/Orchestra.app/Contents/Frameworks/Orchestra Helper.app/Contents/MacOS/Orchestra Helper";
+  const base = { lock, ownedLaunch: null, marker: null };
+
+  it("rule 0 before everything: this launch, whatever its executable", () => {
+    expect(classifyEngineHolder({ ...base, ownedLaunch: { ...lock }, executable: PASEO_EXE })).toBe(
+      0,
+    );
+  });
+
+  it("rule 2: pid AND startedAt of the marker", () => {
+    expect(classifyEngineHolder({ ...base, marker: { ...lock }, executable: PASEO_EXE })).toBe(2);
+    expect(
+      classifyEngineHolder({
+        ...base,
+        marker: { pid: lock.pid, startedAt: "2026-11-15T08:00:00.000Z" },
+        executable: PASEO_EXE,
+      }),
+    ).toBe(5);
+  });
+
+  it("rules 3 and 4 before 5: an Orchestra executable or folder is never Paseo's", () => {
+    expect(classifyEngineHolder({ ...base, executable: ORCHESTRA_EXE })).toBe(3);
+    expect(
+      classifyEngineHolder({
+        ...base,
+        executable: "/Users/x/Library/Application Support/Orchestra/runtime/paseo",
+      }),
+    ).toBe(4);
+  });
+
+  it("rule 5 for an installed Paseo, rule 6 for anything else or nothing readable", () => {
+    expect(classifyEngineHolder({ ...base, executable: PASEO_EXE })).toBe(5);
+    expect(classifyEngineHolder({ ...base, executable: "/usr/local/bin/node" })).toBe(6);
+    expect(classifyEngineHolder({ ...base, executable: null })).toBe(6);
+  });
+});
+
+describe("isPaseoExecutable", () => {
+  it("recognises Paseo.app, the Windows per-user install, /opt/paseo and /usr/lib/paseo", () => {
+    for (const exe of [
+      "/Applications/Paseo.app/Contents/Frameworks/Paseo Helper.app/Contents/MacOS/Paseo Helper",
+      "/Applications/Paseo.app/Contents/MacOS/Paseo",
+      "C:\\Users\\x\\AppData\\Local\\Programs\\Paseo\\Paseo.exe",
+      "c:\\users\\x\\appdata\\local\\programs\\paseo\\PASEO.EXE",
+      "/opt/Paseo/paseo",
+      "/usr/lib/paseo/paseo",
+    ]) {
+      expect(isPaseoExecutable(exe), exe).toBe(true);
+    }
+  });
+
+  it("rejects Orchestra, bare names, other folders and nothing", () => {
+    for (const exe of [
+      "/Applications/Orchestra.app/Contents/Frameworks/Orchestra Helper.app/Contents/MacOS/Orchestra Helper",
+      "Paseo Helper",
+      "paseo.exe",
+      "/usr/local/bin/paseo",
+      "D:\\Tools\\Paseo.exe",
+      "/opt/paseo/node",
+      "/usr/local/bin/node",
+      null,
+      "",
+    ]) {
+      expect(isPaseoExecutable(exe), String(exe)).toBe(false);
+    }
+  });
+});
+
+describe("isUnderOrchestraFolder", () => {
+  const env = {
+    LOCALAPPDATA: "C:\\Users\\x\\AppData\\Local",
+    APPDATA: "C:\\Users\\x\\AppData\\Roaming",
+    HOME: "/home/x",
+  };
+
+  it("macOS Application Support, Windows LOCALAPPDATA/APPDATA, Linux ~/.config", () => {
+    for (const exe of [
+      "/Users/x/Library/Application Support/Orchestra/engine/node",
+      "C:\\Users\\x\\AppData\\Local\\Orchestra\\engine\\node.exe",
+      "C:\\Users\\x\\AppData\\Roaming\\Orchestra\\runtime\\paseo.exe",
+      "/home/x/.config/Orchestra/engine/node",
+    ]) {
+      expect(isUnderOrchestraFolder(exe, env), exe).toBe(true);
+    }
+  });
+
+  it("not Paseo's folders, not a lookalike name", () => {
+    for (const exe of [
+      "/Users/x/Library/Application Support/Paseo/node",
+      "C:\\Users\\x\\AppData\\Local\\Programs\\Paseo\\Paseo.exe",
+      "C:\\Users\\x\\AppData\\Local\\OrchestraX\\node.exe",
+      "/home/x/.config/paseo/node",
+      null,
+    ]) {
+      expect(isUnderOrchestraFolder(exe, env), String(exe)).toBe(false);
+    }
   });
 });
 
@@ -498,6 +629,16 @@ describe("daemonSeedWarningText", () => {
     expect(foreign.canRestart).toBe(false);
     expect(foreign.detail).toContain("started outside Orchestra");
     expect(foreign.detail).toContain("v0.3.0");
+    // contratto-1321 §4.7: no on-screen text names Paseo.
+    for (const owner of ["this-app", "orchestra", "orchestra-other", "foreign"] as const) {
+      for (const kind of ["seed", "plugin-outdated"] as const) {
+        const text = daemonSeedWarningText({ ...base, kind, owner });
+        expect(`${text.message} ${text.detail}`).not.toMatch(/paseo/i);
+      }
+    }
+    expect(
+      daemonSeedWarningText({ ...base, kind: "seed", owner: "orchestra-other" }).canRestart,
+    ).toBe(false);
     expect(daemonSeedWarningText({ ...base, kind: "seed", owner: "orchestra" }).canRestart).toBe(
       true,
     );
@@ -525,6 +666,14 @@ describe("planDaemonSeedAction", () => {
   });
 
   it("never restarts a foreign daemon, and warns on other failures", () => {
+    expect(
+      planDaemonSeedAction({
+        ...healthy,
+        pluginOutdated: true,
+        owner: "orchestra-other",
+        alreadyRestarted: false,
+      }),
+    ).toBe("warn");
     expect(
       planDaemonSeedAction({
         ...healthy,

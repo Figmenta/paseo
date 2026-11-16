@@ -4,9 +4,13 @@ import {
   findOrchestraLinkArg,
   ignoredLinkFields,
   isNoteSlug,
+  isMaestroId,
   isOrchestraLink,
+  maestroPath,
   notePath,
   noteRouteSlug,
+  orchestraLinkFromRoute,
+  orchestraLinkPath,
   parseOrchestraLink,
   parseOrchestraLinkFromArgv,
 } from "./orchestra-links.js";
@@ -69,6 +73,91 @@ describe("parseOrchestraLink", () => {
     ["empty string", ""],
   ])("rejects %s", (_label, url) => {
     expect(parseOrchestraLink(url)).toBeNull();
+  });
+});
+
+describe("parseOrchestraLink: Maestro (contratto-1321 §4.6)", () => {
+  const ID_64 = "A".repeat(64);
+
+  it.each([
+    ["orchestra://maestro", null],
+    ["orchestra://maestro/abc", "abc"],
+    ["orchestra://maestro/Run_42-x", "Run_42-x"],
+    [`orchestra://maestro/${ID_64}`, ID_64],
+    // Only the exact pages the web refuses are refused: a near name is an id.
+    ["orchestra://maestro/Mail", "Mail"],
+    ["orchestra://maestro/mailbox", "mailbox"],
+    ["ORCHESTRA://maestro/abc", "abc"],
+  ])("accepts %s", (url, id) => {
+    expect(parseOrchestraLink(url)).toEqual({ kind: "maestro", id });
+  });
+
+  it.each([
+    ["the mail page", "orchestra://maestro/mail"],
+    ["the confirm page", "orchestra://maestro/confirm"],
+    ["trailing slash", "orchestra://maestro/"],
+    ["trailing slash after the id", "orchestra://maestro/abc/"],
+    ["extra path segment", "orchestra://maestro/abc/def"],
+    ["id of 65 characters", `orchestra://maestro/${ID_64}A`],
+    ["dot in the id", "orchestra://maestro/a.b"],
+    ["dot-dot segment", "orchestra://maestro/.."],
+    ["percent-encoded id", "orchestra://maestro/a%2Fb"],
+    ["query", "orchestra://maestro?x=1"],
+    ["query after the id", "orchestra://maestro/abc?x=1"],
+    ["hash", "orchestra://maestro#top"],
+    ["userinfo", "orchestra://user@maestro/abc"],
+    ["port", "orchestra://maestro:8080/abc"],
+    ["uppercase host", "orchestra://MAESTRO/abc"],
+    ["lookalike host", "orchestra://maestros/abc"],
+    ["no authority", "orchestra:maestro"],
+    ["trailing newline", "orchestra://maestro\n"],
+    ["other scheme", "paseo://maestro/abc"],
+  ])("rejects %s", (_label, url) => {
+    expect(parseOrchestraLink(url)).toBeNull();
+  });
+
+  it("is found in argv like a note link", () => {
+    expect(parseOrchestraLinkFromArgv(["Orchestra.exe", "orchestra://maestro/abc"])).toEqual({
+      kind: "maestro",
+      id: "abc",
+    });
+    expect(parseOrchestraLinkFromArgv(["Orchestra.exe", "orchestra://maestro/mail"])).toBeNull();
+  });
+});
+
+describe("maestroPath, orchestraLinkPath and orchestraLinkFromRoute", () => {
+  it("builds the Maestro routes and reads them back", () => {
+    expect(maestroPath(null)).toBe("/maestro");
+    expect(maestroPath("abc")).toBe("/maestro/abc");
+    expect(orchestraLinkPath({ kind: "maestro", id: null })).toBe("/maestro");
+    expect(orchestraLinkPath({ kind: "maestro", id: "abc" })).toBe("/maestro/abc");
+    expect(orchestraLinkPath({ kind: "note", slug: "cn" })).toBe("/notes?slug=cn");
+    expect(orchestraLinkFromRoute("/maestro")).toEqual({ kind: "maestro", id: null });
+    expect(orchestraLinkFromRoute("/maestro/abc")).toEqual({ kind: "maestro", id: "abc" });
+    expect(orchestraLinkFromRoute("/notes?slug=cn")).toEqual({ kind: "note", slug: "cn" });
+  });
+
+  it.each(["", "mail", "confirm", "a/b", "../x", "a.b", "A".repeat(65)])(
+    "never builds a route from the Maestro id %j",
+    (id) => {
+      expect(isMaestroId(id)).toBe(false);
+      expect(() => maestroPath(id)).toThrow("invalid Maestro id");
+    },
+  );
+
+  it.each([
+    null,
+    undefined,
+    "",
+    "/maestro/",
+    "/maestro/mail",
+    "/maestro/confirm",
+    "/maestro/a/b",
+    "/maestro?x=1",
+    "/h/server-1/agent/agent-1",
+    "https://orchestra.figmenta.site/maestro",
+  ])("reads no link from the route %j", (route) => {
+    expect(orchestraLinkFromRoute(route)).toBeNull();
   });
 });
 

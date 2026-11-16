@@ -253,7 +253,7 @@ describe("main.ts wiring", () => {
     expect(ready).toBeGreaterThan(gate);
     expect(splash).toBeGreaterThan(ready);
     // Before the engine and the first window.
-    expect(splash).toBeLessThan(bootstrap.indexOf("await startOrchestraDaemon();"));
+    expect(splash).toBeLessThan(bootstrap.indexOf("engineSupervisor = startEngineSupervisor();"));
     expect(splash).toBeLessThan(bootstrap.indexOf("desktopWindowOwner.openPrimary("));
   });
 
