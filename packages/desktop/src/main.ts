@@ -91,6 +91,9 @@ import {
   setEngineEnvironmentPreparer,
   stopDesktopDaemonViaCli,
   wasDaemonSpawnedByThisApp,
+  forceStopOwnEngine,
+  ownedLaunchInstance,
+  readOrchestraLaunchMarker,
 } from "./daemon/daemon-manager.js";
 import {
   createQuitLifecycle,
@@ -121,7 +124,7 @@ import {
   type OrchestraLink,
 } from "./figmenta/orchestra-links.js";
 import { seedOrchestraDaemonConfig, verifySeedQuiet } from "./figmenta/orchestra-daemon-seed.js";
-import { createEngineSupervisor } from "./figmenta/engine-supervisor.js";
+import { createEngineSupervisor, readEnginePort } from "./figmenta/engine-supervisor.js";
 import {
   ENGINE_RESTART_CHANNEL,
   ENGINE_STATUS_CHANNEL,
@@ -147,7 +150,7 @@ import {
   isStartupSplashWindow,
   showStartupSplash,
 } from "./figmenta/startup-splash-electron.js";
-import { registerReveal } from "./figmenta/reveal.js";
+import { isOrchestraTopFrame, registerReveal } from "./figmenta/reveal.js";
 import {
   guestPermissionPolicy,
   isGoogleDocsWebviewSrc,
@@ -392,6 +395,8 @@ let linkWindowCreation: Promise<void> | null = null;
 // app is quitting: `appQuitting` turns true in before-quit and before-quit-for-update.
 let mainOrchestraWindow: BrowserWindow | null = null;
 let appQuitting = false;
+// Without a tray (macOS, or a tray Electron could not create) closing never only hides.
+let trayAvailable = false;
 // Contratto-1321 §4.1: the supervisor of our engine, created by bootstrap.
 let engineSupervisor: EngineSupervisor | null = null;
 
@@ -881,6 +886,7 @@ function trackMainOrchestraWindow(win: BrowserWindow, restoreWindowState: boolea
     const hide = shouldHideOnClose({
       platform: process.platform,
       appQuitting,
+      trayAvailable,
       isMainWindow: win === mainOrchestraWindow,
     });
     if (!hide) return;
@@ -1188,11 +1194,66 @@ function resolveOrchestraPluginPath(): string {
 // seed without any dialog, keeps it healthy and reports it to the page as
 // window.orchestraDesktop.engine.
 let ownEngineListen: string | null = null;
+// The seed check may restart our engine once per app run (an outdated plugin): after that
+// restart it only reports, or a plugin that stays outdated would restart it forever.
+let seedRestartUsed = false;
+
+type EngineInstance = { pid: number; startedAt: string } | null;
+
+function sameEngineInstance(a: EngineInstance, b: EngineInstance): boolean {
+  if (a === null || b === null) return a === b;
+  return a.pid === b.pid && a.startedAt === b.startedAt;
+}
+
+async function verifyOwnEngineSeed(): Promise<boolean> {
+  const before = ownedLaunchInstance();
+  const ok = await verifySeedQuiet({
+    listen: ownEngineListen ?? `127.0.0.1:${readEnginePort()}`,
+    pluginPath: resolveOrchestraPluginPath(),
+    alreadyRestarted: seedRestartUsed,
+  });
+  if (!sameEngineInstance(before, ownedLaunchInstance())) seedRestartUsed = true;
+  return ok;
+}
+
+const SUPERVISOR_SETTLE_CAP_MS = 5_000;
+
+// Contratto-1321 §4.4: before the engine is stopped for a quit or an install, the supervisor
+// stops and the launch it may have in flight settles (at most 5 s), so no attempt races it.
+async function stopEngineSupervisorAndSettle(): Promise<void> {
+  const supervisor = engineSupervisor;
+  if (!supervisor) return;
+  supervisor.stop();
+  await Promise.race([
+    supervisor.settled(),
+    new Promise((resolve) => setTimeout(resolve, SUPERVISOR_SETTLE_CAP_MS)),
+  ]);
+}
+
+// The engine setup (Claude Code fixed, "Try again") restarts our engine through the
+// supervisor, never with a launch of its own: a forced stop of OUR instance only (this
+// launch, else the one the Orchestra marker names), then the supervisor's next attempt.
+async function restartOwnEngineAfterSetup(): Promise<void> {
+  const supervisor = engineSupervisor;
+  if (!supervisor) return; // Not started yet: its first launch already gets the new setup.
+  const marker = readOrchestraLaunchMarker();
+  const instance =
+    ownedLaunchInstance() ??
+    (marker && typeof marker.pid === "number" && typeof marker.startedAt === "string"
+      ? { pid: marker.pid, startedAt: marker.startedAt }
+      : null);
+  if (instance) {
+    const stopped = await forceStopOwnEngine(instance);
+    log.info("[orchestra] engine stopped for the setup restart", { stopped, pid: instance.pid });
+  }
+  const started = await supervisor.restartNow();
+  log.info("[orchestra] engine restart after the setup", { attemptStarted: started });
+}
 
 function startEngineSupervisor(): EngineSupervisor {
   const supervisor = createEngineSupervisor({
-    startOwnEngine: async () => {
-      const status = await startDaemon();
+    startOwnEngine: async (signal?: AbortSignal) => {
+      const status = await startDaemon(signal);
       ownEngineListen = status.listen;
       log.info("[orchestra] daemon ready", {
         status: status.status,
@@ -1200,8 +1261,7 @@ function startEngineSupervisor(): EngineSupervisor {
         spawnedByThisApp: wasDaemonSpawnedByThisApp(),
       });
     },
-    verifySeed: () =>
-      verifySeedQuiet({ listen: ownEngineListen, pluginPath: resolveOrchestraPluginPath() }),
+    verifySeed: verifyOwnEngineSeed,
     log: (message, extra) => {
       if (extra === undefined) log.info(message);
       else log.info(message, extra);
@@ -1210,7 +1270,10 @@ function startEngineSupervisor(): EngineSupervisor {
   ipcMain.on(ENGINE_STATUS_GET_CHANNEL, (event) => {
     event.returnValue = supervisor.status();
   });
-  ipcMain.handle(ENGINE_RESTART_CHANNEL, async () => ({ ok: await supervisor.restartNow() }));
+  // Only Orchestra's own top frame may ask, the guard of revealInVault (figmenta/reveal.ts).
+  ipcMain.handle(ENGINE_RESTART_CHANNEL, async (event) =>
+    isOrchestraTopFrame(event) ? { ok: await supervisor.restartNow() } : { ok: false },
+  );
   supervisor.onChange((status) => {
     for (const win of BrowserWindow.getAllWindows()) {
       if (win.isDestroyed() || win.webContents.isDestroyed()) continue;
@@ -1384,12 +1447,7 @@ async function bootstrap(): Promise<void> {
   // retry (the setup window, File > Set Up Claude Code…), which restarts the engine it fixed.
   setEngineEnvironmentPreparer(prepareEngineEnvironment);
   registerEngineSetup({
-    restartEngine: async () => {
-      if (wasDaemonSpawnedByThisApp() && isDesktopManagedDaemonRunningSync()) {
-        await stopDesktopDaemonViaCli("restart");
-      }
-      await startDaemon();
-    },
+    restartEngine: restartOwnEngineAfterSetup,
     onStatusChange: refreshApplicationMenu,
     refreshClaudeCatalog: () => refreshDaemonProviderCatalog("claude"),
   });
@@ -1449,7 +1507,7 @@ async function bootstrap(): Promise<void> {
   startMandatoryUpdater({
     beforeInstall: async () => {
       // Contratto-1321 §4.4: no restart attempt may race the install.
-      engineSupervisor?.stop();
+      await stopEngineSupervisorAndSettle();
       if (wasDaemonSpawnedByThisApp() && isDesktopManagedDaemonRunningSync()) {
         await stopDesktopDaemonViaCli("app_update");
       }
@@ -1459,15 +1517,16 @@ async function bootstrap(): Promise<void> {
   installOrchestraSessionPolicies();
   // Contratto-1321 §4.4: Windows and Linux keep Orchestra in the system tray, from `ready` on.
   // Before the first window exists bootstrap is about to open it: the tray has nothing to do.
-  createOrchestraTray({
-    openOrchestra: () => {
-      if (showMainOrchestraWindow() || !bootstrapIsComplete) return;
-      void desktopWindowOwner.openPrimary().catch((error) => {
-        log.error("[tray] failed to open Orchestra", error);
-      });
-    },
-    quit: () => app.quit(),
-  });
+  trayAvailable =
+    createOrchestraTray({
+      openOrchestra: () => {
+        if (showMainOrchestraWindow() || !bootstrapIsComplete) return;
+        void desktopWindowOwner.openPrimary().catch((error) => {
+          log.error("[tray] failed to open Orchestra", error);
+        });
+      },
+      quit: () => app.quit(),
+    }) !== null;
   await seedOrchestraDaemonConfig({ pluginPath: resolveOrchestraPluginPath() });
   engineSupervisor = startEngineSupervisor();
   // The first attempt gets at most 10 s before the window opens: replacing a foreign engine
@@ -1559,8 +1618,10 @@ function showDaemonShutdownDialog(): void {
 const quitLifecycle = createQuitLifecycle({
   app,
   closeTransportSessions: closeAllTransportSessions,
-  stopDesktopManagedDaemonIfNeeded: () =>
-    stopDesktopManagedDaemonOnQuitIfNeeded({
+  stopDesktopManagedDaemonIfNeeded: async () => {
+    // Contratto-1321 §4.4: the supervisor (stopped first in before-quit) settles before the stop.
+    await stopEngineSupervisorAndSettle();
+    return stopDesktopManagedDaemonOnQuitIfNeeded({
       settingsStore: getDesktopSettingsStore(),
       // Figmenta fork: the pid lock only says "some desktop manages this daemon".
       // Quitting Orchestra must not kill the daemon of an installed Paseo Desktop.
@@ -1568,7 +1629,8 @@ const quitLifecycle = createQuitLifecycle({
         wasDaemonSpawnedByThisApp() && isDesktopManagedDaemonRunningSync(),
       stopDaemon: () => stopDesktopDaemonViaCli("quit"),
       showShutdownFeedback: showDaemonShutdownDialog,
-    }),
+    });
+  },
   // Figmenta fork: the mandatory updater (figmenta/mandatory-update-electron.ts) installs
   // through its own screen; a download left uninstalled at quit is applied by
   // electron-updater's autoInstallOnAppQuit. Upstream's revalidate-on-quit stays off.

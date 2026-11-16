@@ -503,6 +503,20 @@ export function isUnderOrchestraFolder(
   return lower.includes("/.config/orchestra/");
 }
 
+/** Is this executable an engine at all — Orchestra's (rules 3, 4) or Paseo's (rule 5)?
+ * A live pid lock whose pid now runs anything else is a stale lock on a reused pid:
+ * released, never signalled. */
+export function isEngineExecutable(
+  executable: string | null | undefined,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return (
+    isOrchestraExecutable(executable) ||
+    isUnderOrchestraFolder(executable, env) ||
+    isPaseoExecutable(executable)
+  );
+}
+
 /**
  * The §4.3 classification of the supervisor S that holds the port (its pid lock already
  * checked alive and with the serverId the port answers with). The number is the rule:

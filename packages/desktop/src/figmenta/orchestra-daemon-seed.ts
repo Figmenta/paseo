@@ -3,8 +3,7 @@
 // this module reads the files, asks the daemon, and restarts it when that is ours to do.
 // main.ts calls it at boot; the dialog stays in main.ts and is handed in as `warn`.
 
-import { execFileSync } from "node:child_process";
-import { copyFileSync, readFileSync, readlinkSync } from "node:fs";
+import { copyFileSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { app, net } from "electron";
 import log from "electron-log/main";
@@ -13,6 +12,7 @@ import { readDaemonInstance } from "@getpaseo/server/daemon-control";
 import {
   listDaemonPlugins,
   ownedLaunchInstance,
+  processExecutable,
   readOrchestraLaunchMarker,
   startDaemon,
   stopDesktopDaemon,
@@ -25,7 +25,6 @@ import {
   loadedPluginPath,
   ORCHESTRA_PLUGIN_ID,
   ORCHESTRA_URL,
-  parseProcessExecutable,
   planDaemonSeedAction,
   pluginIsRunning,
   seedPaseoConfigText,
@@ -148,44 +147,8 @@ export interface DaemonSeedCheck {
   restarted: boolean;
 }
 
-function runProbe(command: string, args: string[]): string | null {
-  try {
-    return execFileSync(command, args, {
-      encoding: "utf-8",
-      timeout: 3_000,
-      stdio: ["ignore", "pipe", "ignore"],
-      windowsHide: true,
-    });
-  } catch {
-    return null;
-  }
-}
-
-/** The executable image of `pid` (not its command line: the supervisor retitles itself). */
-export function processExecutable(pid: number): string | null {
-  if (process.platform === "darwin") {
-    return (
-      parseProcessExecutable(
-        "lsof",
-        runProbe("lsof", ["-a", "-p", String(pid), "-d", "txt", "-Fn"]),
-      ) ?? parseProcessExecutable("proc", runProbe("ps", ["-o", "ucomm=", "-p", String(pid)]))
-    );
-  }
-  if (process.platform === "linux") {
-    try {
-      return parseProcessExecutable("proc", readlinkSync(`/proc/${pid}/exe`));
-    } catch {
-      return null;
-    }
-  }
-  if (process.platform === "win32") {
-    return parseProcessExecutable(
-      "powershell",
-      runProbe("powershell", ["-NoProfile", "-Command", `(Get-Process -Id ${pid}).Path`]),
-    );
-  }
-  return null;
-}
+/** The executable image of `pid`; lives in daemon-manager since 1.3.21, re-exported. */
+export { processExecutable };
 
 async function resolveDaemonOwner(): Promise<{
   owner: DaemonOwner;
@@ -356,13 +319,14 @@ function bundledOrchestraPluginPath(): string {
  * attempts. true = the engine runs with the Orchestra seed.
  */
 export async function verifySeedQuiet(
-  input: { listen?: string | null; pluginPath?: string } = {},
+  input: { listen?: string | null; pluginPath?: string; alreadyRestarted?: boolean } = {},
 ): Promise<boolean> {
   try {
     const check = await verifyOrchestraDaemonSeed({
       listen: input.listen ?? null,
       pluginPath: input.pluginPath ?? bundledOrchestraPluginPath(),
       warn: () => {},
+      alreadyRestarted: input.alreadyRestarted === true,
     });
     return check.action === "ok";
   } catch (error) {

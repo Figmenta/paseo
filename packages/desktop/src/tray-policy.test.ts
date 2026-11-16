@@ -14,13 +14,30 @@ describe("shouldHideOnClose", () => {
     ["darwin", true, false],
     ["freebsd", false, false],
   ] as const)("platform %s, appQuitting %s → hide %s", (platform, appQuitting, hide) => {
-    expect(shouldHideOnClose({ platform, appQuitting, isMainWindow: true })).toBe(hide);
+    expect(
+      shouldHideOnClose({ platform, appQuitting, trayAvailable: true, isMainWindow: true }),
+    ).toBe(hide);
+  });
+
+  it("never hides without a tray to bring the window back", () => {
+    for (const platform of ["win32", "linux", "darwin"] as const) {
+      expect(
+        shouldHideOnClose({
+          platform,
+          appQuitting: false,
+          trayAvailable: false,
+          isMainWindow: true,
+        }),
+      ).toBe(false);
+    }
   });
 
   it("never hides a window that is not the main one", () => {
     for (const platform of ["win32", "linux", "darwin"] as const) {
       for (const appQuitting of [false, true]) {
-        expect(shouldHideOnClose({ platform, appQuitting, isMainWindow: false })).toBe(false);
+        expect(
+          shouldHideOnClose({ platform, appQuitting, trayAvailable: true, isMainWindow: false }),
+        ).toBe(false);
       }
     }
   });

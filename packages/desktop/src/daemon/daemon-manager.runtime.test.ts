@@ -1,3 +1,5 @@
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DaemonLaunchRuntime } from "./runtime-paths.js";
 
@@ -16,7 +18,8 @@ const mocks = vi.hoisted(() => {
   return {
     DaemonInstanceError,
     startDaemonInstance: vi.fn(),
-    readDaemonInstance: vi.fn(async () => null),
+    readDaemonInstance: vi.fn(async (): Promise<unknown> => null),
+    stopDaemonInstance: vi.fn(),
     runExternalCliJsonCommand: vi.fn(),
     resolveBundledDaemonRuntime: vi.fn(),
     resolvePaseoAppDaemonRuntime: vi.fn(),
@@ -38,7 +41,7 @@ vi.mock("electron-log/main", () => ({
 vi.mock("@getpaseo/server/daemon-control", () => ({
   resolvePaseoHome: vi.fn(() => "/tmp/orchestra-test-home"),
   startDaemonInstance: mocks.startDaemonInstance,
-  stopDaemonInstance: vi.fn(),
+  stopDaemonInstance: mocks.stopDaemonInstance,
   readDaemonInstance: mocks.readDaemonInstance,
   isSameDaemonInstance: (a: { pid: number }, b: { pid: number }) => a.pid === b.pid,
   DaemonInstanceError: mocks.DaemonInstanceError,
@@ -73,7 +76,47 @@ const {
   pickOrchestraDaemonRuntime,
   setEngineEnvironmentPreparer,
   stopForeignEngine,
+  EngineHolderError,
+  engineProcessProbe,
+  forceStopOwnEngine,
+  lastForeignEngineStopAt,
+  startDaemon,
+  ownedLaunchInstance,
 } = await import("./daemon-manager.js");
+
+const TEST_HOME = "/tmp/orchestra-test-home";
+const ORCHESTRA_OTHER =
+  "/Users/x/Downloads/Orchestra 2.app/Contents/Frameworks/Orchestra Helper.app/Contents/MacOS/Orchestra Helper";
+const PASEO_HELPER =
+  "/Applications/Paseo.app/Contents/Frameworks/Paseo Helper.app/Contents/MacOS/Paseo Helper";
+const NOT_AN_ENGINE = "/usr/bin/foo";
+// A pid no process has: the foreign stop sees it gone after the graceful stop.
+const DEAD_PID = 999_999;
+
+function writeMarker(instance: { pid: number; startedAt: string } | null): void {
+  rmSync(TEST_HOME, { recursive: true, force: true });
+  if (!instance) return;
+  mkdirSync(TEST_HOME, { recursive: true });
+  writeFileSync(path.join(TEST_HOME, "orchestra-daemon.json"), JSON.stringify(instance));
+}
+
+function liveStatus(pid: number, startedAt: string) {
+  return {
+    localDaemon: "running",
+    serverId: "srv",
+    listen: "127.0.0.1:6767",
+    pid,
+    startedAt,
+    daemonVersion: "0.9.2",
+    desktopManaged: true,
+  };
+}
+
+function stopCalls(): unknown[][] {
+  return mocks.runExternalCliJsonCommand.mock.calls.filter((call) =>
+    (call[0] as string[]).includes("stop"),
+  );
+}
 
 function runtime(source: "bundled" | "paseo-app", version: string): DaemonLaunchRuntime {
   return {
@@ -91,7 +134,13 @@ function launchedCommands(): string[] {
   );
 }
 
+afterEach(() => {
+  vi.restoreAllMocks();
+  writeMarker(null);
+});
+
 beforeEach(() => {
+  mocks.stopDaemonInstance.mockReset();
   mocks.startDaemonInstance.mockReset();
   mocks.readDaemonInstance.mockReset();
   mocks.readDaemonInstance.mockResolvedValue(null);
@@ -184,20 +233,178 @@ describe("start_desktop_daemon", () => {
     );
   });
 
-  it("does not reuse a daemon this app did not launch (contratto-1321 §4.3): no launch, no stop", async () => {
-    mocks.runExternalCliJsonCommand.mockResolvedValue({
-      localDaemon: "running",
-      serverId: "srv",
-      listen: "127.0.0.1:6767",
-      pid: 42,
-      daemonVersion: "0.9.2",
-      desktopManaged: true,
-    });
-    await expect(createDaemonCommandHandlers().start_desktop_daemon()).rejects.toThrow(
-      "did not launch",
-    );
+  it("a live lock of another Orchestra: port_busy_other, no launch, no stop", async () => {
+    mocks.runExternalCliJsonCommand.mockResolvedValue(liveStatus(42, "2026-11-16T08:00:00.000Z"));
+    vi.spyOn(engineProcessProbe, "executable").mockReturnValue(ORCHESTRA_OTHER);
+    const release = vi.spyOn(engineProcessProbe, "releaseStaleLock");
+    const error = await startDaemon().catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(EngineHolderError);
+    expect((error as InstanceType<typeof EngineHolderError>).reason).toBe("port_busy_other");
     expect(mocks.startDaemonInstance).not.toHaveBeenCalled();
-    expect(mocks.runExternalCliJsonCommand).toHaveBeenCalledTimes(1);
+    expect(mocks.stopDaemonInstance).not.toHaveBeenCalled();
+    expect(release).not.toHaveBeenCalled();
+    expect(stopCalls()).toEqual([]);
+  });
+
+  it("a live lock whose pid is not an engine (reused pid): released, nothing signalled, launched", async () => {
+    mocks.runExternalCliJsonCommand.mockResolvedValue(liveStatus(42, "2026-11-16T08:00:00.000Z"));
+    mocks.resolveBundledDaemonRuntime.mockReturnValue(runtime("bundled", "0.9.2"));
+    mocks.startDaemonInstance.mockResolvedValue({ spawned: true });
+    vi.spyOn(engineProcessProbe, "executable").mockReturnValue(NOT_AN_ENGINE);
+    const release = vi.spyOn(engineProcessProbe, "releaseStaleLock").mockResolvedValue(undefined);
+    const kill = vi.spyOn(process, "kill");
+    await startDaemon();
+    expect(release).toHaveBeenCalledWith(TEST_HOME, {
+      pid: 42,
+      startedAt: "2026-11-16T08:00:00.000Z",
+    });
+    expect(kill).not.toHaveBeenCalled();
+    expect(mocks.stopDaemonInstance).not.toHaveBeenCalled();
+    expect(stopCalls()).toEqual([]);
+    expect(launchedCommands()).toEqual(["/bundled/node"]);
+  });
+
+  it("the marker's own instance on a reused pid: released and relaunched, never reused", async () => {
+    const lock = { pid: 42, startedAt: "2026-11-16T08:00:00.000Z" };
+    writeMarker(lock);
+    mocks.runExternalCliJsonCommand.mockResolvedValue(liveStatus(lock.pid, lock.startedAt));
+    mocks.resolveBundledDaemonRuntime.mockReturnValue(runtime("bundled", "0.9.2"));
+    mocks.startDaemonInstance.mockResolvedValue({ spawned: true });
+    vi.spyOn(engineProcessProbe, "executable").mockReturnValue(NOT_AN_ENGINE);
+    const release = vi.spyOn(engineProcessProbe, "releaseStaleLock").mockResolvedValue(undefined);
+    await startDaemon();
+    expect(release).toHaveBeenCalledWith(TEST_HOME, lock);
+    expect(launchedCommands()).toEqual(["/bundled/node"]);
+  });
+
+  it("a live lock of a Paseo engine: stopped in process (no force), then ours launched", async () => {
+    const lock = { pid: DEAD_PID, startedAt: "2026-11-16T08:00:00.000Z" };
+    mocks.runExternalCliJsonCommand.mockResolvedValue(liveStatus(lock.pid, lock.startedAt));
+    mocks.readDaemonInstance.mockResolvedValue({ ...lock, listen: "127.0.0.1:6767" });
+    mocks.resolveBundledDaemonRuntime.mockReturnValue(runtime("bundled", "0.9.2"));
+    mocks.startDaemonInstance.mockResolvedValue({ spawned: true });
+    vi.spyOn(engineProcessProbe, "executable").mockReturnValue(PASEO_HELPER);
+    await startDaemon();
+    expect(mocks.stopDaemonInstance).toHaveBeenCalledTimes(1);
+    expect(mocks.stopDaemonInstance.mock.calls[0][0]).toBe(TEST_HOME);
+    expect(mocks.stopDaemonInstance.mock.calls[0][1]).toMatchObject({
+      instance: expect.objectContaining(lock),
+      force: false,
+      timeoutMs: 15_000,
+    });
+    expect(lastForeignEngineStopAt()).not.toBeNull();
+    expect(launchedCommands()).toEqual(["/bundled/node"]);
+  });
+
+  it("concurrent starts share one launch", async () => {
+    mocks.runExternalCliJsonCommand.mockResolvedValue({ localDaemon: "stopped", serverId: "" });
+    mocks.resolveBundledDaemonRuntime.mockReturnValue(runtime("bundled", "0.9.2"));
+    mocks.startDaemonInstance.mockResolvedValue({ spawned: true });
+    const first = startDaemon();
+    const second = startDaemon();
+    expect(second).toBe(first);
+    await Promise.all([first, second]);
+    expect(mocks.startDaemonInstance).toHaveBeenCalledTimes(1);
+  });
+
+  it("an aborted start abandons the launch: no lock recorded as ours after the abort", async () => {
+    mocks.runExternalCliJsonCommand.mockResolvedValue({ localDaemon: "stopped", serverId: "" });
+    mocks.resolveBundledDaemonRuntime.mockReturnValue(runtime("bundled", "0.9.2"));
+    let seen: AbortSignal | undefined;
+    mocks.startDaemonInstance.mockImplementationOnce(
+      async (input: { signal?: AbortSignal; onAcquired: (instance: unknown) => void }) => {
+        seen = input.signal;
+        await new Promise((resolve) => input.signal?.addEventListener("abort", resolve));
+        input.onAcquired({ pid: 77, startedAt: "2026-11-16T15:00:00.000Z" });
+        throw new Error("aborted");
+      },
+    );
+    const controller = new AbortController();
+    const started = startDaemon(controller.signal);
+    await vi.waitFor(() => expect(seen).toBeDefined());
+    controller.abort();
+    await expect(started).rejects.toThrow("aborted");
+    expect(seen?.aborted).toBe(true);
+    expect(ownedLaunchInstance()?.pid).not.toBe(77);
+  });
+});
+
+// contratto-1321 §4.1 and review #1: the forced stop of OUR engine, in process.
+describe("forceStopOwnEngine", () => {
+  const lock = { pid: 42, startedAt: "2026-11-16T08:00:00.000Z" };
+
+  it("live lock, marker matching, executable /usr/bin/foo: lock released, no CLI, no stop, no signal", async () => {
+    writeMarker(lock);
+    mocks.readDaemonInstance.mockResolvedValue({ ...lock, listen: "127.0.0.1:6767" });
+    vi.spyOn(engineProcessProbe, "executable").mockReturnValue(NOT_AN_ENGINE);
+    const release = vi.spyOn(engineProcessProbe, "releaseStaleLock").mockResolvedValue(undefined);
+    const kill = vi.spyOn(process, "kill");
+    expect(await forceStopOwnEngine(lock)).toBe(true);
+    expect(release).toHaveBeenCalledWith(TEST_HOME, expect.objectContaining(lock));
+    expect(mocks.runExternalCliJsonCommand).not.toHaveBeenCalled();
+    expect(mocks.stopDaemonInstance).not.toHaveBeenCalled();
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("live lock, marker matching, executable unreadable: nothing released, nothing stopped", async () => {
+    writeMarker(lock);
+    mocks.readDaemonInstance.mockResolvedValue({ ...lock, listen: "127.0.0.1:6767" });
+    vi.spyOn(engineProcessProbe, "executable").mockReturnValue(null);
+    const release = vi.spyOn(engineProcessProbe, "releaseStaleLock").mockResolvedValue(undefined);
+    const kill = vi.spyOn(process, "kill");
+    expect(await forceStopOwnEngine(lock)).toBe(false);
+    expect(release).not.toHaveBeenCalled();
+    expect(mocks.stopDaemonInstance).not.toHaveBeenCalled();
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it("our engine: stopDaemonInstance on that instance with force, shutdown asked over --host", async () => {
+    writeMarker(lock);
+    mocks.readDaemonInstance.mockResolvedValue({ ...lock, listen: "127.0.0.1:6767" });
+    vi.spyOn(engineProcessProbe, "executable").mockReturnValue(ORCHESTRA_OTHER);
+    expect(await forceStopOwnEngine(lock)).toBe(true);
+    const [home, options] = mocks.stopDaemonInstance.mock.calls[0] as [
+      string,
+      {
+        instance: unknown;
+        force: boolean;
+        timeoutMs: number;
+        requestShutdown: (ready: { listen: string }) => Promise<void>;
+      },
+    ];
+    expect(home).toBe(TEST_HOME);
+    expect(options).toMatchObject({
+      instance: expect.objectContaining(lock),
+      force: true,
+      timeoutMs: 15_000,
+    });
+    mocks.runExternalCliJsonCommand.mockResolvedValue({});
+    await options.requestShutdown({ listen: "127.0.0.1:6767" });
+    expect(mocks.runExternalCliJsonCommand).toHaveBeenCalledWith([
+      "daemon",
+      "stop",
+      "--host",
+      "127.0.0.1:6767",
+      "--json",
+    ]);
+  });
+
+  it("a lock replaced during the stop (DAEMON_REPLACED): reported as not stopped", async () => {
+    writeMarker(lock);
+    mocks.readDaemonInstance.mockResolvedValue({ ...lock, listen: "127.0.0.1:6767" });
+    vi.spyOn(engineProcessProbe, "executable").mockReturnValue(ORCHESTRA_OTHER);
+    mocks.stopDaemonInstance.mockRejectedValue(
+      new mocks.DaemonInstanceError("DAEMON_REPLACED", "changed"),
+    );
+    expect(await forceStopOwnEngine(lock)).toBe(false);
+  });
+
+  it("a lock that is not ours is never stopped", async () => {
+    writeMarker(null);
+    mocks.readDaemonInstance.mockResolvedValue({ ...lock, listen: "127.0.0.1:6767" });
+    vi.spyOn(engineProcessProbe, "executable").mockReturnValue(PASEO_HELPER);
+    expect(await forceStopOwnEngine(lock)).toBe(false);
+    expect(mocks.stopDaemonInstance).not.toHaveBeenCalled();
   });
 });
 
@@ -252,13 +459,10 @@ describe("engine environment", () => {
 
   it("a daemon already listening is not launched over: nothing is prepared or installed", async () => {
     mocks.runExternalCliJsonCommand.mockResolvedValue({
-      localDaemon: "running",
-      serverId: "srv",
-      listen: "127.0.0.1:6767",
-      pid: 42,
-      daemonVersion: "0.9.2",
+      ...liveStatus(42, "2026-11-16T08:00:00.000Z"),
       desktopManaged: false,
     });
+    vi.spyOn(engineProcessProbe, "executable").mockReturnValue(ORCHESTRA_OTHER);
     const preparer = vi.fn(async (base: NodeJS.ProcessEnv) => base);
     setEngineEnvironmentPreparer(preparer);
 
@@ -407,6 +611,18 @@ describe("stopForeignEngine", () => {
       expect(ops.signal).not.toHaveBeenCalled();
     });
   }
+
+  it("a lock replaced under the graceful stop (DAEMON_REPLACED): nothing stopped, no signal", async () => {
+    const { ops, calls } = fakeOps({ platform: "darwin", executables: new Map([[7, PASEO]]) });
+    ops.cliStop.mockImplementation(async () => {
+      calls.push("cli");
+      return "replaced" as const;
+    });
+    expect(await stopForeignEngine(7, ops)).toBe("replaced");
+    expect(calls).toEqual(["cli"]);
+    expect(ops.signal).not.toHaveBeenCalled();
+    expect(ops.killTree).not.toHaveBeenCalled();
+  });
 
   it("an executable that cannot be read is never signalled", async () => {
     const { ops, calls } = fakeOps({ platform: "darwin", executables: new Map([[7, null]]) });

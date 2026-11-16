@@ -9,14 +9,19 @@ export function usesTray(platform: NodeJS.Platform): boolean {
 /**
  * Closing the main window on Windows and Linux hides it: the page stays loaded, so Maestro
  * and the client report go on. While the app quits (before-quit, before-quit-for-update) the
- * window closes for real, or `Quit Orchestra` and the update install could never exit.
+ * window closes for real, or `Quit Orchestra` and the update install could never exit. Without
+ * a tray (Electron could not create it) the window closes for real too.
  */
 export function shouldHideOnClose(input: {
   platform: NodeJS.Platform;
   appQuitting: boolean;
+  /** A tray exists to bring the window back: without one, hiding would strand the app. */
+  trayAvailable: boolean;
   isMainWindow: boolean;
 }): boolean {
-  return input.isMainWindow && !input.appQuitting && usesTray(input.platform);
+  return (
+    input.isMainWindow && !input.appQuitting && input.trayAvailable && usesTray(input.platform)
+  );
 }
 
 /** The tray icon in `process.resourcesPath` (electron-builder.yml extraResources). */

@@ -144,12 +144,15 @@ function setup(
     if (world.owned?.pid === instance.pid) world.owned = null;
     return true;
   });
-  const startOwnEngine = vi.fn(async () => {
+  const startOwnEngine = vi.fn(async (signal?: AbortSignal) => {
     const behaviour = world.launchBehaviour;
     if (behaviour === "fail") throw new Error("launch failed");
     if (behaviour !== "ok") {
-      await new Promise((resolve) => setTimeout(resolve, behaviour.hangMs));
-      throw new Error("launch timed out");
+      await Promise.race([
+        new Promise((resolve) => setTimeout(resolve, behaviour.hangMs)),
+        new Promise((resolve) => signal?.addEventListener("abort", resolve, { once: true })),
+      ]);
+      throw new Error(signal?.aborted ? "launch aborted" : "launch timed out");
     }
     if (world.port) throw new Error("port still held");
     ownEngineUp(world);
@@ -170,8 +173,9 @@ function setup(
     ownedLaunch: () => world.owned,
     readExecutable,
     forceStopOwn,
-    stopForeign: (pid) =>
-      stopForeignEngine(pid, {
+    lastForeignStopAt: () => null,
+    stopForeign: (lock) =>
+      stopForeignEngine(lock.pid, {
         platform: options.platform ?? "darwin",
         cliStop,
         isAlive: (target) => world.alive.has(target),
@@ -284,7 +288,7 @@ describe("engine supervisor: §4.3 classification before the launch", () => {
     expectNothingStopped(t);
   });
 
-  it("rule 0: our own launch is reused when healthy, force-stopped and relaunched when not", async () => {
+  it("rule 0: our own launch is reused; unhealthy, it is stopped only after three failed checks", async () => {
     const t = setup();
     ownEngineUp(t.world);
     await t.supervisor.start();
@@ -296,13 +300,18 @@ describe("engine supervisor: §4.3 classification before the launch", () => {
     const first = u.world.lock!;
     u.world.healthy = false;
     await u.supervisor.start();
+    expect(u.forceStopOwn).not.toHaveBeenCalled();
+    expect(u.verifySeed).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(u.forceStopOwn).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(10_000);
     expect(u.forceStopOwn).toHaveBeenCalledWith(first);
     expect(u.startOwnEngine).toHaveBeenCalledTimes(1);
     expect(u.supervisor.status().state).toBe("running");
     expect(u.cliStop).not.toHaveBeenCalled();
   });
 
-  it("rule 2: the instance the marker names is ours: reused, or stopped when unhealthy", async () => {
+  it("rule 2: the instance the marker names is ours and is reused", async () => {
     const t = setup();
     setForeign(t.world, PASEO_MAC, 4242);
     t.world.lock = { pid: 4242, startedAt: "2026-11-16T09:00:00.000Z", serverId: "srv_prev" };
@@ -312,18 +321,23 @@ describe("engine supervisor: §4.3 classification before the launch", () => {
     expect(t.supervisor.status()).toMatchObject({ state: "running", serverId: "srv_prev" });
     expect(t.startOwnEngine).not.toHaveBeenCalled();
     expectNothingStopped(t);
+  });
 
-    const u = setup();
-    u.world.lock = { pid: 4242, startedAt: "2026-11-16T09:00:00.000Z", serverId: "srv_prev" };
-    u.world.alive.add(4242);
-    u.world.port = { serverId: "srv_prev", version: "0.10.1" };
-    u.world.healthy = false;
-    u.world.marker = { pid: 4242, startedAt: "2026-11-16T09:00:00.000Z" };
-    await u.supervisor.start();
-    expect(u.forceStopOwn).toHaveBeenCalledWith(expect.objectContaining({ pid: 4242 }));
-    expect(u.startOwnEngine).toHaveBeenCalledTimes(1);
-    expect(u.cliStop).not.toHaveBeenCalled();
-    expect(u.supervisor.status().state).toBe("running");
+  it("rule 2 engine slow on its first health probe: not stopped, seeded once it answers", async () => {
+    const t = setup();
+    t.world.lock = { pid: 4242, startedAt: "2026-11-16T09:00:00.000Z", serverId: "srv_prev" };
+    t.world.alive.add(4242);
+    t.world.port = { serverId: "srv_prev", version: "0.10.1" };
+    t.world.healthy = false;
+    t.world.marker = { pid: 4242, startedAt: "2026-11-16T09:00:00.000Z" };
+    await t.supervisor.start();
+    expect(t.supervisor.status().state).toBe("running");
+    t.world.healthy = true;
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(t.verifySeed).toHaveBeenCalledTimes(1);
+    expect(t.supervisor.status()).toMatchObject({ state: "running", serverId: "srv_prev" });
+    expect(t.startOwnEngine).not.toHaveBeenCalled();
+    expectNothingStopped(t);
   });
 
   for (const [rule, executable] of [
@@ -569,6 +583,30 @@ describe("engine supervisor: §4.1 health, backoff, state", () => {
     await vi.advanceTimersByTimeAsync(30_000);
   }
 
+  it("restartNow in running after our engine was stopped from outside: probes, then restarts", async () => {
+    const t = setup();
+    await t.supervisor.start();
+    expect(t.startOwnEngine).toHaveBeenCalledTimes(1);
+    // main.ts stopped our engine (Claude Code setup) and asks for a restart: health fails.
+    releaseHolder(t.world, t.world.lock!.pid);
+    t.world.owned = null;
+    expect(await t.supervisor.restartNow()).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.startOwnEngine).toHaveBeenCalledTimes(2);
+    expect(t.supervisor.status().state).toBe("running");
+    expect(t.forceStopOwn).not.toHaveBeenCalled();
+  });
+
+  it("restartNow in running on a healthy engine: false, nothing stopped, nothing launched", async () => {
+    const t = setup();
+    await t.supervisor.start();
+    expect(await t.supervisor.restartNow()).toBe(false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.startOwnEngine).toHaveBeenCalledTimes(1);
+    expect(t.forceStopOwn).not.toHaveBeenCalled();
+    expect(t.supervisor.status().state).toBe("running");
+  });
+
   it("after stop(): restartNow is false and no attempt ever starts", async () => {
     const t = setup();
     await runningThenDown(t);
@@ -579,16 +617,41 @@ describe("engine supervisor: §4.1 health, backoff, state", () => {
     expect(t.startOwnEngine.mock.calls.length).toBe(calls);
   });
 
-  it("stop() during a launch: the launch is abandoned, nothing follows", async () => {
+  it("stop() during a launch: the launch is aborted, settled() resolves, nothing follows", async () => {
     const t = setup();
     t.world.launchBehaviour = { hangMs: 20_000 };
     const started = t.supervisor.start();
     await vi.advanceTimersByTimeAsync(1_000);
+    const signal = t.startOwnEngine.mock.calls[0][0] as AbortSignal | undefined;
+    expect(signal?.aborted).toBe(false);
     t.supervisor.stop();
-    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(signal?.aborted).toBe(true);
+    let settled = false;
+    void t.supervisor.settled().then(() => {
+      settled = true;
+      return undefined;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toBe(true);
     await started;
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
     expect(t.startOwnEngine).toHaveBeenCalledTimes(1);
     expect(t.supervisor.status().state).toBe("starting");
+  });
+
+  it("settled() resolves at once when no launch is in flight", async () => {
+    const t = setup();
+    await t.supervisor.start();
+    await expect(t.supervisor.settled()).resolves.toBeUndefined();
+  });
+
+  it("a lock held by another Orchestra at launch time: port_busy_other, not restart_failed", async () => {
+    const t = setup();
+    t.startOwnEngine.mockRejectedValueOnce(
+      Object.assign(new Error("held"), { reason: "port_busy_other" }),
+    );
+    await t.supervisor.start();
+    expect(t.supervisor.status()).toMatchObject({ state: "error", detail: "port_busy_other" });
   });
 
   it("a failed seed on our engine: error seed_failed, no dialog", async () => {

@@ -14,17 +14,16 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { readDaemonInstance, resolvePaseoHome } from "@getpaseo/server/daemon-control";
 import {
+  EngineHolderError,
   forceStopOwnEngine,
-  isProcessRunning,
-  killProcessTreeWindows,
-  listChildPids,
+  foreignStopOps,
+  lastForeignEngineStopAt,
   ownedLaunchInstance,
+  processExecutable,
   readOrchestraLaunchMarker,
-  stopEngineViaBundledCli,
   stopForeignEngine,
   type ForeignStopOutcome,
 } from "../daemon/daemon-manager.js";
-import { processExecutable } from "./orchestra-daemon-seed.js";
 import { classifyEngineHolder, type EngineHolderRule } from "./orchestra.js";
 import type {
   CreateEngineSupervisor,
@@ -76,10 +75,25 @@ export interface EngineSupervisorOps {
   /** The instance this process launched (rule 0), null when none. */
   ownedLaunch(): Instance | null;
   readExecutable(pid: number): string | null;
-  /** `paseo daemon stop --force` on our engine (rules 0 and 2) only. */
+  /** Forced stop of our engine (rules 0 and 2) only; a lock whose pid no longer runs an
+   *  engine is released, nothing signalled (daemon-manager forceStopOwnEngine). */
   forceStopOwn(instance: Instance): Promise<boolean>;
   /** (a) and (b) of the foreign stop (daemon-manager stopForeignEngine). */
-  stopForeign(pid: number): Promise<ForeignStopOutcome>;
+  stopForeign(lock: Instance): Promise<ForeignStopOutcome>;
+  /** When daemon-manager last stopped a Paseo engine found on the lock at launch time. */
+  lastForeignStopAt(): number | null;
+}
+
+/** The seam's `startOwnEngine` takes no argument; main.ts may accept the abort signal. */
+type StartOwnEngine = (signal?: AbortSignal) => Promise<void>;
+
+function isEngineHolderError(error: unknown): error is EngineHolderError {
+  return (
+    error instanceof EngineHolderError ||
+    (error instanceof Error &&
+      ((error as { reason?: unknown }).reason === "port_busy_other" ||
+        (error as { reason?: unknown }).reason === "foreign_stop_failed"))
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -179,21 +193,11 @@ function defaultOps(): EngineSupervisorOps {
     readMarker: () => readOrchestraLaunchMarker(),
     ownedLaunch: () => ownedLaunchInstance(),
     readExecutable: (pid) => processExecutable(pid),
+    // forceStopOwnEngine reads the executable of the lock's pid first: not an engine
+    // (Orchestra, Orchestra folder, Paseo) → the stale lock is released, no signal.
     forceStopOwn: (instance) => forceStopOwnEngine(instance),
-    stopForeign: (pid) =>
-      stopForeignEngine(pid, {
-        platform: process.platform,
-        cliStop: stopEngineViaBundledCli,
-        isAlive: isProcessRunning,
-        readExecutable: processExecutable,
-        killTree: killProcessTreeWindows,
-        signal: (target, signal) => {
-          process.kill(target, signal);
-        },
-        childPids: listChildPids,
-        sleep: (ms) => new Promise((resolve) => setTimer(() => resolve(undefined), ms)),
-        log: () => {},
-      }),
+    stopForeign: (lock) => stopForeignEngine(lock.pid, foreignStopOps(lock)),
+    lastForeignStopAt: () => lastForeignEngineStopAt(),
   };
 }
 
@@ -233,6 +237,9 @@ export function createEngineSupervisorWith(
   let started = false;
   let stopped = false;
   let attemptInFlight = false;
+  let inFlight: Promise<void> | null = null;
+  let launchAbort: AbortController | null = null;
+  let seedPending = false;
   let timer: unknown = null;
   let errorDeadline: unknown = null;
   let failedAttempts = 0;
@@ -373,14 +380,27 @@ export function createEngineSupervisorWith(
   }
 
   async function launchOwn(): Promise<AttemptResult> {
+    const controller = new AbortController();
+    launchAbort = controller;
+    const foreignStopBefore = ops.lastForeignStopAt();
     try {
-      await deps.startOwnEngine();
+      await (deps.startOwnEngine as StartOwnEngine)(controller.signal);
     } catch (error) {
       deps.log("engine supervisor: launch failed", {
         error: error instanceof Error ? error.message : String(error),
+        aborted: controller.signal.aborted,
       });
+      if (!stopped && isEngineHolderError(error)) {
+        return { ok: false, detail: error.reason, immediateError: true };
+      }
+    } finally {
+      if (launchAbort === controller) launchAbort = null;
     }
     if (stopped) return { ok: "abandoned" };
+    const foreignStopAfter = ops.lastForeignStopAt();
+    if (foreignStopAfter !== null && foreignStopAfter !== foreignStopBefore) {
+      foreignStoppedAt = new Date(foreignStopAfter).toISOString();
+    }
     if (await ops.probeHealth(port)) {
       const lock = await ops.readLock();
       return { ok: true, own: true, instance: lock ?? ops.ownedLaunch() };
@@ -405,7 +425,7 @@ export function createEngineSupervisorWith(
       pid: lock.pid,
       executable,
     });
-    const outcome = await ops.stopForeign(lock.pid);
+    const outcome = await ops.stopForeign(lock);
     if (stopped) return { ok: "abandoned" };
     if (outcome !== "stopped" || !(await waitPortFree(FOREIGN_PORT_RELEASE_MS))) {
       deps.log("engine supervisor: the foreign engine was not stopped", { pid: lock.pid, outcome });
@@ -441,13 +461,9 @@ export function createEngineSupervisorWith(
     });
     switch (rule) {
       case 0:
-      case 2: {
-        if (await ops.probeHealth(port)) return { ok: true, own: true, instance: lock };
-        if (stopped) return { ok: "abandoned" };
-        await ops.forceStopOwn(lock);
-        if (stopped) return { ok: "abandoned" };
-        return launchOwn();
-      }
+      case 2:
+        // Ours: reused. A slow first probe is not a fault — the health loop counts three.
+        return { ok: true, own: true, instance: lock };
       case 3:
       case 4:
         if (await ops.probeHealth(port)) return { ok: true, own: false, instance: lock };
@@ -459,23 +475,48 @@ export function createEngineSupervisorWith(
     }
   }
 
-  async function enterRunning(own: boolean, instance: Instance | null): Promise<void> {
+  /** Runs the seed check; false = our engine failed it (already handled as seed_failed). */
+  async function seedOk(own: boolean): Promise<{ ok: boolean; instance?: Instance | null }> {
     const beforeSeed = ops.ownedLaunch();
     const seeded = await deps.verifySeed();
-    if (stopped) return;
+    let instance: Instance | null | undefined;
     if (!sameInstance(beforeSeed, ops.ownedLaunch())) {
       // The seed check restarted our engine (outdated plugin): one of our attempts.
       failedAttempts += 1;
       deps.log("engine supervisor: the seed check restarted the engine", { failedAttempts });
       instance = (await ops.readLock()) ?? ops.ownedLaunch();
     }
-    if (!seeded) {
-      if (own) {
-        fail("seed_failed", true);
-        return;
-      }
+    if (!seeded && !own) {
       deps.log("engine supervisor: the reused Orchestra engine runs without our seed");
     }
+    return { ok: seeded || !own, instance };
+  }
+
+  async function enterRunning(own: boolean, instance: Instance | null): Promise<void> {
+    if (own && !(await ops.probeHealth(port))) {
+      // Our engine, reused while it does not answer /api/health: the health loop decides
+      // (three failures = fault); the seed is checked once it answers.
+      if (stopped) return;
+      seedPending = true;
+      await goRunning(own, instance, 1);
+      return;
+    }
+    if (stopped) return;
+    const seed = await seedOk(own);
+    if (stopped) return;
+    if (!seed.ok) {
+      fail("seed_failed", true);
+      return;
+    }
+    seedPending = false;
+    await goRunning(own, seed.instance ?? instance, 0);
+  }
+
+  async function goRunning(
+    own: boolean,
+    instance: Instance | null,
+    failuresSoFar: number,
+  ): Promise<void> {
     const probe = await ops.probeStatus(port);
     if (stopped) return;
     version = probe.kind === "busy" ? probe.version : null;
@@ -484,32 +525,36 @@ export function createEngineSupervisorWith(
     failedAttempts = 0;
     backoffStep = 0;
     firstFailureAt = null;
-    healthFailures = 0;
+    healthFailures = failuresSoFar;
     clearErrorDeadline();
     setState("running", null);
     schedule(HEALTH_INTERVAL_MS, healthTick);
   }
 
-  async function attempt(): Promise<void> {
-    if (stopped || attemptInFlight) return;
+  function attempt(): Promise<void> {
+    if (stopped || attemptInFlight) return inFlight ?? Promise.resolve();
     attemptInFlight = true;
     clearTimer();
-    try {
-      let result: AttemptResult;
-      try {
-        result = await runAttempt();
-      } catch (error) {
-        deps.log("engine supervisor: attempt threw", {
-          error: error instanceof Error ? error.message : String(error),
-        });
-        result = { ok: false, detail: "restart_failed", immediateError: false };
-      }
-      if (stopped || result.ok === "abandoned") return;
-      if (result.ok) await enterRunning(result.own, result.instance);
-      else fail(result.detail, result.immediateError);
-    } finally {
+    inFlight = runOneAttempt().finally(() => {
       attemptInFlight = false;
+      inFlight = null;
+    });
+    return inFlight;
+  }
+
+  async function runOneAttempt(): Promise<void> {
+    let result: AttemptResult;
+    try {
+      result = await runAttempt();
+    } catch (error) {
+      deps.log("engine supervisor: attempt threw", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      result = { ok: false, detail: "restart_failed", immediateError: false };
     }
+    if (stopped || result.ok === "abandoned") return;
+    if (result.ok) await enterRunning(result.own, result.instance);
+    else fail(result.detail, result.immediateError);
   }
 
   async function healthTick(): Promise<void> {
@@ -518,6 +563,16 @@ export function createEngineSupervisorWith(
     if (stopped) return;
     if (healthy) {
       healthFailures = 0;
+      if (seedPending && monitored) {
+        seedPending = false;
+        const seed = await seedOk(monitored.own);
+        if (stopped) return;
+        if (!seed.ok) {
+          fail("seed_failed", true);
+          return;
+        }
+        if (seed.instance) monitored = { ...monitored, instance: seed.instance };
+      }
       schedule(HEALTH_INTERVAL_MS, healthTick);
       return;
     }
@@ -565,6 +620,10 @@ export function createEngineSupervisorWith(
       stopped = true;
       clearTimer();
       clearErrorDeadline();
+      launchAbort?.abort();
+    },
+    settled() {
+      return inFlight ? inFlight.then(() => undefined) : Promise.resolve();
     },
     status: snapshot,
     onChange(callback) {
@@ -574,7 +633,17 @@ export function createEngineSupervisorWith(
       };
     },
     async restartNow() {
-      if (stopped || !started || state === "running") return false;
+      if (stopped || !started) return false;
+      if (state === "running") {
+        // A healthy engine is never touched (§3). One that does not answer — main.ts may
+        // have stopped ours on purpose — is restarted now instead of after three checks.
+        if (await ops.probeHealth(port)) return false;
+        if (stopped) return false;
+        deps.log("engine supervisor: restart asked and the engine does not answer");
+        monitored = null;
+        healthFailures = 0;
+        clearTimer();
+      }
       backoffStep = 0;
       if (!attemptInFlight) void attempt();
       return true;

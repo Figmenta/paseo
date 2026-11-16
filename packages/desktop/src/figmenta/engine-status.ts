@@ -55,7 +55,7 @@ export interface EngineSupervisor {
 /** Filled by engine-supervisor.ts (cantiere A1); main.ts (A2) only imports this. */
 export interface EngineSupervisorDeps {
   /** The existing launcher: daemon-manager's start of our engine with the prepared environment. */
-  startOwnEngine(): Promise<void>;
+  startOwnEngine(signal?: AbortSignal): Promise<void>;
   /** The existing seed check (orchestra-daemon-seed.ts verifyOrchestraDaemonSeed); false = failed. */
   verifySeed(): Promise<boolean>;
   log(message: string, extra?: Record<string, unknown>): void;
