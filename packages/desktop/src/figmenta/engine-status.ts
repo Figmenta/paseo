@@ -47,6 +47,9 @@ export interface EngineSupervisor {
   onChange(cb: (status: EngineStatus1321) => void): () => void;
   /** Reset the backoff and try now; true = an attempt started. */
   restartNow(): Promise<boolean>;
+  /** Resolves when no launch is in flight (after stop(): when the aborted launch has settled).
+   *  Callers on quit/install wait on it with their own cap (5 s). */
+  settled(): Promise<void>;
 }
 
 /** Filled by engine-supervisor.ts (cantiere A1); main.ts (A2) only imports this. */
