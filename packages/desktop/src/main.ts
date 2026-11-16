@@ -132,7 +132,7 @@ import {
   type EngineSupervisor,
 } from "./figmenta/engine-status.js";
 import { createOrchestraTray } from "./tray.js";
-import { shouldHideOnClose } from "./tray-policy.js";
+import { shouldHideOnClose, usesTray } from "./tray-policy.js";
 import {
   offerMoveToApplicationsFolder,
   startMandatoryUpdater,
@@ -885,6 +885,12 @@ function trackMainOrchestraWindow(win: BrowserWindow, restoreWindowState: boolea
   win.on("close", (event) => {
     const hide = shouldHideOnClose({
       platform: process.platform,
+      appQuitting,
+      trayAvailable,
+      isMainWindow: win === mainOrchestraWindow,
+    });
+    log.info("[tray] main window close", {
+      hide,
       appQuitting,
       trayAvailable,
       isMainWindow: win === mainOrchestraWindow,
@@ -1679,6 +1685,13 @@ app.on("window-all-closed", () => {
   // setup one (figmenta/claude-code-setup-electron.ts). Closing it means "not now", never
   // "quit": the startup goes on and opens Orchestra.
   if (!bootstrapIsComplete) return;
+  // Contratto-1321 §4.4: on Windows and Linux, with a tray, Orchestra and Maestro stay alive
+  // even when the last window really closed (a close the hide did not catch); the tray's
+  // "Open Orchestra" opens a new main window. Quit is only from the tray or the menu.
+  if (usesTray(process.platform) && trayAvailable && !appQuitting) {
+    log.info("[tray] all windows closed, staying in the tray");
+    return;
+  }
   if (process.platform !== "darwin") {
     app.quit();
   }
