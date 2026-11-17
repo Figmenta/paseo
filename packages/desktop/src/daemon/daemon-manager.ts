@@ -1,4 +1,5 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { execFile, execFileSync } from "node:child_process";
+import { readFileSync, readlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { app, ipcMain, powerMonitor } from "electron";
 import log from "electron-log/main";
@@ -32,10 +33,8 @@ import {
 import {
   resolveBundledDaemonRuntime,
   resolveBundledServerVersion,
-  resolvePaseoAppDaemonRuntime,
   type DaemonLaunchRuntime,
 } from "./runtime-paths.js";
-import { pickDaemonRuntime } from "../figmenta/daemon-runtime.js";
 import { runExternalCliJsonCommand, runExternalCliTextCommand } from "./cli/external.js";
 import {
   createDesktopSettingsCommandHandlers,
@@ -45,7 +44,12 @@ import type { DesktopSettings } from "../settings/desktop-settings.js";
 import { getDesktopSettingsStore } from "../settings/desktop-settings-electron.js";
 import { isRunningUnderARM64Translation } from "../system/arm64-translation.js";
 import {
+  isEngineExecutable,
+  isOrchestraExecutable,
+  isPaseoExecutable,
+  isUnderOrchestraFolder,
   ORCHESTRA_DAEMON_MARKER_FILENAME,
+  parseProcessExecutable,
   shouldRestartDaemonForVersion,
 } from "../figmenta/orchestra.js";
 import { describeSandbox } from "../diagnostics/sandbox.js";
@@ -127,6 +131,40 @@ export function wasDaemonSpawnedByThisApp(): boolean {
   return ownedLaunch !== null;
 }
 
+/** The pid lock (`{ pid, startedAt }`) of the supervisor THIS process launched, if any
+ * (contratto-1321 §4.3 rule 0). */
+export function ownedLaunchInstance(): { pid: number; startedAt: string } | null {
+  if (!ownedLaunch || ownedLaunch.home !== getPaseoHome()) return null;
+  return { pid: ownedLaunch.instance.pid, startedAt: ownedLaunch.instance.startedAt };
+}
+
+/** `orchestra-daemon.json`: the instance an Orchestra launched last (§4.3 rule 2). */
+export function readOrchestraLaunchMarker(
+  home: string = getPaseoHome(),
+): { pid?: unknown; startedAt?: unknown } | null {
+  try {
+    const parsed = JSON.parse(
+      readFileSync(path.join(home, ORCHESTRA_DAEMON_MARKER_FILENAME), "utf-8"),
+    ) as unknown;
+    return parsed !== null && typeof parsed === "object"
+      ? (parsed as { pid?: unknown; startedAt?: unknown })
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function isOrchestraInstance(
+  home: string,
+  instance: { pid: unknown; startedAt: unknown } | null,
+): boolean {
+  if (!instance) return false;
+  const owned = ownedLaunch?.home === home ? ownedLaunch.instance : null;
+  if (owned && owned.pid === instance.pid && owned.startedAt === instance.startedAt) return true;
+  const marker = readOrchestraLaunchMarker(home);
+  return Boolean(marker && marker.pid === instance.pid && marker.startedAt === instance.startedAt);
+}
+
 export function isDesktopManagedDaemonRunningSync(): boolean {
   if (!ownedLaunch) return false;
   try {
@@ -143,7 +181,105 @@ export async function stopDesktopDaemonViaCli(
   await stopDesktopDaemon(reason);
 }
 
-function isProcessRunning(pid: number): boolean {
+function runProbe(command: string, args: string[]): string | null {
+  try {
+    return execFileSync(command, args, {
+      encoding: "utf-8",
+      timeout: 3_000,
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/** The executable image of `pid` (not its command line: the supervisor retitles itself). */
+export function processExecutable(pid: number): string | null {
+  if (process.platform === "darwin") {
+    return (
+      parseProcessExecutable(
+        "lsof",
+        runProbe("lsof", ["-a", "-p", String(pid), "-d", "txt", "-Fn"]),
+      ) ?? parseProcessExecutable("proc", runProbe("ps", ["-o", "ucomm=", "-p", String(pid)]))
+    );
+  }
+  if (process.platform === "linux") {
+    try {
+      return parseProcessExecutable("proc", readlinkSync(`/proc/${pid}/exe`));
+    } catch {
+      return null;
+    }
+  }
+  if (process.platform === "win32") {
+    return parseProcessExecutable(
+      "powershell",
+      runProbe("powershell", ["-NoProfile", "-Command", `(Get-Process -Id ${pid}).Path`]),
+    );
+  }
+  return null;
+}
+
+/** Removes `<home>/paseo.pid` only if it still names `instance` (pid AND startedAt). */
+async function releaseStaleLock(
+  home: string,
+  instance: { pid: number; startedAt: string },
+): Promise<void> {
+  try {
+    const lock = JSON.parse(readFileSync(path.join(home, "paseo.pid"), "utf-8")) as {
+      pid?: unknown;
+      startedAt?: unknown;
+    };
+    if (lock?.pid === instance.pid && lock.startedAt === instance.startedAt) {
+      unlinkSync(path.join(home, "paseo.pid"));
+    }
+  } catch {
+    // Already gone, or unreadable: nothing to release.
+  }
+}
+
+/** The process-level reads this module makes, one object so tests can replace them. */
+export const engineProcessProbe = {
+  executable: processExecutable,
+  releaseStaleLock,
+};
+
+/** Is the process behind a live lock an engine at all? When not, the lock is stale (its pid
+ * was reused): it is released and nothing is signalled. Returns true when released. */
+async function releaseIfNotAnEngine(
+  home: string,
+  instance: { pid: number; startedAt: string },
+): Promise<boolean> {
+  const executable = engineProcessProbe.executable(instance.pid);
+  // Unreadable is not proof of a reused pid (rule 6): leave the lock alone.
+  if (executable === null || isEngineExecutable(executable)) return false;
+  logDesktopDaemonLifecycle("pid lock names a process that is not an engine, released", {
+    pid: instance.pid,
+    executable,
+  });
+  await engineProcessProbe.releaseStaleLock(home, instance);
+  return true;
+}
+
+/** Why our engine could not be started over what holds the lock (contratto-1321 §4.3). */
+export class EngineHolderError extends Error {
+  constructor(
+    public readonly reason: "port_busy_other" | "foreign_stop_failed",
+    message: string,
+  ) {
+    super(message);
+    this.name = "EngineHolderError";
+  }
+}
+
+let lastForeignStop: number | null = null;
+
+/** When this process last stopped a foreign (Paseo) engine from startDaemon, else null. */
+export function lastForeignEngineStopAt(): number | null {
+  return lastForeignStop;
+}
+
+export function isProcessRunning(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
@@ -300,7 +436,21 @@ function assertBuiltInDaemonManagementEnabled(settings: DesktopSettings): void {
   }
 }
 
-export async function startDaemon(): Promise<DesktopDaemonStatus> {
+let startInFlight: Promise<DesktopDaemonStatus> | null = null;
+
+/** Starts our engine; concurrent calls share the one in flight (its `signal` wins). An
+ * aborted `signal` abandons the launch: the supervisor it spawned is stopped, and its
+ * lock is not recorded as ours. */
+export function startDaemon(signal?: AbortSignal): Promise<DesktopDaemonStatus> {
+  if (!startInFlight) {
+    startInFlight = startDaemonOnce(signal).finally(() => {
+      startInFlight = null;
+    });
+  }
+  return startInFlight;
+}
+
+async function startDaemonOnce(signal?: AbortSignal): Promise<DesktopDaemonStatus> {
   assertBuiltInDaemonManagementEnabled(await getDesktopSettingsStore().get());
 
   const current = await resolveDesktopDaemonStatus();
@@ -312,16 +462,24 @@ export async function startDaemon(): Promise<DesktopDaemonStatus> {
     error: current.error,
     desktopManaged: current.desktopManaged,
   });
-  if (current.status === "running" || current.status === "starting") {
-    if (shouldRestartForVersion(current)) {
+  const live =
+    (current.status === "running" || current.status === "starting") &&
+    current.pid !== null &&
+    current.startedAt !== null
+      ? { pid: current.pid, startedAt: current.startedAt }
+      : null;
+  if (live) {
+    if (await releaseIfNotAnEngine(current.home, live)) {
+      // A stale lock on a reused pid: released above, nothing signalled; launch below.
+    } else if (shouldRestartForVersion(current)) {
       logDesktopDaemonLifecycle("daemon version mismatch, restarting", {
         expectedVersion: normalizeVersion(expectedOwnedServerVersion()),
         daemonVersion: normalizeVersion(current.version),
       });
       await stopDesktopDaemon("version_mismatch");
-    } else {
+    } else if (current.ownedByDesktop || isOrchestraInstance(current.home, live)) {
       if (!current.ownedByDesktop) {
-        logDesktopDaemonLifecycle("reusing a daemon this app did not spawn", {
+        logDesktopDaemonLifecycle("reusing the daemon an earlier Orchestra launched", {
           pid: current.pid,
           listen: current.listen,
           daemonVersion: current.version,
@@ -329,16 +487,55 @@ export async function startDaemon(): Promise<DesktopDaemonStatus> {
         });
       }
       return current;
+    } else {
+      // Figmenta fork (contratto-1321 §4.3): a live lock that is not ours. A Paseo engine is
+      // stopped (rule 5) and ours launched; anything else (another Orchestra, rules 3-4) is
+      // left alone and reported as port_busy_other.
+      await replaceForeignHolder(live);
     }
   }
 
-  // Figmenta fork: nothing is listening, so Orchestra launches one — the newest server on
-  // this machine (its own, or an installed Paseo.app's), see figmenta/daemon-runtime.ts.
+  // Figmenta fork: nothing is listening, so Orchestra launches its own bundled server.
+  signal?.throwIfAborted();
   const home = getPaseoHome();
   const bundled = resolveBundledDaemonRuntime(getBundledCliShimPath());
   const engineEnv = await ownEngineEnvironment();
-  await launchWithBundledFallback(home, bundled, pickOrchestraDaemonRuntime(bundled), engineEnv);
+  signal?.throwIfAborted();
+  await launchWithBundledFallback(
+    home,
+    bundled,
+    pickOrchestraDaemonRuntime(bundled),
+    engineEnv,
+    signal,
+  );
   return resolveDesktopDaemonStatus();
+}
+
+async function replaceForeignHolder(live: { pid: number; startedAt: string }): Promise<void> {
+  const executable = engineProcessProbe.executable(live.pid);
+  if (
+    isOrchestraExecutable(executable) ||
+    isUnderOrchestraFolder(executable) ||
+    !isPaseoExecutable(executable)
+  ) {
+    logDesktopDaemonLifecycle("not reusing a daemon Orchestra did not launch", {
+      pid: live.pid,
+      executable,
+    });
+    throw new EngineHolderError(
+      "port_busy_other",
+      "The engine lock is held by an instance this app did not launch.",
+    );
+  }
+  logDesktopDaemonLifecycle("a Paseo engine holds the lock, stopping it", {
+    pid: live.pid,
+    executable,
+  });
+  const outcome = await stopForeignEngine(live.pid, foreignStopOps(live));
+  if (outcome !== "stopped") {
+    throw new EngineHolderError("foreign_stop_failed", `Foreign engine not stopped: ${outcome}`);
+  }
+  lastForeignStop = Date.now();
 }
 
 /**
@@ -352,9 +549,10 @@ export async function launchWithBundledFallback(
   bundled: DaemonLaunchRuntime,
   picked: DaemonLaunchRuntime,
   baseEnv: NodeJS.ProcessEnv = process.env,
+  signal?: AbortSignal,
 ): Promise<void> {
   if (picked === bundled) {
-    await launchDaemonRuntime(home, bundled, baseEnv);
+    await launchDaemonRuntime(home, bundled, baseEnv, signal);
     return;
   }
   const abort = new AbortController();
@@ -372,7 +570,7 @@ export async function launchWithBundledFallback(
     reason,
   });
   await abandonLaunch(home, abort);
-  await launchDaemonRuntime(home, bundled, baseEnv);
+  await launchDaemonRuntime(home, bundled, baseEnv, signal);
 }
 
 const ABANDON_WAIT_MS = 15_000;
@@ -411,27 +609,17 @@ async function abandonLaunch(home: string, abort: AbortController): Promise<void
   ownedLaunch = null;
 }
 
-export function pickOrchestraDaemonRuntime(
-  bundled: DaemonLaunchRuntime,
-  resolvePaseoApp: () => DaemonLaunchRuntime | null = resolvePaseoAppDaemonRuntime,
-): DaemonLaunchRuntime {
-  let paseoApp: DaemonLaunchRuntime | null = null;
-  try {
-    paseoApp = resolvePaseoApp();
-  } catch (error) {
-    logDesktopDaemonLifecycle("installed Paseo.app runtime unreadable, ignored", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
-  const picked = pickDaemonRuntime(bundled, paseoApp ? [paseoApp] : []);
+// Figmenta fork (contratto-1321 §4.1): from 1.3.21 our engine ALWAYS runs on the runtime
+// bundled in this app, never on an installed Paseo.app's (whose executable is exactly
+// Paseo's own, so our engine could not be told apart from a foreign one), and always
+// with the environment prepareEngineEnvironment gives it.
+export function pickOrchestraDaemonRuntime(bundled: DaemonLaunchRuntime): DaemonLaunchRuntime {
   logDesktopDaemonLifecycle("daemon runtime selected", {
-    source: picked.source,
-    version: picked.version,
-    location: picked.location,
-    bundledVersion: bundled.version,
-    paseoAppVersion: paseoApp?.version ?? null,
+    source: bundled.source,
+    version: bundled.version,
+    location: bundled.location,
   });
-  return picked;
+  return bundled;
 }
 
 // Figmenta fork: names the instance this Orchestra launched, so a LATER Orchestra process
@@ -444,7 +632,9 @@ function recordOrchestraLaunch(home: string, instance: DaemonInstance): void {
       `${JSON.stringify({ pid: instance.pid, startedAt: instance.startedAt }, null, 2)}\n`,
     );
   } catch (error) {
-    logDesktopDaemonLifecycle("could not record the Orchestra launch marker", {
+    // Logged, never thrown: the launch goes on without the marker (§4.1).
+    log.warn("[desktop daemon]", "could not record the Orchestra launch marker", {
+      pid: instance.pid,
       error: error instanceof Error ? error.message : String(error),
     });
   }
@@ -461,6 +651,7 @@ async function launchDaemonRuntime(
     args: [],
     baseEnv,
   });
+  let acquired: DaemonInstance | null = null;
   try {
     await startDaemonInstance({
       home,
@@ -471,12 +662,16 @@ async function launchDaemonRuntime(
       desktopManaged: true,
       ...(signal ? { signal } : {}),
       onAcquired: (instance) => {
+        // An abandoned launch (stop() during the launch) is never recorded as ours.
+        if (signal?.aborted) return;
+        acquired = instance;
         ownedLaunch = { home, instance, serverVersion: runtime.version };
         recordOrchestraLaunch(home, instance);
       },
     });
     return "ready";
   } catch (error) {
+    if (signal?.aborted && acquired && ownedLaunch?.instance === acquired) ownedLaunch = null;
     if (!(error instanceof DaemonInstanceError && error.code === "DAEMON_NOT_READY")) throw error;
     return "not_ready";
   }
@@ -517,6 +712,232 @@ export async function stopDesktopDaemon(
   });
   if (owned) ownedLaunch = null;
   return resolveDesktopDaemonStatus();
+}
+
+// ---------------------------------------------------------------------------
+// Figmenta fork (contratto-1321 §4.1, §4.3): stops the engine supervisor uses
+// ---------------------------------------------------------------------------
+
+function requestShutdownViaCli(ready: { listen: string }): Promise<void> {
+  return runExternalCliJsonCommand(["daemon", "stop", "--host", ready.listen, "--json"]).then(
+    () => undefined,
+  );
+}
+
+function isDaemonReplaced(error: unknown): boolean {
+  return error instanceof DaemonInstanceError && error.code === "DAEMON_REPLACED";
+}
+
+/**
+ * Stops OUR engine (rules 0 and 2) in process, `force` on: the live pid lock must still be
+ * `expected` and be this launch or the instance the marker names. A lock whose pid no
+ * longer runs an engine (reused pid) is released, nothing signalled. Returns false,
+ * stopping nothing, when the lock is not ours or was replaced meanwhile.
+ */
+export async function forceStopOwnEngine(expected: {
+  pid: number;
+  startedAt: string;
+}): Promise<boolean> {
+  const home = getPaseoHome();
+  const live = await readDaemonInstance(home);
+  if (!live) return true;
+  if (live.pid !== expected.pid || live.startedAt !== expected.startedAt) return false;
+  if (!isOrchestraInstance(home, live)) return false;
+  if (await releaseIfNotAnEngine(home, live)) return true;
+  // An executable we cannot read is not proof the pid is still ours (rule 6): only the
+  // instance this process launched is stopped without it.
+  const launchedHere =
+    ownedLaunch?.home === home && isSameDaemonInstance(live, ownedLaunch.instance);
+  if (!launchedHere && engineProcessProbe.executable(live.pid) === null) {
+    logDesktopDaemonLifecycle("our engine's executable is unreadable, not stopped", {
+      pid: live.pid,
+    });
+    return false;
+  }
+  logDesktopDaemonLifecycle("force-stopping our engine", { pid: live.pid });
+  try {
+    await stopDaemonInstance(home, {
+      instance: live,
+      force: true,
+      timeoutMs: 15_000,
+      requestShutdown: requestShutdownViaCli,
+    });
+  } catch (error) {
+    if (isDaemonReplaced(error)) return false;
+    throw error;
+  }
+  if (ownedLaunch?.home === home && isSameDaemonInstance(live, ownedLaunch.instance)) {
+    ownedLaunch = null;
+  }
+  return true;
+}
+
+/**
+ * (a) of the foreign stop, in process: `stopDaemonInstance` on exactly the classified
+ * instance, no force, 15 s, shutdown asked through the bundled CLI. "replaced": the lock
+ * changed meanwhile — nothing is stopped.
+ */
+export async function stopInstanceGracefully(instance: {
+  pid: number;
+  startedAt: string;
+}): Promise<"done" | "replaced"> {
+  const home = getPaseoHome();
+  const live = await readDaemonInstance(home);
+  if (!live) return "done";
+  if (live.pid !== instance.pid || live.startedAt !== instance.startedAt) return "replaced";
+  try {
+    await stopDaemonInstance(home, {
+      instance: live,
+      force: false,
+      timeoutMs: 15_000,
+      requestShutdown: requestShutdownViaCli,
+    });
+  } catch (error) {
+    if (isDaemonReplaced(error)) return "replaced";
+    throw error;
+  }
+  return "done";
+}
+
+function execFileQuiet(command: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { windowsHide: true, timeout: 15_000 }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(String(stdout));
+    });
+  });
+}
+
+/** Windows: `taskkill /PID <pid> /T /F` — the supervisor and its whole tree. */
+export async function killProcessTreeWindows(pid: number): Promise<void> {
+  await execFileQuiet("taskkill", ["/PID", String(pid), "/T", "/F"]);
+}
+
+/** macOS/Linux: the direct children of `pid` (`pgrep -P`), empty when none or unreadable. */
+export async function listChildPids(pid: number): Promise<number[]> {
+  try {
+    const out = await execFileQuiet("pgrep", ["-P", String(pid)]);
+    return out
+      .split(/\s+/)
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0);
+  } catch {
+    return [];
+  }
+}
+
+export interface ForeignStopOps {
+  platform: NodeJS.Platform;
+  /** (a) the graceful stop of the classified instance; "replaced" = the lock changed. */
+  cliStop(): Promise<"done" | "replaced" | void>;
+  isAlive(pid: number): boolean;
+  /** The executable image of `pid`, null when unreadable. */
+  readExecutable(pid: number): string | null;
+  /** Windows `taskkill /PID <pid> /T /F`. */
+  killTree(pid: number): Promise<void>;
+  signal(pid: number, signal: "SIGTERM" | "SIGKILL"): void;
+  childPids(pid: number): Promise<number[]>;
+  sleep(ms: number): Promise<void>;
+  log(message: string, extra?: Record<string, unknown>): void;
+}
+
+/** "stopped": S is gone; "not_paseo": S is alive and its executable no longer reads as
+ * Paseo, so nothing was signalled; "replaced": the lock changed under the graceful stop,
+ * nothing stopped; "still_alive": S survived every step. */
+export type ForeignStopOutcome = "stopped" | "not_paseo" | "replaced" | "still_alive";
+
+const FOREIGN_TERM_WAIT_MS = 12_000;
+const FOREIGN_POLL_MS = 250;
+
+async function waitForExit(pid: number, ms: number, ops: ForeignStopOps): Promise<boolean> {
+  for (let waited = 0; waited < ms; waited += FOREIGN_POLL_MS) {
+    if (!ops.isAlive(pid)) return true;
+    await ops.sleep(FOREIGN_POLL_MS);
+  }
+  return !ops.isAlive(pid);
+}
+
+/**
+ * Stops a FOREIGN engine (§4.3 rule 5) whose supervisor is `pid`: (a) the bundled CLI's
+ * `daemon stop`; (b) if S is still alive, its executable is read again — it must still be
+ * Paseo, otherwise nothing is signalled — then Windows `taskkill /T /F` on S, macOS/Linux
+ * SIGTERM to S, 12 s, then SIGKILL to S and to its children whose executable is still
+ * Paseo. Never `Stop-Process` on the supervisor alone. Freeing the port, (c) and (d), is
+ * the supervisor's.
+ */
+export async function stopForeignEngine(
+  pid: number,
+  ops: ForeignStopOps,
+): Promise<ForeignStopOutcome> {
+  try {
+    if ((await ops.cliStop()) === "replaced") {
+      ops.log("foreign engine: the lock changed during the stop, nothing stopped", { pid });
+      return "replaced";
+    }
+  } catch (error) {
+    ops.log("foreign engine: daemon stop failed", {
+      pid,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  if (!ops.isAlive(pid)) return "stopped";
+
+  const executable = ops.readExecutable(pid);
+  if (!isPaseoExecutable(executable)) {
+    ops.log("foreign engine: executable no longer Paseo, not signalled", { pid, executable });
+    return "not_paseo";
+  }
+
+  if (ops.platform === "win32") {
+    try {
+      await ops.killTree(pid);
+    } catch (error) {
+      ops.log("foreign engine: taskkill failed", {
+        pid,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return (await waitForExit(pid, FOREIGN_POLL_MS * 4, ops)) ? "stopped" : "still_alive";
+  }
+
+  const children = await ops.childPids(pid);
+  try {
+    ops.signal(pid, "SIGTERM");
+  } catch {
+    // Gone in the meantime.
+  }
+  if (await waitForExit(pid, FOREIGN_TERM_WAIT_MS, ops)) return "stopped";
+
+  if (!isPaseoExecutable(ops.readExecutable(pid))) {
+    ops.log("foreign engine: executable changed before SIGKILL, not signalled", { pid });
+    return "not_paseo";
+  }
+  for (const target of [pid, ...children]) {
+    if (target !== pid && !isPaseoExecutable(ops.readExecutable(target))) continue;
+    try {
+      ops.signal(target, "SIGKILL");
+    } catch {
+      // Gone in the meantime.
+    }
+  }
+  return (await waitForExit(pid, FOREIGN_POLL_MS * 4, ops)) ? "stopped" : "still_alive";
+}
+
+/** The real process edges of the foreign stop, for the classified instance. */
+export function foreignStopOps(instance: { pid: number; startedAt: string }): ForeignStopOps {
+  return {
+    platform: process.platform,
+    cliStop: () => stopInstanceGracefully(instance),
+    isAlive: isProcessRunning,
+    readExecutable: (pid) => engineProcessProbe.executable(pid),
+    killTree: killProcessTreeWindows,
+    signal: (target, signal) => {
+      process.kill(target, signal);
+    },
+    childPids: listChildPids,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    log: (message, extra) => logDesktopDaemonLifecycle(message, extra),
+  };
 }
 
 async function restartDaemon(): Promise<DesktopDaemonStatus> {

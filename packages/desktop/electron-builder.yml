@@ -103,6 +103,9 @@ linux:
   extraResources:
     - from: bin/paseo
       to: bin/paseo
+    # Figmenta fork (contratto-1321 §4.4): the system tray icon (src/tray.ts).
+    - from: assets/32x32.png
+      to: 32x32.png
   target:
     - target: deb
       arch: [x64]
@@ -138,6 +141,9 @@ win:
   extraResources:
     - from: bin/paseo.cmd
       to: bin/paseo.cmd
+    # Figmenta fork (contratto-1321 §4.4): the system tray icon (src/tray.ts).
+    - from: assets/icon.ico
+      to: icon.ico
   target:
     - target: nsis
       arch:

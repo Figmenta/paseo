@@ -112,6 +112,11 @@ function buildApplicationMenuTemplate(
               },
             ]
           : []),
+        // Figmenta fork (contratto-1321 §4.4): on Windows and Linux closing the window only
+        // hides it in the tray, so the menu needs a real way out (macOS has it in the app menu).
+        ...(isMac
+          ? []
+          : [{ type: "separator" as const }, { label: "Quit Orchestra", role: "quit" as const }]),
       ],
     },
     {

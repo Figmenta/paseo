@@ -1,0 +1,26 @@
+{
+  "running": {
+    "state": "running",
+    "version": "0.10.2",
+    "target": null,
+    "port": 6767,
+    "serverId": "srv_fixture",
+    "managed": true,
+    "detail": null,
+    "notesDir": null,
+    "since": "2026-11-16T15:02:11.000Z",
+    "foreignStoppedAt": null
+  },
+  "error": {
+    "state": "error",
+    "version": null,
+    "target": null,
+    "port": 6767,
+    "serverId": null,
+    "managed": true,
+    "detail": "restart_failed",
+    "notesDir": null,
+    "since": "2026-11-16T15:04:30.000Z",
+    "foreignStoppedAt": "2026-11-16T15:01:58.000Z"
+  }
+}

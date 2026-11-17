@@ -4,6 +4,11 @@ import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
+import {
+  ENGINE_RESTART_CHANNEL,
+  ENGINE_STATUS_CHANNEL,
+  ENGINE_STATUS_GET_CHANNEL,
+} from "./figmenta/engine-status.js";
 import { REVEAL_CHANNEL } from "./figmenta/reveal.js";
 
 // The preload runs inside Electron's sandbox and is tsc-compiled (not bundled), so at
@@ -110,8 +115,9 @@ describe("preload sandbox safety", () => {
 
 // Figmenta fork: what the remote Orchestra page can reach through preload.ts, pinned. The
 // page gets the read-only `window.orchestraDesktop` (built with executeInMainWorld) and ONE
-// callable global, `orchestraDesktopActions`, whose only IPC is the reveal channel
-// (contratto notes-maestro §10.5). Anything added here is a new door into the app from a
+// callable global, `orchestraDesktopActions`, whose only calls are the reveal channel
+// (contratto notes-maestro §10.5) and the engine restart (contratto-1321 §3, §4.5).
+// Anything added here is a new door into the app from a
 // remote origin: this test fails until that is decided and the expectation updated with it.
 function preloadIpcSurface(source: string): { exposed: string[]; ipc: string[] } {
   const sourceFile = ts.createSourceFile("preload.ts", source, ts.ScriptTarget.Latest, true);
@@ -158,14 +164,17 @@ function preloadIpcSurface(source: string): { exposed: string[]; ipc: string[] }
 }
 
 describe("preload surface", () => {
-  it("exposes only orchestraDesktopActions, whose only call is the reveal channel", () => {
+  it("exposes only orchestraDesktopActions, whose only calls are reveal and the engine restart", () => {
     expect(preloadIpcSurface(readFileSync(preloadPath, "utf8"))).toEqual({
       exposed: ["orchestraDesktopActions"],
       ipc: [
+        `invoke ${ENGINE_RESTART_CHANNEL}`,
         `invoke ${REVEAL_CHANNEL}`,
         "on orchestra-desktop:claude-code",
+        `on ${ENGINE_STATUS_CHANNEL}`,
         "sendSync orchestra-desktop:claude-code:get",
-      ],
+        `sendSync ${ENGINE_STATUS_GET_CHANNEL}`,
+      ].sort(),
     });
   });
 });
